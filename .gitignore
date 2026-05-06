@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Data — large binaries, not version-controlled
+data/
+
+# Notebooks
+.ipynb_checkpoints/
+notebooks/scratch/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

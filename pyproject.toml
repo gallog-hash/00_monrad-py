@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monrad"
+version = "0.1.0"
+description = "Muon coincidence and probe alignment pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+monrad-decode-gps = "monrad.decoders.gps:main"
+monrad-decode-bin = "monrad.decoders.position:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
