@@ -1,20 +1,21 @@
 """
 Stage 1 — per-detector time reconstruction.
 
-Converts one detector's set of binary files into a list of
-TimedEvent(t_ns, evt_seq, quality), plus a PosRef table that
-maps each event to its raw position rows on disk.
-
 Public API
 ----------
 load_header_params(header_path)  -> (utc0, f0)
 find_file_pairs(detector_dir)    -> (gps_paths, pos_paths)
-reconstruct(gps_paths, pos_paths, utc0, f0) -> (events, pos_map)
+reconstruct_stream(gps_paths, pos_paths, utc0, f0)
+                                 -> Iterator[(TimedEvent, PosRef)]
+reconstruct(gps_paths, pos_paths, utc0, f0)
+                                 -> (events, pos_map)  [deprecated]
 """
 
 import bisect
 import logging
 import struct
+import warnings
+from collections.abc import Iterator
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
@@ -85,6 +86,19 @@ class _Interval:
         self.trusted = trusted
 
 
+def _iter_gps_records(
+    path: Path,
+) -> Iterator[tuple[int, int, bool]]:
+    """Yield (tick, gen, is_pps) from one *_GPS.bin in order."""
+    _, data = GPSDecoder(str(path)).read()
+    for raw in data:
+        v    = int(raw)
+        tick = v & 0xFFFFFFFFFFFFF
+        gen  = (v >> 52) & 0x7FF
+        flag = bool((v >> 63) & 1)
+        yield tick, gen, flag
+
+
 def _parse_gps_file(
     path: Path,
 ) -> tuple[list[int], list[int], list[int], list[int]]:
@@ -92,17 +106,12 @@ def _parse_gps_file(
     Return (evt_ticks, evt_gens, pps_ticks, pps_gens) from one
     *_GPS.bin file, in acquisition order.
     """
-    _, data = GPSDecoder(str(path)).read()
     evt_ticks: list[int] = []
     evt_gens:  list[int] = []
     pps_ticks: list[int] = []
     pps_gens:  list[int] = []
-    for raw in data:
-        v    = int(raw)
-        tick = v & 0xFFFFFFFFFFFFF
-        gen  = (v >> 52) & 0x7FF
-        flag = (v >> 63) & 1
-        if flag:
+    for tick, gen, is_pps in _iter_gps_records(path):
+        if is_pps:
             pps_ticks.append(tick)
             pps_gens.append(gen)
         else:
@@ -131,6 +140,46 @@ def _pos_file_meta(
     return n_rows, n_cols, first_gen, last_gen
 
 
+def _build_next_interval(
+    c0: int,
+    c1: int,
+    n0: int,
+    f0: int,
+    tau: float,
+) -> _Interval:
+    """
+    Build one PPS-to-PPS _Interval from a consecutive tick pair.
+
+    Encapsulates the residual check from _build_pps_chain(), operating
+    on a single pair instead of the whole list.
+    """
+    dc = c1 - c0
+    if dc <= 0:
+        log.warning('PPS tick not monotonic (dc=%d); untrusted', dc)
+        return _Interval(c0, c1, n0, n0 + 1, max(dc, 1), 1, False)
+    n = round(dc / f0)
+    if n == 0:
+        log.warning(
+            'Two PPS records within one f0 period; untrusted'
+        )
+        return _Interval(c0, c1, n0, n0 + 1, dc, 1, False)
+    res = abs(dc - n * f0) / (n * f0)
+    trusted = res <= tau
+    n1 = n0 + n
+    if not trusted:
+        log.warning(
+            'PPS residual %.2e > tau=%.0e at N~%d — '
+            'interval untrusted',
+            res, tau, n1,
+        )
+    elif n > 1:
+        log.warning(
+            '%d dropped PPS pulses between N=%d and N=%d',
+            n - 1, n0, n1,
+        )
+    return _Interval(c0, c1, n0, n1, dc, n, trusted)
+
+
 def _build_pps_chain(
     all_pps: list[tuple[int, int]],
     f0: int,
@@ -142,41 +191,14 @@ def _build_pps_chain(
     """
     if len(all_pps) < 2:
         return []
-
     intervals: list[_Interval] = []
     c_last, _ = all_pps[0]
     n_last = 0
-
     for c_next, _ in all_pps[1:]:
-        dc = c_next - c_last
-        if dc <= 0:
-            log.warning('PPS tick not monotonic (dc=%d); skipping', dc)
-            continue
-        n = round(dc / f0)
-        if n == 0:
-            log.warning(
-                'Two PPS records within one f0 period; skipping'
-            )
-            continue
-        res = abs(dc - n * f0) / (n * f0)
-        trusted = res <= tau
-        n_next = n_last + n
-        iv = _Interval(c_last, c_next, n_last, n_next, dc, n, trusted)
+        iv = _build_next_interval(c_last, c_next, n_last, f0, tau)
         intervals.append(iv)
-        if not trusted:
-            log.warning(
-                'PPS residual %.2e > tau=%.0e at N~%d — '
-                'interval untrusted',
-                res, tau, n_next,
-            )
-        elif n > 1:
-            log.warning(
-                '%d dropped PPS pulses between N=%d and N=%d',
-                n - 1, n_last, n_next,
-            )
         c_last = c_next
-        n_last = n_next
-
+        n_last = iv.n1
     return intervals
 
 
@@ -300,7 +322,202 @@ def find_file_pairs(
     return gps_paths, pos_paths
 
 
-# ── main entry point ─────────────────────────────────────────────
+# ── streaming entry point ────────────────────────────────────────
+
+def reconstruct_stream(
+    gps_paths: list[Path],
+    pos_paths: list[Path],
+    utc0: datetime,
+    f0: int = F0_DEFAULT,
+    tau: float = PPS_TAU,
+) -> Iterator[tuple[TimedEvent, PosRef]]:
+    """
+    Streaming Stage 1.  Yields (TimedEvent, PosRef) pairs in time
+    order, emitting each PPS interval's events as soon as the
+    closing PPS is observed.
+
+    Memory bound: at most ~2 s of events in pending buffers at
+    startup (pre-PPS_1 + PPS_1→PPS_2), ~1 s thereafter.
+
+    Yields
+    ------
+    TimedEvent  (t_ns, evt_seq, quality)
+    PosRef      (file_idx, row_offset, split_rows)
+    """
+    if len(gps_paths) != len(pos_paths):
+        raise ValueError(
+            'gps_paths and pos_paths must have the same length'
+        )
+
+    utc0_ns = _utc_to_ns(utc0)
+
+    # (tick, PosRef) — events buffered since last PPS
+    _pending:  list[tuple[int, PosRef]] = []
+    # (tick, PosRef) — events before the first PPS record
+    _pre_pps1: list[tuple[int, PosRef]] = []
+
+    pps_count = 0
+    prev_pps_tick: int | None = None
+    n0 = 0                      # cumulative seconds at prev_pps_tick
+    last_iv: _Interval | None = None   # last built, for fwd extrap
+    evt_seq = 0
+
+    # split-block detection
+    prev_pos_last_gen: int | None = None
+    prev_pos_nr:       int | None = None
+
+    for file_idx, (gps_path, pos_path) in enumerate(
+        zip(gps_paths, pos_paths)
+    ):
+        gps_path = Path(gps_path)
+        pos_path = Path(pos_path)
+
+        nr, nc, first_gen, last_gen = _pos_file_meta(pos_path)
+
+        if nr % 16 != 0:
+            log.warning(
+                '%s: row count %d not multiple of 16'
+                ' (possible split block at file end)',
+                pos_path.name, nr,
+            )
+
+        # GEN continuity check and split-block detection
+        if prev_pos_last_gen is not None and nr > 0:
+            expected = (prev_pos_last_gen + 1) % 2048
+            if first_gen == prev_pos_last_gen:
+                # Last block of previous file straddled the boundary
+                tail = (prev_pos_nr or 0) % 16
+                if tail and _pending:
+                    old_tick, old_ref = _pending[-1]
+                    _pending[-1] = (
+                        old_tick,
+                        PosRef(
+                            old_ref.file_idx,
+                            old_ref.row_offset,
+                            split_rows=tail,
+                        ),
+                    )
+                log.warning(
+                    '%s: split block detected — %d rows in prev file',
+                    pos_path.name, tail if tail else 0,
+                )
+            elif first_gen != expected:
+                log.warning(
+                    '%s: GEN discontinuity at boundary'
+                    ' — expected %d, got %d',
+                    pos_path.name, expected, first_gen,
+                )
+
+        n_pos_events = nr // 16
+        local_event_idx = 0
+
+        for tick, gen, is_pps in _iter_gps_records(gps_path):
+            if is_pps:
+                pps_count += 1
+
+                if pps_count == 1:
+                    # Note PPS_1 tick; cannot close any interval yet.
+                    prev_pps_tick = tick
+                    n0 = 0
+
+                elif pps_count == 2:
+                    # PPS_2 closes the startup window.  Build the
+                    # PPS_1→PPS_2 interval, use it to back-extrapolate
+                    # pre-PPS_1 events (DEGRADED) and to timestamp
+                    # PPS_1→PPS_2 events normally.
+                    back_iv = _build_next_interval(
+                        prev_pps_tick, tick, n0, f0, tau
+                    )
+                    last_iv = back_iv
+
+                    for ev_tick, ref in _pre_pps1:
+                        t_ns = _linear(utc0_ns, back_iv, ev_tick)
+                        yield (
+                            TimedEvent(t_ns, evt_seq, Quality.DEGRADED),
+                            ref,
+                        )
+                        evt_seq += 1
+                    _pre_pps1.clear()
+
+                    q = (
+                        Quality.GOOD
+                        if back_iv.trusted
+                        else Quality.UNTRUSTED
+                    )
+                    for ev_tick, ref in _pending:
+                        t_ns = _linear(utc0_ns, back_iv, ev_tick)
+                        yield TimedEvent(t_ns, evt_seq, q), ref
+                        evt_seq += 1
+                    _pending.clear()
+
+                    n0 = back_iv.n1
+                    prev_pps_tick = tick
+
+                else:
+                    # PPS_3+: standard one-interval-at-a-time flow.
+                    iv = _build_next_interval(
+                        prev_pps_tick, tick, n0, f0, tau
+                    )
+                    last_iv = iv
+                    q = (
+                        Quality.GOOD if iv.trusted else Quality.UNTRUSTED
+                    )
+                    for ev_tick, ref in _pending:
+                        t_ns = _linear(utc0_ns, iv, ev_tick)
+                        yield TimedEvent(t_ns, evt_seq, q), ref
+                        evt_seq += 1
+                    _pending.clear()
+
+                    n0 = iv.n1
+                    prev_pps_tick = tick
+
+            else:
+                # Event record: assign PosRef and buffer it.
+                ref = PosRef(file_idx, local_event_idx * 16)
+                if pps_count == 0:
+                    _pre_pps1.append((tick, ref))
+                else:
+                    _pending.append((tick, ref))
+                local_event_idx += 1
+
+        if local_event_idx != n_pos_events:
+            log.warning(
+                '%s: %d GPS events but %d position blocks',
+                pos_path.name, local_event_idx, n_pos_events,
+            )
+
+        prev_pos_last_gen = last_gen if nr > 0 else prev_pos_last_gen
+        prev_pos_nr = nr
+
+    if not pps_count:
+        raise ValueError(
+            'No PPS records found — cannot anchor timestamps'
+        )
+
+    # Flush remaining events (no closing PPS) with forward extrapolation.
+    if _pre_pps1 or _pending:
+        if last_iv is not None:
+            fwd_iv = last_iv
+        elif prev_pps_tick is not None:
+            fwd_iv = _Interval(
+                prev_pps_tick, prev_pps_tick + f0,
+                n0, n0 + 1, f0, 1, False,
+            )
+        else:
+            fwd_iv = _Interval(0, f0, 0, 1, f0, 1, False)
+
+        # pre-PPS_1 events have smaller ticks → yield first.
+        for buf in (_pre_pps1, _pending):
+            for ev_tick, ref in buf:
+                t_ns = _linear(utc0_ns, fwd_iv, ev_tick)
+                yield (
+                    TimedEvent(t_ns, evt_seq, Quality.DEGRADED),
+                    ref,
+                )
+                evt_seq += 1
+
+
+# ── deprecated batch wrapper ─────────────────────────────────────
 
 def reconstruct(
     gps_paths: list[Path],
@@ -310,146 +527,25 @@ def reconstruct(
     tau: float = PPS_TAU,
 ) -> tuple[list[TimedEvent], dict[int, PosRef]]:
     """
-    Stage 1: reconstruct UTC timestamps for all events in one
-    detector's run.
+    Deprecated. Use reconstruct_stream() for production pipelines.
 
-    Parameters
-    ----------
-    gps_paths : *_GPS.bin files in acquisition order
-    pos_paths : *.bin files in the same order
-    utc0      : UTC time of the first PPS (from load_header_params)
-    f0        : nominal clock frequency in Hz
-    tau       : PPS residual acceptance threshold (default 1e-4)
-
-    Returns
-    -------
-    events  : list of TimedEvent in time order (monotonic t_ns)
-    pos_map : {evt_seq: PosRef} for O(1) stage-3 random access
+    Thin wrapper around reconstruct_stream() that materialises all
+    events and returns (events, pos_map) for backward compatibility.
     """
-    if len(gps_paths) != len(pos_paths):
-        raise ValueError(
-            'gps_paths and pos_paths must have the same length'
-        )
-
-    utc0_ns = _utc_to_ns(utc0)
-
-    # ── pass 1: collect all records across files ─────────────────
-    # Entries: (tick, file_idx, local_event_idx)
-    all_evt: list[tuple[int, int, int]] = []
-    all_pps: list[tuple[int, int]] = []    # (tick, gen)
-    pos_map: dict[int, PosRef] = {}
-
-    evt_seq     = 0
-    prev_gen:   int | None = None   # GEN of last pos-file row
-    prev_file:  int | None = None
-
-    for file_idx, (gps_path, pos_path) in enumerate(
-        zip(gps_paths, pos_paths)
-    ):
-        gps_path = Path(gps_path)
-        pos_path = Path(pos_path)
-
-        evt_ticks, evt_gens, pps_ticks, pps_gens = (
-            _parse_gps_file(gps_path)
-        )
-        n_gps_events = len(evt_ticks)
-
-        nr, nc, first_gen, last_gen = _pos_file_meta(pos_path)
-
-        # Validate row count
-        if nr % 16 != 0:
-            log.warning(
-                '%s: row count %d not multiple of 16'
-                ' (possible split block at file end)',
-                pos_path.name, nr,
-            )
-        n_pos_events = nr // 16
-        if n_pos_events != n_gps_events:
-            raise ValueError(
-                f'{pos_path.name}: {n_pos_events} position blocks'
-                f' != {n_gps_events} GPS event records'
-            )
-
-        # Check GEN continuity at file boundary
-        if prev_gen is not None and nr > 0:
-            expected = (prev_gen + 1) % 2048
-            if first_gen == prev_gen:
-                # Same GEN means the previous file's last block
-                # was split; the first rows here are its tail.
-                tail = nr % 16 if (prev_file is not None) else 0
-                if tail:
-                    log.warning(
-                        '%s: split block detected — last %d rows'
-                        ' of file %d and first %d rows here'
-                        ' form one block',
-                        pos_path.name, tail,
-                        prev_file, 16 - tail,
-                    )
-                    # Patch the PosRef written for the event that
-                    # owns the split block's first half.
-                    split_seq = evt_seq - 1
-                    old = pos_map[split_seq]
-                    pos_map[split_seq] = PosRef(
-                        old.file_idx, old.row_offset,
-                        split_rows=tail,
-                    )
-            elif first_gen != expected:
-                log.warning(
-                    '%s: GEN discontinuity at boundary'
-                    ' — expected %d, got %d',
-                    pos_path.name, expected, first_gen,
-                )
-
-        # Record events and build pos_map
-        for local_idx in range(n_gps_events):
-            all_evt.append((evt_ticks[local_idx], file_idx, local_idx))
-            pos_map[evt_seq] = PosRef(file_idx, local_idx * 16)
-            evt_seq += 1
-
-        all_pps.extend(zip(pps_ticks, pps_gens))
-
-        prev_gen  = last_gen if nr > 0 else prev_gen
-        prev_file = file_idx
-
-    if not all_pps:
-        raise ValueError(
-            'No PPS records found — cannot anchor timestamps'
-        )
-
-    # ── pass 2: build PPS anchor chain ───────────────────────────
-    c0 = all_pps[0][0]   # tick of first PPS = UTC₀ anchor
-    intervals = _build_pps_chain(all_pps, f0, tau)
-    c0s = [iv.c0 for iv in intervals]
-
-    trusted   = [iv for iv in intervals if iv.trusted]
-    back_iv   = trusted[0]  if trusted else None
-    fwd_iv    = trusted[-1] if trusted else None
-
-    if not trusted:
-        log.warning(
-            'No trusted PPS intervals — all events will be DEGRADED'
-        )
-    log.debug(
-        'PPS chain: %d intervals, %d trusted, c0=%d',
-        len(intervals), len(trusted), c0,
+    warnings.warn(
+        'reconstruct() is deprecated; use reconstruct_stream()',
+        DeprecationWarning,
+        stacklevel=2,
     )
-
-    # ── pass 3: timestamp each event ─────────────────────────────
-    events: list[TimedEvent] = []
-    for seq, (tick, _file_idx, _local) in enumerate(all_evt):
-        t_ns, quality = _timestamp(
-            tick, intervals, c0s, c0,
-            utc0_ns, f0, back_iv, fwd_iv,
-        )
-        events.append(TimedEvent(t_ns, seq, quality))
-
-    # Sanity check: timestamps must be non-decreasing
-    for i in range(1, len(events)):
-        if events[i].t_ns < events[i - 1].t_ns:
-            log.warning(
-                'Non-monotonic timestamp at evt_seq=%d:'
-                ' t_ns=%d < prev=%d',
-                i, events[i].t_ns, events[i - 1].t_ns,
-            )
-
+    events:    list[TimedEvent] = []
+    pos_index: list[PosRef]    = []
+    for ev, ref in reconstruct_stream(
+        gps_paths, pos_paths, utc0, f0, tau
+    ):
+        events.append(ev)
+        pos_index.append(ref)
+    pos_map = {
+        ev.evt_seq: ref
+        for ev, ref in zip(events, pos_index)
+    }
     return events, pos_map
