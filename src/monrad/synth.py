@@ -192,6 +192,11 @@ def _sample_tracks(
 
 # ── public API ───────────────────────────────────────────────────
 
+def _quantize_clamp(coord_mm: float, n_ch: int) -> int:
+    """Quantize to strip channel, clamping to [0, n_ch-1]."""
+    return max(0, min(n_ch - 1, int(coord_mm / STRIP_MM)))
+
+
 def generate(
     out_dir: str | Path,
     t_x: float = 50.0,
@@ -203,6 +208,7 @@ def generate(
     seed: int = 42,
     start_utc: datetime = datetime(2023, 4, 18, 19, 21, 0),
     f0: int = F0,
+    plane_offsets: dict[int, tuple[float, float]] | None = None,
 ) -> dict:
     """
     Write synthetic telescope + probe files to out_dir.
@@ -210,13 +216,20 @@ def generate(
     Parameters are in mm and radians.  Default pose:
       t_x=50 mm, t_y=-30 mm, theta=17°, z_p=300 mm.
 
+    plane_offsets : optional dict {plane_idx: (dx_mm, dy_mm)} applied to
+                    telescope hit coordinates before quantization, simulating
+                    per-plane translational misalignments.
+
     Returns a dict with keys:
       tracks          list of (a_x, b_x, a_y, b_y)
       probe_hits      dict {track_index: (c_u, c_v)}
       n_coincidences  int
       tel_dir, probe_dir  Path
       pose            (t_x, t_y, theta, z_p)
+      plane_offsets   dict as passed in (or {})
     """
+    if plane_offsets is None:
+        plane_offsets = {}
     out_dir = Path(out_dir)
     tel_dir = out_dir / 'telescope'
     prb_dir = out_dir / 'probe'
@@ -256,13 +269,18 @@ def generate(
     tel_blocks: list[list[int]] = []
     for ax, bx, ay, by in tracks:
         words = []
-        for z in Z_TEL:
-            cx = _quantize(ax + bx * z, N_TEL)
-            cy = _quantize(ay + by * z, N_TEL)
-            assert cx is not None and cy is not None, (
-                f"Track out of range at z={z}: "
-                f"x={ax+bx*z:.1f}, y={ay+by*z:.1f}"
-            )
+        for k, z in enumerate(Z_TEL):
+            off_x, off_y = plane_offsets.get(k, (0.0, 0.0))
+            if off_x == 0.0 and off_y == 0.0:
+                cx = _quantize(ax + bx * z, N_TEL)
+                cy = _quantize(ay + by * z, N_TEL)
+                assert cx is not None and cy is not None, (
+                    f"Track out of range at z={z}: "
+                    f"x={ax+bx*z:.1f}, y={ay+by*z:.1f}"
+                )
+            else:
+                cx = _quantize_clamp(ax + bx * z + off_x, N_TEL)
+                cy = _quantize_clamp(ay + by * z + off_y, N_TEL)
             words.append(_ch_to_u64(cx, cy, gen))
         tel_blocks.append(words)
         gen = (gen + 1) % 2048
@@ -292,10 +310,11 @@ def generate(
     _write_pos_bin(prb_dir / f'{ts}.bin', prb_blocks, n_cols=1)
 
     return {
-        'tracks': tracks,
-        'probe_hits': probe_hits,
-        'n_coincidences': len(probe_hits),
-        'tel_dir': tel_dir,
-        'probe_dir': prb_dir,
-        'pose': (t_x, t_y, theta, z_p),
+        'tracks':          tracks,
+        'probe_hits':      probe_hits,
+        'n_coincidences':  len(probe_hits),
+        'tel_dir':         tel_dir,
+        'probe_dir':       prb_dir,
+        'pose':            (t_x, t_y, theta, z_p),
+        'plane_offsets':   plane_offsets,
     }
