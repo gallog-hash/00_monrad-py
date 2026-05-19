@@ -147,12 +147,7 @@ def _build_next_interval(
     f0: int,
     tau: float,
 ) -> _Interval:
-    """
-    Build one PPS-to-PPS _Interval from a consecutive tick pair.
-
-    Encapsulates the residual check from _build_pps_chain(), operating
-    on a single pair instead of the whole list.
-    """
+    """Build one PPS-to-PPS _Interval from a consecutive tick pair."""
     dc = c1 - c0
     if dc <= 0:
         log.warning('PPS tick not monotonic (dc=%d); untrusted', dc)
@@ -179,27 +174,6 @@ def _build_next_interval(
         )
     return _Interval(c0, c1, n0, n1, dc, n, trusted)
 
-
-def _build_pps_chain(
-    all_pps: list[tuple[int, int]],
-    f0: int,
-    tau: float,
-) -> list[_Interval]:
-    """
-    Build PPS interval chain from a list of (tick, gen) pairs.
-    Returns intervals sorted by c0.
-    """
-    if len(all_pps) < 2:
-        return []
-    intervals: list[_Interval] = []
-    c_last, _ = all_pps[0]
-    n_last = 0
-    for c_next, _ in all_pps[1:]:
-        iv = _build_next_interval(c_last, c_next, n_last, f0, tau)
-        intervals.append(iv)
-        c_last = c_next
-        n_last = iv.n1
-    return intervals
 
 
 def _linear(utc0_ns: int, iv: _Interval, tick: int) -> int:
