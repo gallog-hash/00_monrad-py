@@ -5,16 +5,22 @@ between a muon telescope and one or more probes from raw detector files, and
 (2) fit each probe's pose (position and rotation) relative to the telescope from
 the coincidences thus identified.
 
-It is organised top-down: first the data model on disk, then the processing
-stages, then the open items that should be confirmed against real data before
-code is finalised. Each section includes both the *what* and the *why* — the
-rationale is preserved so that future revisions of the algorithm can be made
-with full context.
+It is organised top-down: first the data model on disk, then the data-flow
+model, then the processing stages, then the open items that should be confirmed
+against real data before code is finalised. Each section includes both the
+*what* and the *why* — the rationale is preserved so that future revisions of
+the algorithm can be made with full context.
 
 The reference decoders for the on-disk formats are
 `decode_header.py`, `decode_gps.py`, and `decode_bin.py`. This document treats
 their bit-level behaviour as authoritative; if anything stated here disagrees
 with the scripts, the scripts win.
+
+> **Note.** This document incorporates the streaming redesign previously
+> described in `DESIGN_UPDATE.md`. The algorithms are unchanged; the
+> data-flow model (§3) and the stage-level implementation notes (§4–§8)
+> have been updated to reflect the generator-based pipeline that is
+> implemented in the code.
 
 
 ## 1. Hardware and acquisition model
@@ -127,12 +133,12 @@ agree.
 of an 80 ns acquisition window per event. All 16 rows in a block share the
 same GEN value, and there are no PPS records in `*.bin` — PPS lives only in
 `*_GPS.bin`. The position information for an event is recovered by bitwise-OR
-across the 16 samples (see §5).
+across the 16 samples (see §6).
 
 In a clean acquisition, `*.bin` row count is a multiple of 16, and
 `*.bin row count / 16` equals the number of non-PPS records in the
 corresponding `*_GPS.bin`. The pipeline asserts this invariant on each
-file pair as a sanity check (see §3.4 for the file-boundary edge case).
+file pair as a sanity check (see §4.4 for the file-boundary edge case).
 
 ### 2.4 Position encoding — fiber and ribbon
 
@@ -151,17 +157,54 @@ the active area.
 
 A clean event has exactly one fiber bit and one ribbon bit set per axis (per
 plane), giving an unambiguous channel ("golden hit"). Events with broader
-clusters require a small reconstruction step described in §5.
+clusters require a small reconstruction step described in §6.
 
 
-## 3. Stage 1 — per-detector time reconstruction
+## 3. Data-flow model
+
+Every stage boundary is an iterator boundary. No stage materialises more than
+a bounded window of events at once.
+
+```
+stage 1 (per detector)          stage 2               stages 4 / 5
+─────────────────────           ──────────            ──────────────
+reconstruct_stream()   ──────►  coincidence_  ──────► AlignmentAccumulator /
+                                stream()               PoseFitter
+                       n+1 streams merged via min-heap
+```
+
+The maximum in-memory working set at any point in the pipeline is:
+
+- **Stage 1**: one PPS interval (~1 s) of buffered events per detector.
+- **Stage 2**: the coincidence window (200 ns) plus inter-detector PPS
+  latency (≤ a few seconds).
+- **Stages 4 / 5**: one accumulator buffer (configurable; default 10 000
+  events for stage 4, 500 coincidences for stage 5).
+
+**Motivation.** At a telescope rate of 10 Hz, one week of continuous
+acquisition produces approximately 6 000 000 events per detector. A batch
+design that accumulates all events into Python lists before returning costs
+roughly 3.4 GB of RAM per detector in stage 1 alone. Running telescope +
+two probes concurrently saturates a typical analysis machine. The streaming
+design bounds peak RAM to a few hundred megabytes regardless of run length.
+
+Stage 4 (telescope alignment) runs on a dedicated `reconstruct_stream()` for
+the telescope, consuming all telescope events. Stage 5 runs on a separate
+`coincidence_stream()` that gets its own `reconstruct_stream()` for both
+detectors. The telescope GPS and position files are therefore iterated twice,
+but since file-header reads cost at most 24 bytes per file and the GPS files
+are small, the I/O overhead is negligible.
+
+
+## 4. Stage 1 — per-detector time reconstruction
 
 Goal: convert each detector's `*_GPS.bin` records into a stream of
-`(t_ns, evt_seq, quality)` tuples, where `t_ns` is the event's UTC time in
-integer nanoseconds. This is run independently — and identically — for the
-telescope and for each probe.
+`(TimedEvent, PosRef)` pairs, where `t_ns` is the event's UTC time in
+integer nanoseconds and `PosRef` carries the event's location in the `*.bin`
+files. This is run independently — and identically — for the telescope and
+for each probe.
 
-### 3.1 Anchoring with PPS
+### 4.1 Anchoring with PPS
 
 The header gives one absolute UTC anchor `UTC₀` (decoded from the UBX-TIM-TM2
 GPS string) and the nominal counter frequency `f₀`. PPS records inside
@@ -184,7 +227,7 @@ accept the pair as spanning exactly `n` seconds. When `n > 1` this implies
 interval `[C_last, C']` as **untrusted** and propagate that flag to any events
 falling inside it; do not attempt to invent timestamps.
 
-### 3.2 Event timestamps
+### 4.2 Event timestamps
 
 Between any two accepted PPS anchors, the locally measured frequency is
 
@@ -210,16 +253,21 @@ good PPS. Events before the first accepted PPS are back-extrapolated using
 the `f_local` measured by PPS_1→PPS_2; events after the last good PPS are
 forward-extrapolated; both are tagged with a degraded `quality` flag.
 
-### 3.3 The `evt_seq → (file, row)` map
+### 4.3 Back-extrapolation of pre-PPS_1 events
 
-While walking the event records, also record for each
-`evt_seq` the file index and the local position-record offset in `*.bin`
-(`= local_event_index × 16` rows, since every event is one block of 16
-position rows). This map is small (one tuple per event) and lets the position
-decoding (§5) do O(1) seeks into the position files without re-parsing
-anything.
+The streaming design cannot resolve back-extrapolation until PPS_2 is seen.
+The procedure is:
 
-### 3.4 File-boundary handling
+1. Buffer all events and PPS records until PPS_2 is observed.
+2. At PPS_2: build `_Interval(PPS_1, PPS_2)` as `back_iv`.
+3. Back-extrapolate buffered pre-PPS_1 events using `back_iv`, then
+   timestamp PPS_1→PPS_2 events normally.
+4. From PPS_2 onward: standard one-interval-at-a-time flow.
+
+This introduces a one-time startup latency of at most 2 s. Pre-PPS_1 events
+are tagged `Quality.DEGRADED`.
+
+### 4.4 File-boundary handling
 
 The acquisition writes a new `(*_GPS.bin, *.bin)` pair every 5 minutes
 without flushing per-detector pipeline state. Concretely:
@@ -235,13 +283,34 @@ without flushing per-detector pipeline state. Concretely:
   block straddles the boundary, the two halves are stitched before being
   passed to the position decoder.
 
-### 3.5 Output
+Split-block detection must be eager: when opening file `k+1`, check GEN
+continuity before yielding any events from file `k` that might belong to a
+split block. If the last pending event of file `k` has the same GEN as the
+first row of file `k+1`, hold that event and construct a `PosRef` with the
+correct `split_rows` value before yielding.
 
-A monotonic-in-time iterator yielding `(t_ns, evt_seq, quality)` per
-detector, plus the side table from §3.3.
+### 4.5 Output
+
+`reconstruct_stream()` is the primary API. It is a generator that yields
+`(TimedEvent, PosRef)` pairs in time order, emitting each PPS interval's
+events as soon as the closing PPS record is observed.
+
+```
+TimedEvent  (t_ns, evt_seq, quality)
+PosRef      (file_idx, row_offset, split_rows)
+```
+
+`PosRef` is carried inline with the `TimedEvent` and passed directly to
+stage 3 decode calls by the caller; no side-table lookup is required.
+
+A deprecated `reconstruct()` batch wrapper is retained for backward
+compatibility. It materialises the full stream into lists and returns
+`(events, pos_map)` where `pos_map[evt_seq]` equals the corresponding
+`PosRef`. Remove it once all callers have been migrated to
+`reconstruct_stream()`.
 
 
-## 4. Stage 2 — coincidence search
+## 5. Stage 2 — coincidence search
 
 Goal: identify time-coincident clusters of events across the n+1 detector
 streams using a 200 ns sliding window.
@@ -253,10 +322,10 @@ inside Δt. The window may be tightened later (likely to ≈ 100 ns) once the
 empirical Δt distribution between true telescope-probe coincidences is
 measured.
 
-### 4.1 The merge
+### 5.1 The merge
 
-Given n+1 streams each sorted by `t_ns`, do a k-way merge with a min-heap
-keyed on `t_ns`. Maintain a sliding deque of events within
+`coincidence_stream()` consumes n+1 `reconstruct_stream()` iterators via a
+k-way min-heap keyed on `t_ns`. It maintains a sliding deque of events within
 `[t_now − Δt, t_now]`. On each pop:
 
 1. evict deque entries with `t_ns < t_now − Δt`;
@@ -269,37 +338,55 @@ when no further event within Δt could extend it. This produces transitive-
 closure clusters (consecutive events ≤ Δt apart), which is the standard
 convention and avoids artifacts from arbitrary seed-choice.
 
-Complexity is `O(N log(n+1))` for `N` total events. At your rates the deque
-length is almost always 0–1 and the dominant cost is I/O. Random
-coincidences can be neglected for now (per your assumption).
+Complexity is `O(N log(n+1))` for `N` total events. At the expected rates
+the deque length is almost always 0–1 and the dominant cost is I/O. Random
+coincidences can be neglected for now (per assumption).
 
-### 4.2 Output
+Each `reconstruct_stream()` buffers up to ~1 s of events waiting for the
+next PPS. The k-way heap stalls on the slowest-advancing stream; no special
+handling is required since the heap naturally absorbs the latency. If the
+heap stalls beyond a configurable `max_lag_s` (default 5 s), a warning is
+logged.
 
-A list of clusters, each cluster a list of `(detector_id, evt_seq, t_ns,
-quality)`. The position information has not yet been touched.
+### 5.2 Output
+
+A generator yielding clusters, each a list of `(detector_id, TimedEvent,
+PosRef)` tuples. `PosRef` is carried transparently so that stage 3 callers
+downstream never need to look anything up.
 
 
-## 5. Stage 3 — position decoding
+## 6. Stage 3 — position decoding
 
 Goal: decode positions from `*.bin` into hits `(x, y, σ_x, σ_y, quality)`
 per plane. This is a **procedure**, not a stage in its own right — it is
 invoked by two consumers:
 
-- the **telescope internal alignment** branch (§6), which feeds it the full
-  stream of telescope events from §3.5;
-- the **probe pose fit** branch (§7), which feeds it the coincidence-surviving
-  events from all detectors emitted by §4.2.
+- the **telescope internal alignment** branch (§7), which feeds it the full
+  stream of telescope events from §4.5;
+- the **probe pose fit** branch (§8), which feeds it the coincidence-surviving
+  events from all detectors emitted by §5.2.
 
 Both consumers use exactly the same decoding logic; only the upstream event
-selection differs. This factoring keeps the bit-level position-reconstruction
-code in one place and makes both branches independently testable.
+selection differs.
 
-### 5.1 Random access into `*.bin`
+### 6.1 Interface
 
-For each `(detector_id, evt_seq)` to be decoded, look up the
-`(file_index, row_index)` from §3.3 and read 16 × `n_cols` u64s starting at
-`row_index`. This is a single O(1) seek per event, costing at most
-16 × 3 × 8 = 384 bytes per telescope event and 128 bytes per probe event.
+```python
+def decode_position(
+    pos_ref: PosRef,
+    pos_paths: list[Path],
+    n_cols: int,
+) -> list[Hit | None]:
+```
+
+`pos_ref` is received directly from the stream — no `pos_map` lookup is
+needed. Returns one `Hit | None` per plane (`n_cols` elements).
+
+### 6.2 Random access into `*.bin`
+
+For the `(file_idx, row_offset)` in `pos_ref`, read 16 × `n_cols` u64s
+starting at `row_offset`. This is a single O(1) seek per event, costing at
+most 16 × 3 × 8 = 384 bytes per telescope event and 128 bytes per probe event.
 
 For each of the `n_cols` planes, compute the bitwise OR of the 16 samples'
 X and Y fields. Verify that all 16 GEN values within the block agree, and
@@ -307,14 +394,14 @@ that the GEN matches `evt_seq mod 2048` from `*_GPS.bin`. A mismatch on
 either is a structural error — the file pair is corrupted or the join is
 wrong; halt and report.
 
-### 5.2 Validity prefilter
+### 6.3 Validity prefilter
 
 A column is **invalid** if any of the four 10-bit halves of the OR equals
 1023 (all bits set, indicating channel saturation), or if either ribbon half
 is zero (no ribbon channel fired, so no coordinate can be recovered). This
 matches the existing logic in `decode_bin.py::_is_valid`.
 
-### 5.3 Hit reconstruction
+### 6.4 Hit reconstruction
 
 For each valid axis (X or Y separately):
 
@@ -332,7 +419,7 @@ For each valid axis (X or Y separately):
 A hit is delivered to the caller only if both X and Y are reconstructed. The
 quality flag is `golden`, `cluster`, `unresolved`, or `invalid`.
 
-### 5.4 Channel → physical coordinate
+### 6.5 Channel → physical coordinate
 
 ```
 coord_mm = (ch + 0.5) × strip_pitch_mm   #   strip_pitch_mm = 10
@@ -341,9 +428,9 @@ coord_mm = (ch + 0.5) × strip_pitch_mm   #   strip_pitch_mm = 10
 with channel 0 at one physical edge of the active area. The same convention
 is used for telescope and probes. Any per-detector edge offset (e.g. a frame
 that prevents the leftmost strip from being at exactly x = 0) is absorbed
-into the alignment fits in §6 and §7.
+into the alignment fits in §7 and §8.
 
-### 5.5 Future refinement
+### 6.6 Future refinement
 
 The 16 per-sample bit patterns carry information that the OR discards: the
 first sample in which a strip fires gives a sub-event-window time stamp
@@ -352,15 +439,15 @@ strip is a time-over-threshold quality weight. Both are noted for future
 work and are not used in the current design.
 
 
-## 6. Stage 4 — telescope internal alignment (parallel branch)
+## 7. Stage 4 — telescope internal alignment (parallel branch)
 
 Goal: validate (and if necessary calibrate) the telescope's internal
 geometry — that its three planes are mutually parallel and X-Y aligned —
 **before** any probe pose fit is attempted.
 
-### 6.1 Why this is its own stage, and why it runs first
+### 7.1 Why this is its own stage, and why it runs first
 
-The probe pose fit in §7 assumes a perfectly self-consistent telescope: planes
+The probe pose fit in §8 assumes a perfectly self-consistent telescope: planes
 parallel, X axes aligned across planes, Y axes aligned across planes. If that
 assumption is wrong by some `Δx_2 ≈ 1 mm` translation of plane 2, every probe
 fit silently absorbs that shift into its own `(t_x, t_y)` and rotation θ —
@@ -381,20 +468,18 @@ angular and spatial coverage, for two reasons:
   the full angular and spatial extent of the telescope, not the narrow cone
   selected by a coincidence with a probe.
 
-For both reasons this stage runs on **all telescope tracks**, not on
-coincidence survivors. It is computationally a parallel branch to the
-coincidence pipeline (§4 → §5 → §7), sharing only Stage 1 (timing) and the
-Stage 3 procedure (position decoding) with it.
+For both reasons this stage runs on **all telescope tracks** via a dedicated
+`reconstruct_stream()`, independent of the coincidence pipeline.
 
-### 6.2 Inputs
+### 7.2 Inputs
 
-The full telescope event stream from §3.5, with positions decoded by §5
+The full telescope event stream from §4.5, with positions decoded by §6
 (applied to all telescope events, not coincidence survivors). Filter to
 tracks where all three planes have a valid hit (`golden` or `cluster`). At
 tens of Hz over a 5-minute file this yields thousands of tracks per file
 and easily tens of thousands per multi-hour acquisition.
 
-### 6.3 Diagnostics
+### 7.3 Diagnostics
 
 Two complementary tests are run.
 
@@ -420,47 +505,65 @@ contribution to the residual is unbiased.
 With three planes, (b) gives three independent views of each per-plane
 systematic.
 
-### 6.4 Decision
+### 7.4 Decision
 
 If all per-plane offsets are below ~1 mm (sub-strip) and rotations below
 ~1 mrad, the nominal telescope geometry is good as-is and the pipeline
-proceeds to §7 with no corrections. If systematics exceed those thresholds,
+proceeds to §8 with no corrections. If systematics exceed those thresholds,
 the recovered offsets and rotations are folded into the telescope geometry
-as corrections that propagate to every subsequent line fit in §7.2.
+as corrections that propagate to every subsequent line fit in §8.2.
 
 Thresholds are set by physics, not statistics: with thousands of tracks the
 statistical uncertainty per plane is well below 0.1 mm, so any systematic
 above the per-strip resolution of ~3 mm should be visible and worth
 correcting.
 
-### 6.5 Continuous monitoring
+### 7.5 Accumulator design
 
-The same test, applied periodically across a long acquisition, is a
-sensitive monitor for slow physical effects: mechanical settling over hours,
-thermal expansion across day/night cycles, vibration. Compute hourly or
-per-file alignment parameters and watch them as a time series. Slow drift
-indicates a real physical effect that may need a time-dependent correction;
-sudden jumps indicate a discrete event (someone bumped the apparatus, a DAQ
-restart with different settings).
+Stage 4 is implemented as `AlignmentAccumulator`, which buffers decoded
+three-plane hits and emits an `AlignmentCorrection` each time the buffer
+reaches `flush_every` hits (default 10 000).
+
+```python
+accum = AlignmentAccumulator(flush_every=10_000)
+for ev, ref in reconstruct_stream(tel_gps, tel_pos, utc0, f0):
+    hit = decode_position(ref, tel_pos_paths, n_cols=3)
+    if hit and hit.quality in ('golden', 'cluster'):
+        correction = accum.add(hit)
+        if correction is not None:
+            log.info('Alignment updated: %s', correction)
+```
+
+`AlignmentCorrection` carries the per-plane `(Δx, Δy, rotation_z)` values
+and a `needs_correction` boolean that downstream consumers (stage 5) read to
+decide whether to apply it.
+
+### 7.6 Continuous monitoring
+
+Each flush produces a timestamped `AlignmentCorrection`. Persisting these
+to a log file indexed by the UTC timestamp of the first hit in the batch
+directly implements continuous drift monitoring: slow changes indicate
+mechanical settling or thermal expansion; sudden jumps indicate a discrete
+physical event (apparatus bumped, DAQ restarted).
 
 
-## 7. Stage 5 — probe pose alignment
+## 8. Stage 5 — probe pose alignment
 
 Goal: for each probe, fit four parameters `(t_x, t_y, θ, z_p)` describing the
 probe's pose relative to the telescope, given the surviving telescope-probe
 coincidences.
 
-This stage assumes that §6 has run and that the telescope geometry passed
-to it is internally consistent within tolerance. If §6 has reported per-plane
+This stage assumes that §7 has run and that the telescope geometry passed
+to it is internally consistent within tolerance. If §7 has reported per-plane
 systematics above the strip resolution and they have not been folded into
 the telescope geometry as corrections, **stop and fix that first** — every
 probe pose returned by this stage will otherwise absorb the telescope's
 internal misalignment into its own parameters with no diagnostic to detect
 it.
 
-### 7.1 Geometry and parameterisation
+### 8.1 Geometry and parameterisation
 
-We assume — and have validated by §6 — that all telescope planes are
+We assume — and have validated by §7 — that all telescope planes are
 mutually parallel and X-Y aligned, and that the probe plane is parallel to
 the telescope planes. Place the telescope frame so the planes are at
 constant `z` values `z₁, z₂, z₃` (the geometric centre of the top plane is
@@ -478,20 +581,20 @@ Four unknowns. Each coincidence gives two scalar constraints (the predicted
 telescope hit on the probe plane vs. the measured probe hit), so three
 coincidences suffice in principle and many more are available in practice.
 
-### 7.2 Telescope line fit per coincidence
+### 8.2 Telescope line fit per coincidence
 
 For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 3` define a 3D line via two independent linear least-squares fits in
 `x(z) = a_x + b_x · z` and `y(z) = a_y + b_y · z`. Each fit yields the four
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
-position uncertainties (§5.3) and the corrected plane `z` values from §6.
+position uncertainties (§6.4) and the corrected plane `z` values from §7.
 
 A **track quality cut** (e.g. χ² of the line fit < 4, equivalent to ≤ 1 strip
 of residual on each plane) is applied here to remove ghost tracks before
 they corrupt the alignment fit. Loose cuts are preferred over tight ones at
 this stage.
 
-### 7.3 The residual
+### 8.3 The residual
 
 For each coincidence `i`, the predicted telescope position at the probe
 plane is
@@ -534,7 +637,7 @@ nonlinearity in θ:
 - **The remaining nonlinearity is in a single bounded scalar θ ∈ [−π, π]**,
   evaluable cheaply.
 
-### 7.4 The optimiser
+### 8.4 The optimiser
 
 The recipe has four steps.
 
@@ -561,7 +664,7 @@ unrelated probe hit) are handled by a one-pass cut on Mahalanobis distance:
 compute `d_i = √(r_iᵀ W_i r_i)`, drop coincidences with `d_i > 4`, refit. With
 the low accidental rate assumed, one pass is enough.
 
-### 7.5 The 4-fold rotation ambiguity
+### 8.5 The 4-fold rotation ambiguity
 
 A square probe with identical X and Y strip layouts is invariant under
 rotations of 90°, 180°, and 270° from the data alone — the four θ minima
@@ -574,7 +677,7 @@ are mathematically equivalent fits. The pipeline either:
 
 This is documented in the report; it is not an algorithmic failure.
 
-### 7.6 Expected precision
+### 8.6 Expected precision
 
 With per-coordinate strip resolution `σ_strip = 10 mm / √12 ≈ 2.9 mm` and
 N coincidences, the `(t_x, t_y)` precision is roughly `σ_eff / √N`, where
@@ -598,13 +701,13 @@ degenerate with `(t_x, t_y)` at large distances; at 5 m, expect σ on `z_p` of
 tens of cm. If a tape-measure value is available externally it should be
 compared against the fit as a sanity check.
 
-### 7.7 Output and diagnostics
+### 8.7 Output and diagnostics
 
 The fitter returns a bundle, **not just four numbers**:
 
 - the four fitted parameters and the 4 × 4 covariance from the inverse
   Hessian at the optimum;
-- the χ²(θ) curve from §7.4 step 1;
+- the χ²(θ) curve from §8.4 step 1;
 - residual histograms in `x` and `y` at the probe plane (expected shape:
   triangular if errors are uniform, or roughly Gaussian if dominated by
   track extrapolation; mean should be zero);
@@ -615,8 +718,75 @@ The fitter returns a bundle, **not just four numbers**:
 
 These diagnostics are what tell you whether to trust the four numbers.
 
+### 8.8 Accumulator design
 
-## 8. Open items and assumptions to verify
+Stage 5 is implemented as `PoseFitter`, which consumes the
+`coincidence_stream()` generator and accumulates coincidences into a rolling
+buffer. A refit is triggered every `refit_every` new coincidences once the
+minimum `MIN_FIT` threshold is reached.
+
+```python
+tel_stream_a = reconstruct_stream(tel_gps, tel_pos, utc0, f0)
+tel_stream_b = reconstruct_stream(tel_gps, tel_pos, utc0, f0)
+prb_stream   = reconstruct_stream(prb_gps, prb_pos, prb_utc0, f0)
+
+accum  = AlignmentAccumulator(flush_every=10_000)
+fitter = PoseFitter(tel_z=Z_TEL, alignment=AlignmentCorrection.identity())
+
+# Stage 4: all telescope events on stream A
+for ev, ref in tel_stream_a:
+    hit = decode_position(ref, tel_pos_paths, n_cols=3)
+    if hit:
+        corr = accum.add(hit)
+        if corr:
+            fitter.update_alignment(corr)
+
+# Stage 5: coincidences on stream B + probe stream
+for cluster in coincidence_stream([tel_stream_b, prb_stream],
+                                   detector_ids=[TEL_ID, PRB_ID]):
+    result = fitter.add(cluster)
+    if result:
+        log.info('Pose updated: %s', result)
+```
+
+`PoseFitter.update_alignment()` accepts a new `AlignmentCorrection` at any
+time; it is applied to telescope hits at the next refit.
+
+
+## 9. Module layout
+
+```
+src/monrad/
+    decoders/
+        header.py    # parse_header(), decode_ubx_tm2()
+        gps.py       # GPSDecoder — reads *_GPS.bin
+        position.py  # BinDecoder — reads *.bin, reconstructs hits
+    synth.py         # generate() — synthetic dataset for testing
+    stage1.py        # reconstruct_stream(), load_header_params(),
+                     # find_file_pairs(), reconstruct() [deprecated]
+    stage2.py        # coincidence_stream()
+    stage3.py        # Hit, decode_position()
+    stage4.py        # PlaneCorrection, AlignmentCorrection,
+                     # AlignmentAccumulator, fit_telescope_alignment()
+    stage5.py        # Coincidence, PoseResult,
+                     # PoseFitter, fit_probe_pose()
+```
+
+Key types:
+
+| Type | Module | Description |
+|---|---|---|
+| `Quality` | `stage1` | GOOD / DEGRADED / UNTRUSTED |
+| `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
+| `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
+| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality)` |
+| `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z)` |
+| `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
+| `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
+| `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
+
+
+## 10. Open items and assumptions to verify
 
 The following items are reasonable defaults but should be confirmed against
 real data on first inspection:
@@ -630,14 +800,14 @@ real data on first inspection:
   across `*_GPS.bin` boundaries with no synthetic gap inserted by the DAQ.
 - **Cross-file 16-row block continuity.** That a 16-row block of position
   data may occasionally be split between two `*.bin` files; the pipeline
-  detects and stitches such cases (§3.4), but the DAQ behaviour on file
+  detects and stitches such cases (§4.4), but the DAQ behaviour on file
   rotation should be confirmed.
 - **GEN behaviour at acquisition start.** Whether GEN starts at 0 or at an
   arbitrary value at run start. The pipeline does not depend on GEN's
   absolute starting value (only its monotonicity), but it does assume the
-  GEN agreement check in §5.1 is meaningful from the first event onward.
+  GEN agreement check in §6.2 is meaningful from the first event onward.
 - **Probe channel count.** Whether this is recorded in the header or
-  determined by inspection of which bits ever fire. §5.4 needs this for
+  determined by inspection of which bits ever fire. §6.5 needs this for
   the channel → coordinate mapping.
 - **Saturation interpretation.** The `_is_valid` filter treats any 10-bit
   half equal to 1023 as invalid (saturated). Whether a partially-saturated
@@ -645,16 +815,15 @@ real data on first inspection:
   refinement.
 
 
-## 9. First deliverable: a synthetic-data unit test
+## 11. Synthetic end-to-end test
 
-Before any of the stages is implemented against real data, the following
-test should be set up and used as a regression guard for the rest of the
-project:
+Before any of the stages is exercised against real data, the following
+test guards the pipeline as a regression suite.
 
 1. **Generate a synthetic dataset.** Pick ground-truth values
    `(t_x, t_y, θ, z_p)` for one probe, plus optional small per-plane
    misalignments for the telescope (a translation `Δx_k`, a rotation about
-   z `α_k`, etc.) so that §6 has something to detect. Generate N = 1000
+   z `α_k`, etc.) so that §7 has something to detect. Generate N = 1000
    muon tracks with random directions sampled from the cosmic-ray angular
    distribution, restricted to those crossing all three telescope planes.
    For each track, compute the three telescope plane intersections (with
@@ -669,13 +838,19 @@ project:
    within their statistical uncertainties, and once those corrections are
    folded in, Stage 5 should recover `(t_x, t_y, θ, z_p)` within 3σ of its
    fitted uncertainties.
-3. **Make this a unit test.** Add adversarial cases — dropped PPS, GEN
-   wraps, 16-row block split across files, occasional cluster hits and
-   invalid hits, a few accidental coincidences, a telescope with a
-   deliberately uncorrected plane rotation — and verify that each is
-   detected, flagged, or absorbed correctly.
+3. **Adversarial cases** — dropped PPS, GEN wraps, 16-row block split across
+   files, occasional cluster hits and invalid hits, a few accidental
+   coincidences, a telescope with a deliberately uncorrected plane rotation,
+   pre-PPS_1 events, stream exhaustion mid-buffer, back-to-back untrusted
+   intervals — verify that each is detected, flagged, or absorbed correctly.
 
-This test is the most valuable thing in the repository. It is the only way
-to know that a future change has not silently broken something in the
-chain. Build it first; it is easier to design synthetic data when the
-pipeline has not yet calcified around real data idiosyncrasies.
+**Implementation status.** All three requirements above are implemented:
+
+- `monrad.synth.generate()` produces the synthetic dataset described in
+  step 1.
+- `tests/test_pipeline_stream.py` runs the complete two-pass streaming
+  pipeline and asserts that recovered parameters lie within 3σ of ground
+  truth and that peak heap allocation stays below 512 MB.
+- Adversarial cases are covered by `tests/test_stage1.py` (pre-PPS events,
+  stream exhaustion, untrusted intervals) and the per-stage test modules
+  (`tests/test_stage2.py` through `tests/test_stage5.py`).
