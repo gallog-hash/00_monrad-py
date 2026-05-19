@@ -28,29 +28,55 @@ No linter is configured yet. Python ≥ 3.10 is required (`int | None` and `tupl
 
 ## Architecture
 
-`DESIGN.md` is the authoritative algorithm reference. When code and `DESIGN.md` disagree, the code wins. Read §9 of `DESIGN.md` first — the synthetic end-to-end unit test described there is the intended starting point for new pipeline code.
+`DESIGN.md` is the authoritative algorithm reference. When code and `DESIGN.md` disagree, the code wins. Read §11 of `DESIGN.md` first — the synthetic end-to-end test described there is the intended starting point for new pipeline code.
 
 ### Source layout
 
 ```
 src/monrad/
-    decoders/        # low-level format readers (the only code that exists so far)
+    decoders/        # low-level format readers
         header.py    # parse_header() + decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder  — reads *.bin, reconstructs hits
+    synth.py         # generate() — synthetic test-data generator
+    stage1.py        # reconstruct_stream(), load_header_params(), find_file_pairs()
+    stage2.py        # coincidence_stream()
+    stage3.py        # Hit, decode_position()
+    stage4.py        # AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
+    stage5.py        # PoseFitter, PoseResult, fit_probe_pose()
 ```
 
-### The five pipeline stages (not yet implemented)
+### The five pipeline stages
 
 | Stage | Input | Output |
 |---|---|---|
-| 1 — time reconstruction | `*_GPS.bin` + header per detector | `(t_ns, evt_seq, quality)` stream |
-| 2 — coincidence search | n+1 time-sorted streams | clusters of `(detector, evt_seq, t_ns, quality)` |
-| 3 — position decoding | `*.bin` + evt_seq lookup | `(x, y, σ_x, σ_y, quality)` per plane |
+| 1 — time reconstruction | `*_GPS.bin` + header per detector | `Iterator[(TimedEvent, PosRef)]` |
+| 2 — coincidence search | n+1 `reconstruct_stream()` iterators | `Iterator[list[(det_id, TimedEvent, PosRef)]]` |
+| 3 — position decoding | `PosRef` + `*.bin` paths | `list[Hit | None]` (one per plane) |
 | 4 — telescope alignment | all telescope events | per-plane offsets/rotations (parallel to stages 2–3) |
-| 5 — probe pose fit | coincidence events, corrected telescope geometry | `(t_x, t_y, θ, z_p)` + covariance |
+| 5 — probe pose fit | coincidence events + `AlignmentCorrection` | `PoseResult`: `(t_x, t_y, θ, z_p)` + covariance |
 
 Stages 1–3 share the same logic for telescope and probes; only the event selection differs. Stage 3 is a procedure called by both stage 4 (all telescope events) and stage 5 (coincidence survivors only).
+
+### Streaming design
+
+All stage boundaries are iterator boundaries — no stage accumulates a full
+list before the next stage starts. Peak RAM is bounded (~1 s of events per
+detector in stage 1; the 200 ns window in stage 2).
+
+**Two-stream pattern for stages 4 + 5.** Stage 4 consumes *all* telescope
+events; stage 5 consumes only coincident ones. Pass two independent
+`reconstruct_stream()` calls — one to `AlignmentAccumulator`, one to
+`coincidence_stream()`. Do **not** `itertools.tee` a single stream; the
+telescope files are small and iterating them twice is cheaper than the
+buffer `tee` would need.
+
+### Tests
+
+Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
+(stages 1–5 end-to-end with a 512 MB memory bound):
+`tests/test_pipeline_stream.py`. All tests use synthetic data from
+`monrad.synth.generate()`; no real detector files are required.
 
 ### Key invariants to preserve
 
