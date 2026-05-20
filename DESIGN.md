@@ -835,6 +835,15 @@ real data on first inspection:
   real-data validation, implement residual histograms (stage 4), the χ²(θ)
   curve (stage 5), and the alignment drift log.  These are the primary
   human-readable outputs for deciding whether to trust the fitted parameters.
+- **Alignment curvature degeneracy.** `fit_telescope_alignment` uses the
+  two-plane predictor (§6.3b).  For z = [0, 400, 800] mm the interpolation
+  fractions are t₀ = −1, t₁ = 0.5, t₂ = 2, so the residuals satisfy
+  r₀ = r₂ = x₀ − 2·x₁ + x₂ and r₁ = −r₀/2 for any dataset.  The predictor
+  therefore measures only the second difference (curvature) of hit positions
+  and cannot distinguish which individual plane is physically offset.  The
+  corrections (Δ[0] = Δ[2], Δ[1] = −Δ[0]/2) should be interpreted as
+  "curvature removal", not individual plane localisation.  Resolving
+  individual plane offsets requires external survey data or a 4-plane geometry.
 
 
 ## 11. Synthetic end-to-end test

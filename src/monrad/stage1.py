@@ -16,7 +16,7 @@ import logging
 import struct
 import warnings
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
@@ -272,7 +272,14 @@ def load_header_params(
             f'No GPS_String found in {header_path}'
         )
     tm2 = decode_ubx_tm2(gps_bytes)
-    utc0: datetime = tm2['timeR']
+    utc0_raw: datetime = tm2['timeR']
+    # The header's TIMEPULSE is a 100 Hz calibration pulse, not a 1 Hz PPS.
+    # PPS edges always fire at integer seconds.  Snap to the next whole
+    # second so that utc0 correctly anchors the first PPS in the GPS stream.
+    if utc0_raw.microsecond:
+        utc0: datetime = utc0_raw.replace(microsecond=0) + timedelta(seconds=1)
+    else:
+        utc0 = utc0_raw
     return utc0, f0
 
 
