@@ -249,7 +249,10 @@ def load_header_params(
     """
     modules = parse_header(str(header_path))
 
-    # Clock frequency — present in synthetic headers, optional elsewhere
+    # Real hardware headers carry no clock frequency field; F0_DEFAULT is
+    # always the live fallback.  The key-search below exists solely to read
+    # the 'clock_freq' entry written by monrad.synth.generate() in synthetic
+    # test headers — it is unreachable on production data.
     f0 = F0_DEFAULT
     for params in modules.values():
         for key, val in params.items():

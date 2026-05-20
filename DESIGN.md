@@ -813,6 +813,28 @@ real data on first inspection:
   half equal to 1023 as invalid (saturated). Whether a partially-saturated
   event is recoverable by trusting the unsaturated half is left as future
   refinement.
+- **Clock frequency source.** Real headers do not carry an `f₀` field;
+  `load_header_params` always uses `F0_DEFAULT = 100_000_000 Hz`.  Confirm
+  this is correct for all detector models before any multi-detector run.
+- **Probe active area inference.** Probe size cannot be assumed to be 30×30 cm².
+  The physical active area should be inferred per-acquisition from the
+  most-significant ribbon channel that ever fires.  Dark-current hits can
+  illuminate ribbon channels beyond the geometrically active region; a
+  per-axis maximum-channel scan over the full run should precede any
+  channel→coordinate mapping.
+- **Telescope plane z-coordinates.** `_Z_TEL = [0, 400, 800] mm` is hardcoded.
+  Verify against hardware drawings before the first stage-4 run; a few-mm
+  error biases the line-fit covariance and the probe z_p estimate.
+- **Plane tilt detection.** The 2 cm physical thickness of each
+  position-sensitive plane (two perpendicular scintillator layers) introduces
+  a z-ambiguity.  A tilt of a plane about x or y would manifest as a residual
+  that correlates with the track direction cosine (§7.3).  Detecting and
+  correcting tilts requires fitting one extra parameter per plane per axis and
+  is deferred until a tilt signal is observed above noise in real data.
+- **Diagnostic plots.** No visualisation is currently produced.  Before first
+  real-data validation, implement residual histograms (stage 4), the χ²(θ)
+  curve (stage 5), and the alignment drift log.  These are the primary
+  human-readable outputs for deciding whether to trust the fitted parameters.
 
 
 ## 11. Synthetic end-to-end test
