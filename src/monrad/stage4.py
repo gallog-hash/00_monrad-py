@@ -49,6 +49,7 @@ class AlignmentCorrection(NamedTuple):
 
 def fit_telescope_alignment(
     hits: list[list[Hit]],
+    z_tel: np.ndarray | None = None,
 ) -> AlignmentCorrection:
     """
     Fit telescope internal alignment from a batch of 3-plane hits.
@@ -79,7 +80,7 @@ def fit_telescope_alignment(
     # Build position arrays — shape (N, 3)
     x = np.array([[h[k].x_mm for k in range(3)] for h in hits], dtype=float)
     y = np.array([[h[k].y_mm for k in range(3)] for h in hits], dtype=float)
-    z = _Z_TEL
+    z = z_tel if z_tel is not None else _Z_TEL
 
     # ── (a) Three-plane straight-line fit ─────────────────────────────
     # Design matrix [1, z] for one track; same structure for all events.
@@ -143,8 +144,13 @@ class AlignmentAccumulator:
     Implements DESIGN_UPDATE.md §5.1.
     """
 
-    def __init__(self, flush_every: int = 10_000) -> None:
+    def __init__(
+        self,
+        flush_every: int = 10_000,
+        z_tel: np.ndarray | None = None,
+    ) -> None:
         self.flush_every        = flush_every
+        self._z_tel             = z_tel
         self._hits: list[list[Hit]] = []
         self.current_correction = AlignmentCorrection.identity()
 
@@ -172,7 +178,7 @@ class AlignmentAccumulator:
         return self._fit_and_flush()
 
     def _fit_and_flush(self) -> AlignmentCorrection:
-        correction = fit_telescope_alignment(self._hits)
+        correction = fit_telescope_alignment(self._hits, self._z_tel)
         self.current_correction = correction
         self._hits.clear()
         return correction

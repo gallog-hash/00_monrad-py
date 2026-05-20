@@ -4,11 +4,14 @@ Run the full monrad pipeline (stages 1-5) against one real acquisition.
 
 Usage:
     run_pipeline.py --telescope <dir> --probe <dir> [--out <dir>]
+                    [--z-tel Z0 Z1 Z2]
 
 Arguments:
     --telescope  Directory containing telescope *_header.txt, *_GPS.bin, *.bin
     --probe      Directory containing probe *_header.txt, *_GPS.bin, *.bin
     --out        Output directory for summary.txt (default: ./pipeline_out)
+    --z-tel      Telescope plane z-coordinates in mm, top to bottom
+                 (default: 0 400 800)
 
 Expected console output (example values):
 
@@ -34,7 +37,9 @@ Expected console output (example values):
 
     === Stage 3: Hit quality (coincidence survivors) ===
       523 coincidences x 3 telescope planes = 1569 readings
-      Telescope  golden 941   cluster 94   unresolved 12   invalid 5   missing 2
+      Plane 0    golden 314   cluster 32   unresolved 4   invalid 2   missing 1
+      Plane 1    golden 315   cluster 30   unresolved 5   invalid 1   missing 1
+      Plane 2    golden 312   cluster 32   unresolved 3   invalid 2   missing 0
       523 coincidences x 1 probe plane = 523 readings
       Probe      golden 410   cluster 80   unresolved 20   invalid 13   missing 0
 
@@ -71,10 +76,6 @@ from monrad.stage3 import decode_position
 from monrad.stage4 import AlignmentAccumulator
 from monrad.stage5 import PoseFitter
 
-# Telescope plane z-coordinates in mm.  Hardcoded; verify against hardware
-# drawings before the first real run — see DESIGN.md §10 open item.
-_Z_TEL = np.array([0.0, 400.0, 800.0])
-
 _HIT_QUALITIES = ('golden', 'cluster', 'unresolved', 'invalid', 'missing')
 
 
@@ -86,6 +87,9 @@ def _parse_args() -> argparse.Namespace:
                    metavar='DIR', help='Probe acquisition directory')
     p.add_argument('--out', default=Path('./pipeline_out'), type=Path,
                    metavar='DIR', help='Output directory (default: ./pipeline_out)')
+    p.add_argument('--z-tel', nargs=3, type=float, default=[0., 400., 800.],
+                   metavar=('Z0', 'Z1', 'Z2'),
+                   help='Telescope plane z-coords in mm (default: 0 400 800)')
     return p.parse_args()
 
 
@@ -122,6 +126,7 @@ def main() -> None:
     tel_dir: Path = args.telescope
     prb_dir: Path = args.probe
     out_dir: Path = args.out
+    z_tel = np.array(args.z_tel)
 
     lines: list[str] = []
 
@@ -130,7 +135,7 @@ def main() -> None:
     prb_utc0, prb_f0, prb_gps, prb_pos = _load_detector(prb_dir, 'probe')
 
     # ── Pass 1a: telescope alignment (stage 4) + telescope event quality ─
-    accum = AlignmentAccumulator()
+    accum = AlignmentAccumulator(z_tel=z_tel)
     tel_q: Counter = Counter()
     for ev, ref in reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0):
         tel_q[ev.quality] += 1
@@ -164,25 +169,38 @@ def main() -> None:
               f'delta_y = {pc.delta_y:+7.2f} mm   '
               f'rot_z = {pc.rotation_z:+.2e} rad')
     _emit(lines, f'  needs_correction: {alignment.needs_correction}')
-    # Symmetry check: for z=[0,400,800] the two-plane predictor always gives
-    # delta[0]=delta[2] and delta[1]=-delta[0]/2 (mathematical identity).
+    # Symmetry / spacing check.
+    # For evenly-spaced z the two-plane predictor is a mathematical identity:
+    #   delta[0]=delta[2], delta[1]=-delta[0]/2 (curvature only).
+    # For uneven spacing the identity does not hold; show extrapolation factors.
     dx = [pc.delta_x for pc in alignment.planes]
     dy = [pc.delta_y for pc in alignment.planes]
     asym_x = abs(dx[0] - dx[2])
     asym_y = abs(dy[0] - dy[2])
-    ratio_dx = dx[1] / dx[0] if abs(dx[0]) > 1e-9 else float('nan')
+    dz01 = z_tel[1] - z_tel[0]
+    dz12 = z_tel[2] - z_tel[1]
+    evenly_spaced = abs(dz01 - dz12) < 1e-6 * (z_tel[2] - z_tel[0])
     _emit(lines, '  Symmetry check (Plane 0 vs Plane 2):')
     _emit(lines,
           f'    |delta_x[0] - delta_x[2]| = {asym_x:5.2f} mm'
-          f'   |delta_y[0] - delta_y[2]| = {asym_y:5.2f} mm'
-          f'   (expected 0.00)')
-    _emit(lines,
-          f'    delta_x[1]/delta_x[0] = {ratio_dx:+.2f}'
-          f'   (expected -0.50: algorithm identity for z=[0,400,800])')
-    _emit(lines,
-          '  Note: for evenly-spaced z the two-plane predictor always gives')
-    _emit(lines,
-          '    delta[0]=delta[2], delta[1]=-delta[0]/2 (measures curvature only).')
+          f'   |delta_y[0] - delta_y[2]| = {asym_y:5.2f} mm')
+    if evenly_spaced:
+        ratio_dx = dx[1] / dx[0] if abs(dx[0]) > 1e-9 else float('nan')
+        _emit(lines,
+              f'    delta_x[1]/delta_x[0] = {ratio_dx:+.2f}'
+              f'   (expected -0.50: algorithm identity for evenly-spaced z)')
+        _emit(lines,
+              '  Note: for evenly-spaced z the two-plane predictor always gives')
+        _emit(lines,
+              '    delta[0]=delta[2], delta[1]=-delta[0]/2 (measures curvature only).')
+    else:
+        t0 = (z_tel[0] - z_tel[1]) / (z_tel[2] - z_tel[1])
+        t2 = (z_tel[2] - z_tel[0]) / (z_tel[1] - z_tel[0])
+        _emit(lines,
+              f'  Note: z=[{z_tel[0]:.0f},{z_tel[1]:.0f},{z_tel[2]:.0f}] mm '
+              f'(uneven: dz01={dz01:.0f} mm, dz12={dz12:.0f} mm); '
+              f'extrapolation factors t0={t0:.3f}, t2={t2:.3f}. '
+              f'delta[0]≠delta[2] expected.')
     _emit(lines)
 
     # ── Pass 2: coincidence search (stage 2) + hit quality (stage 3)
@@ -191,7 +209,7 @@ def main() -> None:
     prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
 
     fitter = PoseFitter(
-        tel_z=_Z_TEL,
+        tel_z=z_tel,
         alignment=alignment,
         tel_id=0,
         prb_id=1,
@@ -201,7 +219,7 @@ def main() -> None:
 
     n_coinc = 0
     total_cluster_size = 0
-    tel_hit_q: Counter = Counter()
+    tel_hit_q: list[Counter] = [Counter(), Counter(), Counter()]
     prb_hit_q: Counter = Counter()
     _pos_paths = {0: tel_pos, 1: prb_pos}
     _n_cols    = {0: 3,       1: 1}
@@ -215,9 +233,14 @@ def main() -> None:
             hits = decode_position(
                 ref, _pos_paths[det_id], n_cols=_n_cols[det_id],
             )
-            counter = tel_hit_q if det_id == 0 else prb_hit_q
-            for h in hits:
-                counter[h.quality if h is not None else 'missing'] += 1
+            if det_id == 0:
+                for plane_idx, h in enumerate(hits):
+                    tel_hit_q[plane_idx][
+                        h.quality if h is not None else 'missing'
+                    ] += 1
+            else:
+                for h in hits:
+                    prb_hit_q[h.quality if h is not None else 'missing'] += 1
         fitter.add(cluster)
 
     pose = fitter.flush()
@@ -232,8 +255,9 @@ def main() -> None:
     # ── Print stage 3 ────────────────────────────────────────────────────
     _emit(lines, '=== Stage 3: Hit quality (coincidence survivors) ===')
     _emit(lines, f'  {n_coinc} coincidences x 3 telescope planes = {n_coinc*3} readings')
-    tel_parts = '   '.join(f'{q} {tel_hit_q[q]}' for q in _HIT_QUALITIES)
-    _emit(lines, f'  Telescope  {tel_parts}')
+    for k, q in enumerate(tel_hit_q):
+        parts = '   '.join(f'{qn} {q[qn]}' for qn in _HIT_QUALITIES)
+        _emit(lines, f'  Plane {k}    {parts}')
     _emit(lines, f'  {n_coinc} coincidences x 1 probe plane = {n_coinc} readings')
     prb_parts = '   '.join(f'{q} {prb_hit_q[q]}' for q in _HIT_QUALITIES)
     _emit(lines, f'  Probe      {prb_parts}')

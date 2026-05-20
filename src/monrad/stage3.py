@@ -50,10 +50,16 @@ def _read_block(
         with open(path, 'rb') as fh:
             fh.seek(offset)
             raw = fh.read(n_rows * n_cols * _WORD)
-        return [
+        words = [
             struct.unpack_from('<Q', raw, i)[0]
             for i in range(0, len(raw), _WORD)
         ]
+        # Pad with zeros if the read fell short of EOF (GPS/pos count mismatch).
+        # A zero word has ribbon=0, which _is_valid() rejects as 'invalid'.
+        expected = n_rows * n_cols
+        if len(words) < expected:
+            words += [0] * (expected - len(words))
+        return words
 
     if pos_ref.split_rows == 0:
         return _rows(pos_paths[pos_ref.file_idx], pos_ref.row_offset, 16)
