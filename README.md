@@ -39,7 +39,10 @@ Files are written in 5-minute chunks; the pipeline stitches them into one logica
 from monrad.decoders.header import parse_header, decode_ubx_tm2
 
 modules = parse_header("20230418_191621_header.txt")
-gps_frame = decode_ubx_tm2(modules["GPS"]["GPS_String"])
+# GPS string keys are named GPS_String_00, GPS_String_01, …
+gps_bytes = next(v for k, v in modules["GPS"].items()
+                 if k.startswith("GPS_String"))
+gps_frame = decode_ubx_tm2(gps_bytes)
 print(gps_frame["timeR"])   # UTC datetime of the TIMEPULSE rising edge
 print(gps_frame["accEst"])  # timing accuracy estimate in ns
 ```
@@ -52,47 +55,65 @@ monrad-decode-bin data/.../20230418_192121.bin --or 5   # first 5 event groups
 monrad-decode-bin data/.../20230418_192121.bin --csv out.csv
 ```
 
-### Run the full pipeline (telescope + one probe)
+### Run the full pipeline (CLI smoke test)
+
+```bash
+python scripts/run_pipeline.py \
+    --telescope data/telescope \
+    --probe     data/probe \
+    --out       pipeline_out
+```
+
+Prints event counts, alignment corrections, coincidence count, hit quality
+breakdown, and fitted pose parameters.  Saves a plain-text summary to
+`pipeline_out/summary.txt`.
+
+### Run the full pipeline (Python API)
 
 ```python
+import numpy as np
 from pathlib import Path
 from monrad.stage1 import reconstruct_stream, load_header_params, find_file_pairs
 from monrad.stage2 import coincidence_stream
 from monrad.stage3 import decode_position
 from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import PoseFitter, AlignmentCorrection
+from monrad.stage5 import PoseFitter
 
 tel_dir = Path("data/telescope")
 prb_dir = Path("data/probe")
 
-utc0, f0   = load_header_params(next(tel_dir.glob("*_header.txt")))
-prb_utc0, _ = load_header_params(next(prb_dir.glob("*_header.txt")))
+# Header files may carry a numeric suffix (e.g. *_header000.txt).
+tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header*.txt")))
+prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header*.txt")))
 tel_gps, tel_pos = find_file_pairs(tel_dir)
 prb_gps, prb_pos = find_file_pairs(prb_dir)
 
-# Two independent telescope streams: one for alignment, one for coincidences.
-tel_stream_a = reconstruct_stream(tel_gps, tel_pos, utc0, f0)
-tel_stream_b = reconstruct_stream(tel_gps, tel_pos, utc0, f0)
-prb_stream   = reconstruct_stream(prb_gps, prb_pos, prb_utc0, f0)
+# Pass 1: telescope alignment (stage 4).
+accum = AlignmentAccumulator()
+for _ev, ref in reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0):
+    accum.add(decode_position(ref, tel_pos, n_cols=3))
+alignment = accum.flush()
 
-accum  = AlignmentAccumulator()
-fitter = PoseFitter(tel_z=[0., 400., 800.],
-                    alignment=AlignmentCorrection.identity())
+# Pass 2: coincidence search + probe pose fit (stages 2 + 5).
+# Open two independent telescope streams — do NOT tee a single one.
+tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
+prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
 
-# Stage 4: telescope alignment on all telescope events.
-for ev, ref in tel_stream_a:
-    hit = decode_position(ref, tel_pos, n_cols=3)
-    if hit:
-        corr = accum.add(hit)
-        if corr:
-            fitter.update_alignment(corr)
+fitter = PoseFitter(
+    tel_z=np.array([0., 400., 800.]),
+    alignment=alignment,
+    tel_id=0,
+    prb_id=1,
+    tel_pos_paths=tel_pos,
+    prb_pos_paths=prb_pos,
+)
+for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
+    fitter.add(cluster)
 
-# Stage 5: probe pose fit on coincident events.
-for cluster in coincidence_stream([tel_stream_b, prb_stream],
-                                   detector_ids=[0, 1]):
-    result = fitter.add(cluster)
-    if result:
-        print(result)
+result = fitter.flush()
+if result is not None:
+    print(f"t_x={result.t_x:.1f} mm  t_y={result.t_y:.1f} mm  "
+          f"theta={np.degrees(result.theta):.1f} deg  z_p={result.z_p:.1f} mm")
 ```
 
 ## Package structure
