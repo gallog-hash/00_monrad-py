@@ -844,6 +844,33 @@ real data on first inspection:
   corrections (Δ[0] = Δ[2], Δ[1] = −Δ[0]/2) should be interpreted as
   "curvature removal", not individual plane localisation.  Resolving
   individual plane offsets requires external survey data or a 4-plane geometry.
+  For uneven plane spacing (e.g. z = [0, 630, 1350] mm) the identity breaks,
+  so the `--z-tel` argument must always reflect the true hardware geometry.
+- **Folded-fiber readout in the telescope.** Analysis of real telescope data
+  (2022 lab run, `scripts/diagnose_hits.py`) reveals that a single muon hit
+  consistently fires **two non-adjacent fiber bits** whose indices are
+  mirror-symmetric about the midpoint of the 10-bit mask: bits k and (9 − k)
+  fire together at nearly equal rates (mean symmetry ratio ≈ 0.90 across all
+  three planes and both axes).  The most likely explanation is that each
+  physical scintillator strip is read out by two fibers that are routed to
+  MAROC channels k and 9 − k ("folded" or "mirror" wiring).  The current
+  decoder (`BinDecoder._reconstruct_coord`) treats these two non-adjacent bits
+  as irreconcilable separate clusters and returns `unresolved`, which is the
+  primary cause of the ~83 % unresolved rate seen in coincident telescope hits.
+  Resolving this requires the physical fiber-to-MAROC-channel mapping (a
+  hardware document or a test-pulse scan) so that a remapping step can be
+  inserted before `_reconstruct_coord`.  Until then, hits from folded-wired
+  planes cannot be reconstructed and stage 5 cannot be reached.
+- **MAROC cross-talk on telescope Plane 0.** In the 2022 lab run,
+  `diagnose_hits.py` shows that 12.5 % of Plane 0 events have **all 10 fiber
+  bits set** simultaneously (popcount = 10), compared with < 2 % on Planes 1
+  and 2 and < 0.03 % on the probe.  This is a hardware artefact: a large
+  primary signal on one MAROC channel induces cross-talk that saturates the
+  remaining channels on the same chip.  These events are already rejected by
+  `BinDecoder._is_valid` (all-ones fiber mask → invalid), but the high rate
+  (12.5 %) degrades effective statistics for stage 4 and suggests the Plane 0
+  MAROC threshold should be raised or the gain reduced until the cross-talk
+  rate falls below ~1 %.
 
 
 ## 11. Synthetic end-to-end test
