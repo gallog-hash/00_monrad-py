@@ -170,37 +170,43 @@ def main() -> None:
               f'rot_z = {pc.rotation_z:+.2e} rad')
     _emit(lines, f'  needs_correction: {alignment.needs_correction}')
     # Symmetry / spacing check.
-    # For evenly-spaced z the two-plane predictor is a mathematical identity:
-    #   delta[0]=delta[2], delta[1]=-delta[0]/2 (curvature only).
-    # For uneven spacing the identity does not hold; show extrapolation factors.
+    # Sort columns by z to identify the physical outer and middle planes,
+    # regardless of column order in the *.bin file.
     dx = [pc.delta_x for pc in alignment.planes]
     dy = [pc.delta_y for pc in alignment.planes]
-    asym_x = abs(dx[0] - dx[2])
-    asym_y = abs(dy[0] - dy[2])
-    dz01 = z_tel[1] - z_tel[0]
-    dz12 = z_tel[2] - z_tel[1]
-    evenly_spaced = abs(dz01 - dz12) < 1e-6 * (z_tel[2] - z_tel[0])
-    _emit(lines, '  Symmetry check (Plane 0 vs Plane 2):')
+    sorted_idx = list(np.argsort(z_tel))           # col indices in z order
+    i_lo, i_mid, i_hi = sorted_idx
+    dz_lo  = float(z_tel[i_mid] - z_tel[i_lo])
+    dz_hi  = float(z_tel[i_hi]  - z_tel[i_mid])
+    span   = float(z_tel[i_hi]  - z_tel[i_lo])
+    evenly_spaced = abs(dz_lo - dz_hi) < 1e-6 * span
+    # For evenly-spaced planes the two-plane predictor is a mathematical
+    # identity: delta[outer_lo] = delta[outer_hi], delta[mid] = -delta[outer]/2.
+    asym_x = abs(dx[i_lo] - dx[i_hi])
+    asym_y = abs(dy[i_lo] - dy[i_hi])
     _emit(lines,
-          f'    |delta_x[0] - delta_x[2]| = {asym_x:5.2f} mm'
-          f'   |delta_y[0] - delta_y[2]| = {asym_y:5.2f} mm')
+          f'  Symmetry check (outer planes: col {i_lo} z={z_tel[i_lo]:.0f} mm'
+          f' vs col {i_hi} z={z_tel[i_hi]:.0f} mm):')
+    _emit(lines,
+          f'    |delta_x[{i_lo}] - delta_x[{i_hi}]| = {asym_x:5.2f} mm'
+          f'   |delta_y[{i_lo}] - delta_y[{i_hi}]| = {asym_y:5.2f} mm')
     if evenly_spaced:
-        ratio_dx = dx[1] / dx[0] if abs(dx[0]) > 1e-9 else float('nan')
+        ratio_dx = dx[i_mid] / dx[i_lo] if abs(dx[i_lo]) > 1e-9 else float('nan')
         _emit(lines,
-              f'    delta_x[1]/delta_x[0] = {ratio_dx:+.2f}'
+              f'    delta_x[mid={i_mid}]/delta_x[outer={i_lo}] = {ratio_dx:+.2f}'
               f'   (expected -0.50: algorithm identity for evenly-spaced z)')
         _emit(lines,
-              '  Note: for evenly-spaced z the two-plane predictor always gives')
-        _emit(lines,
-              '    delta[0]=delta[2], delta[1]=-delta[0]/2 (measures curvature only).')
+              f'  Note: z spacing is even ({dz_lo:.0f} mm gaps); '
+              f'middle column is col {i_mid} (z={z_tel[i_mid]:.0f} mm). '
+              f'Two-plane predictor measures curvature only.')
     else:
-        t0 = (z_tel[0] - z_tel[1]) / (z_tel[2] - z_tel[1])
-        t2 = (z_tel[2] - z_tel[0]) / (z_tel[1] - z_tel[0])
+        t_lo = (z_tel[i_lo] - z_tel[i_mid]) / (z_tel[i_hi] - z_tel[i_mid])
+        t_hi = (z_tel[i_hi] - z_tel[i_lo]) / (z_tel[i_mid] - z_tel[i_lo])
         _emit(lines,
               f'  Note: z=[{z_tel[0]:.0f},{z_tel[1]:.0f},{z_tel[2]:.0f}] mm '
-              f'(uneven: dz01={dz01:.0f} mm, dz12={dz12:.0f} mm); '
-              f'extrapolation factors t0={t0:.3f}, t2={t2:.3f}. '
-              f'delta[0]≠delta[2] expected.')
+              f'(uneven: dz_lo={dz_lo:.0f} mm, dz_hi={dz_hi:.0f} mm); '
+              f'extrapolation factors t_lo={t_lo:.3f}, t_hi={t_hi:.3f}. '
+              f'delta[outer_lo]≠delta[outer_hi] expected.')
     _emit(lines)
 
     # ── Pass 2: coincidence search (stage 2) + hit quality (stage 3)

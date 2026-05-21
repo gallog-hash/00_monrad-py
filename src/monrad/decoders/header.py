@@ -133,9 +133,14 @@ def parse_header(filename: str) -> Dict[str, Dict[str, Any]]:
                 if value.startswith('"') and value.endswith('"'):
                     value = value[1:-1]
 
-                # GPS string fields: decode escaped binary payload
-                if current_module == 'GPS' and key.startswith('GPS_String'):
+                # GPS string fields: decode escaped binary payload.
+                # Real hardware writes "GPS String" (space); synth writes
+                # "GPS_String_00" (underscore).  Normalise to underscore so
+                # downstream code can use a single startswith check.
+                norm_key = key.replace(' ', '_')
+                if current_module == 'GPS' and norm_key.startswith('GPS_String'):
                     value = _decode_escaped_bytes(value)
+                    key = norm_key
                 else:
                     try:
                         if '.' not in value and value.replace('-', '').isdigit():
