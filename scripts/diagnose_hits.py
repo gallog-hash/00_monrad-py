@@ -84,6 +84,10 @@ def _accumulate(
     per-bit firing counts and popcount histograms into bit_freq / pop_hist.
 
     Indices: 0=fiber_X, 1=ribbon_X, 2=fiber_Y, 3=ribbon_Y.
+
+    All-bits-set events (popcount == 10, cross-talk artefacts) are counted
+    in pop_hist but excluded from bit_freq so they do not bias the
+    fold-symmetry calculation.
     """
     mask10 = (1 << _NBITS) - 1
 
@@ -103,9 +107,13 @@ def _accumulate(
         for i, m in enumerate([fx, rx, fy, ry]):
             pc = bin(m).count('1')
             pop_hist[i][pc] += 1
-            for bit in range(_NBITS):
-                if (m >> bit) & 1:
-                    bit_freq[i][bit] += 1
+            # Exclude all-bits-set events from bit_freq: they set every bit
+            # equally and would artificially pull fold-symmetry ratios toward
+            # 1.00, masking or exaggerating the folded-fiber signal.
+            if pc < _NBITS:
+                for bit in range(_NBITS):
+                    if (m >> bit) & 1:
+                        bit_freq[i][bit] += 1
 
 
 # ── reporting helpers ────────────────────────────────────────────────────────
@@ -148,7 +156,10 @@ def _print_axis(
     pop_hist:  Counter,
     n_groups:  int,
 ) -> None:
-    mean_pop = sum(bit_freq.values()) / n_groups
+    # True mean popcount from pop_hist (includes all-bits-set events).
+    # bit_freq excludes all-bits-set, so using it here would give a
+    # downward-biased mean.
+    mean_pop = sum(k * pop_hist.get(k, 0) for k in range(_NBITS + 1)) / n_groups
 
     pop_parts = []
     for k in range(_NBITS + 1):
@@ -157,6 +168,7 @@ def _print_axis(
             pop_parts.append(f'{k}:{100*c/n_groups:.1f}%')
     pop_str = '  '.join(pop_parts)
 
+    # Per-bit rates exclude all-bits-set events (see _accumulate).
     rates = [100 * bit_freq.get(b, 0) / n_groups for b in range(_NBITS)]
     rates_str = '[' + ', '.join(f'{r:.1f}' for r in rates) + ']'
 
@@ -200,7 +212,7 @@ def _print_summary_table(
         for i, lbl in enumerate(labels):
             bf  = bit_freqs[i]
             ph  = pop_hists[i]
-            mp  = sum(bf.values()) / n_groups
+            mp  = sum(k * ph.get(k, 0) for k in range(_NBITS + 1)) / n_groups
             g1  = 100 * ph.get(1, 0) / n_groups
             n_all = 100 * ph.get(_NBITS, 0) / n_groups
             sym = _fold_symmetry(bf, n_groups)
