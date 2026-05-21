@@ -850,17 +850,28 @@ real data on first inspection:
   (2022 lab run, `scripts/diagnose_hits.py`) reveals that a single muon hit
   consistently fires **two non-adjacent fiber bits** whose indices are
   mirror-symmetric about the midpoint of the 10-bit mask: bits k and (9 − k)
-  fire together at nearly equal rates (mean symmetry ratio ≈ 0.90 across all
-  three planes and both axes).  The most likely explanation is that each
-  physical scintillator strip is read out by two fibers that are routed to
-  MAROC channels k and 9 − k ("folded" or "mirror" wiring).  The current
-  decoder (`BinDecoder._reconstruct_coord`) treats these two non-adjacent bits
-  as irreconcilable separate clusters and returns `unresolved`, which is the
-  primary cause of the ~83 % unresolved rate seen in coincident telescope hits.
-  Resolving this requires the physical fiber-to-MAROC-channel mapping (a
-  hardware document or a test-pulse scan) so that a remapping step can be
-  inserted before `_reconstruct_coord`.  Until then, hits from folded-wired
-  planes cannot be reconstructed and stage 5 cannot be reached.
+  fire together at nearly equal rates.  Symmetry ratios (computed excluding
+  all-bits-set cross-talk events — see next item) across the 2022 dataset:
+
+  | Plane | fiber_X | ribbon_X | fiber_Y | ribbon_Y |
+  |-------|---------|----------|---------|----------|
+  | 0     | 0.89    | 0.92     | 0.75    | 0.86     |
+  | 1     | 0.89    | 0.83     | 0.91    | 0.91     |
+  | 2     | 0.89    | 0.86     | 0.91    | 0.86     |
+
+  The Plane 0 fiber_Y score (0.75) is lower partly because the higher
+  cross-talk rate on that board inflates individual bit counts unevenly even
+  after all-bits-set events are excluded.  The most likely explanation for the
+  overall symmetry is that each physical scintillator strip is read out by two
+  fibers routed to MAROC channels k and 9 − k ("folded" or "mirror" wiring).
+  The current decoder (`BinDecoder._reconstruct_coord`) treats these two
+  non-adjacent bits as irreconcilable separate clusters and returns
+  `unresolved`, which is the primary cause of the ~83 % unresolved rate seen
+  in coincident telescope hits.  Resolving this requires the physical
+  fiber-to-MAROC-channel mapping (a hardware document or a test-pulse scan) so
+  that a remapping step can be inserted before `_reconstruct_coord`.  Until
+  then, hits from folded-wired planes cannot be reconstructed and stage 5
+  cannot be reached.
 - **MAROC cross-talk on telescope Plane 0.** In the 2022 lab run,
   `diagnose_hits.py` shows that 12.5 % of Plane 0 events have **all 10 fiber
   bits set** simultaneously (popcount = 10), compared with < 2 % on Planes 1
