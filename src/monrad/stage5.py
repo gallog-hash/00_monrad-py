@@ -423,8 +423,9 @@ class PoseFitter:
         ])
         sigma_tel = tel_hits[0].sigma_x
 
+        z_arr = self.alignment.corrected_z_tel(self.tel_z)
         a_x, b_x, a_y, b_y, cov_x, _, chi2_line = _tel_line_fit(
-            x_arr, y_arr, self.tel_z, sigma_tel
+            x_arr, y_arr, z_arr, sigma_tel
         )
         if chi2_line >= _CHI2_TRACK:
             return None
@@ -443,7 +444,11 @@ class PoseFitter:
         )
 
     def _refit(self) -> 'PoseResult':
-        result = fit_probe_pose(self._coincs, self.tel_z, self.alignment)
+        result = fit_probe_pose(
+            self._coincs,
+            self.alignment.corrected_z_tel(self.tel_z),
+            self.alignment,
+        )
         self._since_last = 0
         self.result = result
         return result

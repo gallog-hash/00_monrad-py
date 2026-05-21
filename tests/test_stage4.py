@@ -228,3 +228,82 @@ class TestOffsetRecovery:
             assert abs(pc.rotation_z) < 5e-3, (
                 f"rotation_z[{k}]={pc.rotation_z:.6f} rad, expected ≈ 0"
             )
+
+    def test_delta_z_near_zero_no_injection(self, correction):
+        """No Z offset was injected; plane 1 delta_z should be near zero."""
+        assert abs(correction.planes[1].delta_z) < 10.0, (
+            f"delta_z[1]={correction.planes[1].delta_z:.4f} mm "
+            f"unexpectedly large (no Z offset injected)"
+        )
+        assert correction.planes[0].delta_z == 0.0
+        assert correction.planes[2].delta_z == 0.0
+
+
+# ── Z-offset injection + recovery ───────────────────────────────────────
+
+_DZ_INJECT = 30.0  # mm — middle-plane Z offset to inject
+
+# σ of the slope-residual regression estimator at N events.
+# The slope (track angle) variance ≈ (mean b² over cosmic rays).
+# With a 10 Hz 1000-event run at strip_mm = 10 mm the regression noise
+# is small; we allow ±15 mm (half the injection) as a loose bound.
+_DZ_TOL = 15.0
+
+
+@pytest.fixture(scope='module')
+def synth_z(tmp_path_factory):
+    out = tmp_path_factory.mktemp('synth_stage4_z')
+    result = generate(
+        out_dir=out,
+        t_x=50.0, t_y=-30.0,
+        theta=0.29671, z_p=300.0,
+        n_tracks=_N_TRACKS,
+        seed=42,
+        start_utc=_START_UTC,
+        f0=F0,
+        z_tel_offsets={1: _DZ_INJECT},
+    )
+    return result, out
+
+
+@pytest.fixture(scope='module')
+def correction_z(synth_z):
+    result, out = synth_z
+    tel_dir = out / 'telescope'
+    utc0, f0  = load_header_params(next(tel_dir.glob('*_header.txt')))
+    gps_paths, pos_paths = find_file_pairs(tel_dir)
+
+    accum = AlignmentAccumulator(flush_every=_N_TRACKS + 1)
+    for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
+        hits = decode_position(ref, pos_paths, n_cols=3)
+        accum.add(hits)
+    return accum.flush()
+
+
+class TestZOffsetRecovery:
+
+    def test_plane1_delta_z_detected(self, correction_z):
+        """Injected 30 mm Z offset on middle plane must be recovered."""
+        dz = correction_z.planes[1].delta_z
+        assert abs(dz - _DZ_INJECT) < _DZ_TOL, (
+            f"delta_z[1]={dz:.2f} mm, expected {_DZ_INJECT} ± {_DZ_TOL} mm"
+        )
+
+    def test_outer_planes_delta_z_zero(self, correction_z):
+        """Outer planes always have delta_z = 0 (not fitted)."""
+        assert correction_z.planes[0].delta_z == 0.0
+        assert correction_z.planes[2].delta_z == 0.0
+
+    def test_needs_correction_flag(self, correction_z):
+        """A 30 mm Z offset exceeds _Z_THRESH = 5 mm."""
+        assert correction_z.needs_correction
+
+    def test_corrected_z_tel(self, correction_z):
+        """corrected_z_tel() shifts only the middle plane."""
+        import numpy as np
+        from monrad.synth import Z_TEL
+        z_corr = correction_z.corrected_z_tel(Z_TEL)
+        assert abs(z_corr[0] - Z_TEL[0]) < 1e-6
+        assert abs(z_corr[2] - Z_TEL[2]) < 1e-6
+        # Middle plane shifted by ≈ DZ_INJECT
+        assert abs(z_corr[1] - (Z_TEL[1] + _DZ_INJECT)) < _DZ_TOL

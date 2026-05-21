@@ -97,13 +97,30 @@ def _write_pos_bin(
 
 # ── encoding ────────────────────────────────────────────────────
 
-def _ch_to_u64(c_x: int, c_y: int, gen: int) -> int:
-    """Encode a golden hit (single channel per axis) as a u64 word."""
+def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
+    """Encode a hit as a u64 word.
+
+    fold=False (default): golden hit — single fiber bit + single ribbon
+    bit per axis, exactly as the real pipeline expects from clean data.
+
+    fold=True: folded-fiber encoding — each axis fires both bit k and
+    bit (9-k) in both the fiber and ribbon halves, mimicking the real
+    telescope MAROC wiring.  The fold-pair decoder (_unfold_mask) should
+    recover the original channel.
+    """
     # ch = 10 * ribbon_bit + fiber_bit
-    y_rib = 1 << (c_y // 10)
-    y_fib = 1 << (c_y % 10)
-    x_rib = 1 << (c_x // 10)
-    x_fib = 1 << (c_x % 10)
+    r_y, f_y = c_y // 10, c_y % 10
+    r_x, f_x = c_x // 10, c_x % 10
+    if fold:
+        y_rib = (1 << r_y) | (1 << (9 - r_y))
+        y_fib = (1 << f_y) | (1 << (9 - f_y))
+        x_rib = (1 << r_x) | (1 << (9 - r_x))
+        x_fib = (1 << f_x) | (1 << (9 - f_x))
+    else:
+        y_rib = 1 << r_y
+        y_fib = 1 << f_y
+        x_rib = 1 << r_x
+        x_fib = 1 << f_x
     return (
         y_rib
         | (y_fib << 10)
@@ -209,6 +226,8 @@ def generate(
     start_utc: datetime = datetime(2023, 4, 18, 19, 21, 0),
     f0: int = F0,
     plane_offsets: dict[int, tuple[float, float]] | None = None,
+    fold: bool = False,
+    z_tel_offsets: dict[int, float] | None = None,
 ) -> dict:
     """
     Write synthetic telescope + probe files to out_dir.
@@ -216,9 +235,16 @@ def generate(
     Parameters are in mm and radians.  Default pose:
       t_x=50 mm, t_y=-30 mm, theta=17°, z_p=300 mm.
 
-    plane_offsets : optional dict {plane_idx: (dx_mm, dy_mm)} applied to
-                    telescope hit coordinates before quantization, simulating
-                    per-plane translational misalignments.
+    plane_offsets  : optional dict {plane_idx: (dx_mm, dy_mm)} applied to
+                     telescope hit coordinates before quantization.
+    fold           : if True, encode telescope hits with both fold-pair
+                     bits set (k and 9-k) in each mask half, mimicking
+                     folded-fiber MAROC wiring.  fold-pair decoding should
+                     recover the original channels.
+    z_tel_offsets  : optional dict {plane_idx: dz_mm} — the telescope
+                     *.bin file is written with hits computed at
+                     Z_TEL[k] + dz, but the header still records the
+                     nominal Z_TEL.  Used to test stage-4 Z-correction.
 
     Returns a dict with keys:
       tracks          list of (a_x, b_x, a_y, b_y)
@@ -227,9 +253,12 @@ def generate(
       tel_dir, probe_dir  Path
       pose            (t_x, t_y, theta, z_p)
       plane_offsets   dict as passed in (or {})
+      z_tel_offsets   dict as passed in (or {})
     """
     if plane_offsets is None:
         plane_offsets = {}
+    if z_tel_offsets is None:
+        z_tel_offsets = {}
     out_dir = Path(out_dir)
     tel_dir = out_dir / 'telescope'
     prb_dir = out_dir / 'probe'
@@ -269,7 +298,10 @@ def generate(
     tel_blocks: list[list[int]] = []
     for ax, bx, ay, by in tracks:
         words = []
-        for k, z in enumerate(Z_TEL):
+        for k, z_nom in enumerate(Z_TEL):
+            # Hits are placed at the true z (z_nom + dz) but the pipeline
+            # is told the nominal z — this lets stage 4 detect the offset.
+            z = z_nom + z_tel_offsets.get(k, 0.0)
             off_x, off_y = plane_offsets.get(k, (0.0, 0.0))
             if off_x == 0.0 and off_y == 0.0:
                 cx = _quantize(ax + bx * z, N_TEL)
@@ -281,7 +313,7 @@ def generate(
             else:
                 cx = _quantize_clamp(ax + bx * z + off_x, N_TEL)
                 cy = _quantize_clamp(ay + by * z + off_y, N_TEL)
-            words.append(_ch_to_u64(cx, cy, gen))
+            words.append(_ch_to_u64(cx, cy, gen, fold=fold))
         tel_blocks.append(words)
         gen = (gen + 1) % 2048
 
@@ -317,4 +349,5 @@ def generate(
         'probe_dir':       prb_dir,
         'pose':            (t_x, t_y, theta, z_p),
         'plane_offsets':   plane_offsets,
+        'z_tel_offsets':   z_tel_offsets,
     }

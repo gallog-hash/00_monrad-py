@@ -846,42 +846,97 @@ real data on first inspection:
   individual plane offsets requires external survey data or a 4-plane geometry.
   For uneven plane spacing (e.g. z = [0, 630, 1350] mm) the identity breaks,
   so the `--z-tel` argument must always reflect the true hardware geometry.
-- **Folded-fiber readout in the telescope.** Analysis of real telescope data
-  (2022 lab run, `scripts/diagnose_hits.py`) reveals that a single muon hit
-  consistently fires **two non-adjacent fiber bits** whose indices are
-  mirror-symmetric about the midpoint of the 10-bit mask: bits k and (9 − k)
-  fire together at nearly equal rates.  Symmetry ratios (computed excluding
-  all-bits-set cross-talk events — see next item) across the 2022 dataset:
+- **Folded-fiber readout — telescope and probe (all datasets).**
+  `scripts/diagnose_hits.py` has been run on three lab datasets
+  (2021-07-23, 2022-02-04, 2023-04-18).  The key diagnostics are
+  fold-symmetry score (ratio of mirror-pair firing rates; 1.00 = perfect
+  fold), mean popcount after 16-row OR, and the all-bits-set rate (proxy
+  for MAROC cross-talk).
 
-  | Plane | fiber_X | ribbon_X | fiber_Y | ribbon_Y |
-  |-------|---------|----------|---------|----------|
-  | 0     | 0.89    | 0.92     | 0.75    | 0.86     |
-  | 1     | 0.89    | 0.83     | 0.91    | 0.91     |
-  | 2     | 0.89    | 0.86     | 0.91    | 0.86     |
+  **Telescope fold-symmetry scores (excluding all-bits-set events):**
 
-  The Plane 0 fiber_Y score (0.75) is lower partly because the higher
-  cross-talk rate on that board inflates individual bit counts unevenly even
-  after all-bits-set events are excluded.  The most likely explanation for the
-  overall symmetry is that each physical scintillator strip is read out by two
-  fibers routed to MAROC channels k and 9 − k ("folded" or "mirror" wiring).
-  The current decoder (`BinDecoder._reconstruct_coord`) treats these two
-  non-adjacent bits as irreconcilable separate clusters and returns
-  `unresolved`, which is the primary cause of the ~83 % unresolved rate seen
-  in coincident telescope hits.  Resolving this requires the physical
-  fiber-to-MAROC-channel mapping (a hardware document or a test-pulse scan) so
-  that a remapping step can be inserted before `_reconstruct_coord`.  Until
-  then, hits from folded-wired planes cannot be reconstructed and stage 5
-  cannot be reached.
-- **MAROC cross-talk on telescope Plane 0.** In the 2022 lab run,
-  `diagnose_hits.py` shows that 12.5 % of Plane 0 events have **all 10 fiber
-  bits set** simultaneously (popcount = 10), compared with < 2 % on Planes 1
-  and 2 and < 0.03 % on the probe.  This is a hardware artefact: a large
-  primary signal on one MAROC channel induces cross-talk that saturates the
-  remaining channels on the same chip.  These events are already rejected by
-  `BinDecoder._is_valid` (all-ones fiber mask → invalid), but the high rate
-  (12.5 %) degrades effective statistics for stage 4 and suggests the Plane 0
-  MAROC threshold should be raised or the gain reduced until the cross-talk
-  rate falls below ~1 %.
+  | Run  | Pl | fib_X | rib_X | fib_Y | rib_Y | xtalk_fib_X% |
+  |------|----|-------|-------|-------|-------|--------------|
+  | 2021 | 0  | 0.90  | 0.93  | 0.91  | 0.95  | 2.7          |
+  | 2021 | 1  | 0.90  | 0.77  | 0.89  | 0.90  | 3.4          |
+  | 2021 | 2  | 0.87  | 0.86  | 0.91  | 0.89  | 3.1          |
+  | 2022 | 0  | 0.88  | 0.93  | 0.73  | 0.89  | 13.4         |
+  | 2022 | 1  | 0.91  | 0.80  | 0.89  | 0.90  | 2.4          |
+  | 2022 | 2  | 0.87  | 0.82  | 0.91  | 0.88  | 7.0          |
+  | 2023 | 0  | 0.87  | 0.78  | 0.85  | 0.88  | 3.9          |
+  | 2023 | 1  | nan   | nan   | nan   | nan   | **89.5**     |
+  | 2023 | 2  | 0.83  | 0.81  | 0.89  | 0.90  | 2.3          |
+
+  (2023 column refers to `BuS_Tracker` — see note below on plane 1.)
+
+  **Deductions:**
+
+  1. *Folded readout is structural.*  Fold-symmetry ≈ 0.80–0.95 in the
+     fiber half appears consistently across all three years and all planes
+     that are functional.  The most likely explanation is that each physical
+     scintillator strip is read out by two SiPMs/fibers routed to MAROC
+     channels k and (9 − k) ("folded" or "mirror" wiring).  Mean popcounts
+     of ~2 for telescope fiber halves (vs. ~1 for single-bit events)
+     confirm that two bits fire per hit.
+
+  2. *Ribbon fold in the telescope.*  Ribbon halves also show fold-symmetry
+     scores of 0.77–0.95 and mean popcounts of ~1.8–2.3.  All 10 ribbon
+     bits are active in telescope planes, implying the ribbon readout is
+     also folded.  This means both fiber and ribbon contribute fold pairs
+     for every hit; after fold-decoding, the effective channel count per
+     axis is at most 5 × 5 = 25 (fiber positions 0–4 × ribbon positions
+     0–4).  The physical coordinate mapping `x_mm = (ch + 0.5) × 10 mm`
+     remains usable but implies an active area of ~250 mm per axis rather
+     than 990 mm — the true strip-to-MAROC mapping requires hardware
+     documentation or a test-pulse scan to determine the correct physical
+     ordering.
+
+  3. *Probe ribbon is NOT folded.*  All probe ribbon halves use only bits
+     0–3 (4 active bits, bits 4–9 are always zero).  This matches a probe
+     with 4 ribbon strips → ~40 mm active area in that dimension.  Fold
+     symmetry is NaN for probe ribbon because no mirror pairs (k, 9−k) with
+     k ≤ 3 exist above the 2 % activity threshold.  Probe fiber halves show
+     moderate fold signatures (0.71–0.86), so the fiber half of the probe
+     is also likely folded.
+
+  4. *Current decoder impact.*  `BinDecoder._reconstruct_coord` treats the
+     two non-adjacent fold-pair bits as irreconcilable clusters and returns
+     `unresolved`.  This is the dominant cause of the ~83 % unresolved
+     rate in telescope coincident hits; the fold-pair decoder (§11 task 3.4)
+     addresses this directly by recognising (k, 9−k) patterns and remapping
+     to a single position before clustering.
+
+- **MAROC cross-talk — per-run severity and 2023 plane-1 failure.**
+  The all-bits-set popcount (= 10) rate is the primary cross-talk proxy.
+  All-bits-set events are already rejected by `BinDecoder._is_valid` and
+  excluded from fold-symmetry calculations.
+
+  *2021 telescope:*  All planes show uniform cross-talk of 2.7–3.5 % on
+  both fiber and ribbon halves.  This is above the ~1 % target but modest
+  enough that most planes remain functional; MAROC thresholds were
+  apparently near the acceptable limit in this run.
+
+  *2022 telescope:*  Plane 0 shows 12–14 % all-bits-set rate (previously
+  documented as ~12.5 %).  Plane 2 shows 7 %.  Plane 1 is the healthiest
+  at 1.8–2.5 %.  The Plane 0 fiber_Y fold-symmetry score drops to 0.73
+  because the elevated cross-talk inflates individual bit counts unevenly
+  even after cross-talk events are excluded.
+
+  *2023 BuS_Tracker:*  **Plane 1 is catastrophically saturated: 89.5 %
+  all-bits-set rate across all four axes.**  The remaining ~10 % events
+  have a mix of single-bit and very-low-count patterns with no coherent
+  fold structure (fold-symmetry = NaN, no active bits above 2 % threshold).
+  Plane 1 of the 2023 BuS_Tracker should be treated as non-functional; the
+  2023 run is effectively a 2-plane telescope (planes 0 and 2 only).  The
+  MAROC chip for plane 1 requires threshold/gain adjustment before the next
+  run.  Planes 0 and 2 of the 2023 BuS_Tracker have acceptable cross-talk
+  (2–4 %) and clear fold-symmetry signatures (0.78–0.90).
+
+  *2023 BuS_Probe J11_40x40:*  Fiber cross-talk is 1.7–2.6 %; ribbon
+  shows no cross-talk (0 %).  The fiber_X fold-symmetry is notably lower
+  (0.71) with strongly asymmetric per-bit rates (bits 4–7 fire at ~31–35 %,
+  bits 0–3 and 8–9 at 15–28 %), suggesting either non-uniform illumination
+  or an imperfect fold mapping on this probe board.
 
 
 ## 11. Synthetic end-to-end test

@@ -222,9 +222,91 @@ def _print_summary_table(
                   f'{g1:>8.1f}  {n_all:>10.2f}  {sm_val:>9.2f}')
 
 
+# ── co-firing analysis ───────────────────────────────────────────────────────
+
+def _accumulate_cofiring(
+    words:       list[int],
+    n_groups:    int,
+    n_cols:      int,
+    col:         int,
+    co_counts:   list[list[list[int]]],
+) -> None:
+    """
+    Accumulate co-firing counts into co_counts[axis][bit_i][bit_j].
+
+    co_counts[a][i][j] = number of events in which both bit i and bit j
+    fired in axis a (i < j, upper triangle; diagonal = single-bit count).
+    All-bits-set events (cross-talk) are excluded.
+    """
+    mask10 = (1 << _NBITS) - 1
+    for g in range(n_groups):
+        x_or = y_or = 0
+        base = g * 16 * n_cols + col
+        for row in range(16):
+            w = words[base + row * n_cols]
+            y_or |= w & 0xFFFFF
+            x_or |= (w >> 32) & 0xFFFFF
+
+        fx = (x_or >> _NBITS) & mask10
+        rx =  x_or             & mask10
+        fy = (y_or >> _NBITS) & mask10
+        ry =  y_or             & mask10
+
+        for a, m in enumerate([fx, rx, fy, ry]):
+            if bin(m).count('1') == _NBITS:
+                continue  # exclude all-bits-set (cross-talk)
+            bits_set = [b for b in range(_NBITS) if (m >> b) & 1]
+            for b in bits_set:
+                co_counts[a][b][b] += 1       # diagonal = single-bit count
+            for i, bi in enumerate(bits_set):
+                for bj in bits_set[i + 1:]:
+                    co_counts[a][bi][bj] += 1  # upper triangle
+
+
+def _print_cofiring(
+    co_counts: list[list[list[int]]],
+    n_groups:  int,
+    col:       int,
+) -> None:
+    labels = ['fiber_X', 'ribbon_X', 'fiber_Y', 'ribbon_Y']
+    for a, lbl in enumerate(labels):
+        mat = co_counts[a]
+        print(f'\n  Plane {col}  {lbl}  co-firing matrix (%, excluding all-bits-set)')
+        header = '       ' + ''.join(f'{j:>7}' for j in range(_NBITS))
+        print(header)
+        for i in range(_NBITS):
+            row_str = f'  bit {i} '
+            for j in range(_NBITS):
+                if j < i:
+                    row_str += '       '
+                elif j == i:
+                    pct = 100 * mat[i][i] / n_groups
+                    row_str += f'{pct:>6.1f}%'
+                else:
+                    pct = 100 * mat[i][j] / n_groups
+                    row_str += f'{pct:>6.1f}%' if pct > 0.5 else '      -'
+            print(row_str)
+
+        # Highlight the five (k, 9-k) mirror pairs.
+        print(f'  Mirror-pair rates (k, 9-k):')
+        for k in range(_NBITS // 2):
+            mirror = _NBITS - 1 - k
+            co_pct = 100 * mat[k][mirror] / n_groups
+            k_pct  = 100 * mat[k][k]      / n_groups
+            m_pct  = 100 * mat[mirror][mirror] / n_groups
+            print(f'    ({k:d},{mirror:d}): '
+                  f'both={co_pct:.1f}%  '
+                  f'only {k:d}={k_pct - co_pct:.1f}%  '
+                  f'only {mirror:d}={m_pct - co_pct:.1f}%')
+
+
 # ── main entry point ─────────────────────────────────────────────────────────
 
-def diagnose(paths: list[Path], max_groups: int | None) -> None:
+def diagnose(
+    paths:       list[Path],
+    max_groups:  int | None,
+    co_firing:   bool = False,
+) -> None:
     """Aggregate statistics across all paths and print the full report."""
 
     # Determine n_cols from the first file.
@@ -233,6 +315,11 @@ def diagnose(paths: list[Path], max_groups: int | None) -> None:
     # Per-plane accumulators.
     bit_freqs = [[Counter() for _ in range(4)] for _ in range(n_cols_ref)]
     pop_hists = [[Counter() for _ in range(4)] for _ in range(n_cols_ref)]
+    # co_counts[col][axis][bit_i][bit_j]  (upper triangle + diagonal)
+    co_counts = [
+        [[[0] * _NBITS for _ in range(_NBITS)] for _ in range(4)]
+        for _ in range(n_cols_ref)
+    ] if co_firing else None
     total_groups = 0
 
     for path in paths:
@@ -244,6 +331,9 @@ def diagnose(paths: list[Path], max_groups: int | None) -> None:
         for col in range(n_cols):
             _accumulate(words, n_groups, n_cols, col,
                         bit_freqs[col], pop_hists[col])
+            if co_counts is not None:
+                _accumulate_cofiring(words, n_groups, n_cols, col,
+                                     co_counts[col])
         total_groups += n_groups
 
     if total_groups == 0:
@@ -269,6 +359,13 @@ def diagnose(paths: list[Path], max_groups: int | None) -> None:
         for lbl, idx in labels:
             _print_axis(lbl, bit_freqs[col][idx], pop_hists[col][idx], total_groups)
 
+    if co_counts is not None:
+        print(f'\n{"="*65}')
+        print('Co-firing analysis')
+        print(f'{"="*65}')
+        for col in range(n_cols_ref):
+            _print_cofiring(co_counts[col], total_groups, col)
+
 
 def main() -> None:
     p = argparse.ArgumentParser(
@@ -280,6 +377,9 @@ def main() -> None:
                    help='*.bin file or directory containing *.bin files')
     p.add_argument('--max-groups', type=int, default=None, metavar='N',
                    help='Analyse at most N event groups per file (quick scan)')
+    p.add_argument('--co-firing', action='store_true',
+                   help='Print 10×10 co-firing matrix per plane/axis '
+                        '(confirms fold-pair structure)')
     args = p.parse_args()
 
     if args.path.is_dir():
@@ -293,7 +393,7 @@ def main() -> None:
     else:
         p.error(f'Path not found: {args.path}')
 
-    diagnose(paths, args.max_groups)
+    diagnose(paths, args.max_groups, co_firing=args.co_firing)
 
 
 if __name__ == '__main__':
