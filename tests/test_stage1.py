@@ -12,10 +12,7 @@ from datetime import datetime
 
 from monrad.stage1 import (
     Quality,
-    PosRef,
-    TimedEvent,
     _utc_to_ns,
-    _build_next_interval,
     load_header_params,
     find_file_pairs,
     reconstruct,
@@ -24,19 +21,22 @@ from monrad.stage1 import (
 from monrad.synth import generate, F0
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
-_N_TRACKS  = 1000
+_N_TRACKS = 1000
 
 
 # ── fixtures ─────────────────────────────────────────────────────
 
-@pytest.fixture(scope='module')
+
+@pytest.fixture(scope="module")
 def synth(tmp_path_factory):
     """Generate one set of telescope + probe files for the whole module."""
-    out = tmp_path_factory.mktemp('synth')
+    out = tmp_path_factory.mktemp("synth")
     result = generate(
         out_dir=out,
-        t_x=50.0, t_y=-30.0,
-        theta=0.29671, z_p=300.0,
+        t_x=50.0,
+        t_y=-30.0,
+        theta=0.29671,
+        z_p=300.0,
         n_tracks=_N_TRACKS,
         seed=42,
         start_utc=_START_UTC,
@@ -47,12 +47,13 @@ def synth(tmp_path_factory):
 
 # ── batch fixtures (deprecated reconstruct()) ─────────────────────
 
-@pytest.fixture(scope='module')
+
+@pytest.fixture(scope="module")
 def tel_batch(synth):
     """Run stage 1 (batch) on the telescope detector."""
     result, out = synth
-    tel_dir = out / 'telescope'
-    header  = next(tel_dir.glob('*_header.txt'))
+    tel_dir = out / "telescope"
+    header = next(tel_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(tel_dir)
     with pytest.warns(DeprecationWarning):
@@ -60,12 +61,12 @@ def tel_batch(synth):
     return events, pos_map, utc0, f0
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 def prb_batch(synth):
     """Run stage 1 (batch) on the probe detector."""
     result, out = synth
-    prb_dir = out / 'probe'
-    header  = next(prb_dir.glob('*_header.txt'))
+    prb_dir = out / "probe"
+    header = next(prb_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(prb_dir)
     with pytest.warns(DeprecationWarning):
@@ -75,35 +76,37 @@ def prb_batch(synth):
 
 # ── streaming fixtures ────────────────────────────────────────────
 
-@pytest.fixture(scope='module')
+
+@pytest.fixture(scope="module")
 def tel(synth):
     """Run stage 1 (streaming) on the telescope detector."""
     result, out = synth
-    tel_dir = out / 'telescope'
-    header  = next(tel_dir.glob('*_header.txt'))
+    tel_dir = out / "telescope"
+    header = next(tel_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(tel_dir)
     events_and_refs = list(reconstruct_stream(gps, pos, utc0, f0))
-    events   = [ev  for ev, _   in events_and_refs]
-    pos_index = [ref for _,  ref in events_and_refs]
+    events = [ev for ev, _ in events_and_refs]
+    pos_index = [ref for _, ref in events_and_refs]
     return events, pos_index, utc0, f0
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 def prb(synth):
     """Run stage 1 (streaming) on the probe detector."""
     result, out = synth
-    prb_dir = out / 'probe'
-    header  = next(prb_dir.glob('*_header.txt'))
+    prb_dir = out / "probe"
+    header = next(prb_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(prb_dir)
     events_and_refs = list(reconstruct_stream(gps, pos, utc0, f0))
-    events    = [ev  for ev, _   in events_and_refs]
-    pos_index = [ref for _,  ref in events_and_refs]
+    events = [ev for ev, _ in events_and_refs]
+    pos_index = [ref for _, ref in events_and_refs]
     return events, pos_index
 
 
 # ── helpers ───────────────────────────────────────────────────────
+
 
 def _expected_ns(utc0_ns: int, i: int, f0: int) -> int:
     """
@@ -113,13 +116,14 @@ def _expected_ns(utc0_ns: int, i: int, f0: int) -> int:
     which—with the ideal PPS chain—maps to
       t_ns = utc0_ns + tick * 1_000_000_000 // f0.
     """
-    dt   = f0 // 10   # ticks between events
-    toff = dt  // 2   # offset from PPS edge
+    dt = f0 // 10  # ticks between events
+    toff = dt // 2  # offset from PPS edge
     tick = toff + i * dt
     return utc0_ns + tick * 1_000_000_000 // f0
 
 
 # ── utility tests ─────────────────────────────────────────────────
+
 
 class TestUtcToNs:
     def test_epoch_is_zero(self):
@@ -136,13 +140,13 @@ class TestUtcToNs:
 class TestLoadHeaderParams:
     def test_utc0_matches_start(self, synth):
         _, out = synth
-        header = next((out / 'telescope').glob('*_header.txt'))
+        header = next((out / "telescope").glob("*_header.txt"))
         utc0, _ = load_header_params(header)
         assert utc0 == _START_UTC
 
     def test_f0_matches_synth(self, synth):
         _, out = synth
-        header = next((out / 'telescope').glob('*_header.txt'))
+        header = next((out / "telescope").glob("*_header.txt"))
         _, f0 = load_header_params(header)
         assert f0 == F0
 
@@ -150,22 +154,23 @@ class TestLoadHeaderParams:
 class TestFindFilePairs:
     def test_returns_one_pair(self, synth):
         _, out = synth
-        gps, pos = find_file_pairs(out / 'telescope')
+        gps, pos = find_file_pairs(out / "telescope")
         assert len(gps) == 1 and len(pos) == 1
 
     def test_gps_suffix(self, synth):
         _, out = synth
-        gps, _ = find_file_pairs(out / 'telescope')
-        assert gps[0].name.endswith('_GPS.bin')
+        gps, _ = find_file_pairs(out / "telescope")
+        assert gps[0].name.endswith("_GPS.bin")
 
     def test_pos_not_gps_suffix(self, synth):
         _, out = synth
-        _, pos = find_file_pairs(out / 'telescope')
-        assert not pos[0].name.endswith('_GPS.bin')
-        assert pos[0].name.endswith('.bin')
+        _, pos = find_file_pairs(out / "telescope")
+        assert not pos[0].name.endswith("_GPS.bin")
+        assert pos[0].name.endswith(".bin")
 
 
 # ── batch-API telescope tests ─────────────────────────────────────
+
 
 class TestTelescopeEvents:
     def test_count(self, tel_batch):
@@ -175,14 +180,13 @@ class TestTelescopeEvents:
     def test_all_good(self, tel_batch):
         events, _, _, _ = tel_batch
         bad = [e for e in events if e.quality != Quality.GOOD]
-        assert not bad, f'{len(bad)} events not GOOD'
+        assert not bad, f"{len(bad)} events not GOOD"
 
     def test_monotonic(self, tel_batch):
         events, _, _, _ = tel_batch
         for i in range(1, len(events)):
             assert events[i].t_ns >= events[i - 1].t_ns, (
-                f'Non-monotonic at i={i}: '
-                f'{events[i].t_ns} < {events[i-1].t_ns}'
+                f"Non-monotonic at i={i}: {events[i].t_ns} < {events[i - 1].t_ns}"
             )
 
     def test_timestamps_exact(self, tel_batch):
@@ -190,9 +194,7 @@ class TestTelescopeEvents:
         utc0_ns = _utc_to_ns(utc0)
         for i, ev in enumerate(events):
             exp = _expected_ns(utc0_ns, i, f0)
-            assert ev.t_ns == exp, (
-                f'evt {i}: got {ev.t_ns}, expected {exp}'
-            )
+            assert ev.t_ns == exp, f"evt {i}: got {ev.t_ns}, expected {exp}"
 
     def test_evt_seq_contiguous(self, tel_batch):
         events, _, _, _ = tel_batch
@@ -203,9 +205,7 @@ class TestTelescopeEvents:
         events, _, _, _ = tel_batch
         for i in range(1, len(events)):
             diff = events[i].t_ns - events[i - 1].t_ns
-            assert diff == 100_000_000, (
-                f'Spacing at i={i}: {diff} ns, want 100 ms'
-            )
+            assert diff == 100_000_000, f"Spacing at i={i}: {diff} ns, want 100 ms"
 
 
 class TestTelescopePosMap:
@@ -221,8 +221,7 @@ class TestTelescopePosMap:
         _, pos_map, _, _ = tel_batch
         for i in range(_N_TRACKS):
             assert pos_map[i].row_offset == i * 16, (
-                f'evt {i}: row_offset={pos_map[i].row_offset}, '
-                f'want {i * 16}'
+                f"evt {i}: row_offset={pos_map[i].row_offset}, want {i * 16}"
             )
 
     def test_no_split_blocks(self, tel_batch):
@@ -232,16 +231,17 @@ class TestTelescopePosMap:
 
 # ── batch-API probe tests ─────────────────────────────────────────
 
+
 class TestProbeEvents:
     def test_count(self, synth, prb_batch):
         result, _ = synth
         events, _ = prb_batch
-        assert len(events) == result['n_coincidences']
+        assert len(events) == result["n_coincidences"]
 
     def test_all_good(self, prb_batch):
         events, _ = prb_batch
         bad = [e for e in events if e.quality != Quality.GOOD]
-        assert not bad, f'{len(bad)} probe events not GOOD'
+        assert not bad, f"{len(bad)} probe events not GOOD"
 
     def test_monotonic(self, prb_batch):
         events, _ = prb_batch
@@ -249,17 +249,16 @@ class TestProbeEvents:
             assert events[i].t_ns >= events[i - 1].t_ns
 
     def test_timestamps_match_telescope(self, synth, tel_batch, prb_batch):
-        result, _   = synth
+        result, _ = synth
         tel_evts, _, utc0, f0 = tel_batch
         prb_evts, _ = prb_batch
-        utc0_ns     = _utc_to_ns(utc0)
-        coinc_idx   = sorted(result['probe_hits'])
+        utc0_ns = _utc_to_ns(utc0)
+        coinc_idx = sorted(result["probe_hits"])
         for j, prb_ev in enumerate(prb_evts):
-            i   = coinc_idx[j]
+            i = coinc_idx[j]
             exp = _expected_ns(utc0_ns, i, f0)
             assert prb_ev.t_ns == exp, (
-                f'probe evt {j} (tel idx {i}): '
-                f'got {prb_ev.t_ns}, expected {exp}'
+                f"probe evt {j} (tel idx {i}): got {prb_ev.t_ns}, expected {exp}"
             )
 
     def test_evt_seq_contiguous(self, prb_batch):
@@ -272,7 +271,7 @@ class TestProbePosMap:
     def test_coverage(self, synth, prb_batch):
         result, _ = synth
         _, pos_map = prb_batch
-        n = result['n_coincidences']
+        n = result["n_coincidences"]
         assert set(pos_map) == set(range(n))
 
     def test_no_split_blocks(self, prb_batch):
@@ -282,11 +281,12 @@ class TestProbePosMap:
     def test_row_offsets(self, synth, prb_batch):
         result, _ = synth
         _, pos_map = prb_batch
-        for i in range(result['n_coincidences']):
+        for i in range(result["n_coincidences"]):
             assert pos_map[i].row_offset == i * 16
 
 
 # ── streaming-API tests ───────────────────────────────────────────
+
 
 class TestReconstructStream:
     """
@@ -306,7 +306,7 @@ class TestReconstructStream:
     def test_tel_all_good(self, tel):
         events, _, _, _ = tel
         bad = [e for e in events if e.quality != Quality.GOOD]
-        assert not bad, f'{len(bad)} events not GOOD'
+        assert not bad, f"{len(bad)} events not GOOD"
 
     def test_tel_monotonic(self, tel):
         events, _, _, _ = tel
@@ -318,9 +318,7 @@ class TestReconstructStream:
         utc0_ns = _utc_to_ns(utc0)
         for i, ev in enumerate(events):
             exp = _expected_ns(utc0_ns, i, f0)
-            assert ev.t_ns == exp, (
-                f'evt {i}: got {ev.t_ns}, expected {exp}'
-            )
+            assert ev.t_ns == exp, f"evt {i}: got {ev.t_ns}, expected {exp}"
 
     def test_tel_evt_seq_contiguous(self, tel):
         events, _, _, _ = tel
@@ -353,12 +351,12 @@ class TestReconstructStream:
     def test_prb_count(self, synth, prb):
         result, _ = synth
         events, _ = prb
-        assert len(events) == result['n_coincidences']
+        assert len(events) == result["n_coincidences"]
 
     def test_prb_all_good(self, prb):
         events, _ = prb
         bad = [e for e in events if e.quality != Quality.GOOD]
-        assert not bad, f'{len(bad)} probe events not GOOD'
+        assert not bad, f"{len(bad)} probe events not GOOD"
 
     def test_prb_monotonic(self, prb):
         events, _ = prb
@@ -366,13 +364,13 @@ class TestReconstructStream:
             assert events[i].t_ns >= events[i - 1].t_ns
 
     def test_prb_timestamps_match_telescope(self, synth, tel, prb):
-        result, _   = synth
-        _,  _, utc0, f0 = tel
+        result, _ = synth
+        _, _, utc0, f0 = tel
         prb_evts, _ = prb
-        utc0_ns     = _utc_to_ns(utc0)
-        coinc_idx   = sorted(result['probe_hits'])
+        utc0_ns = _utc_to_ns(utc0)
+        coinc_idx = sorted(result["probe_hits"])
         for j, prb_ev in enumerate(prb_evts):
-            i   = coinc_idx[j]
+            i = coinc_idx[j]
             exp = _expected_ns(utc0_ns, i, f0)
             assert prb_ev.t_ns == exp
 
@@ -396,36 +394,37 @@ class TestReconstructStream:
 
 # Binary helpers shared by adversarial tests
 
+
 def _gps_rec(tick: int, gen: int, is_pps: bool) -> int:
     return tick | (gen << 52) | ((1 << 63) if is_pps else 0)
 
 
 def _write_gps(path, records: list[int]) -> None:
-    with open(path, 'wb') as f:
-        f.write(struct.pack('<I', len(records)))
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", len(records)))
         for r in records:
-            f.write(struct.pack('<Q', r))
+            f.write(struct.pack("<Q", r))
 
 
 def _write_pos(path, n_events: int, n_cols: int = 1) -> None:
     """Write a minimal pos file: n_events golden-hit blocks."""
     n_rows = n_events * 16
-    with open(path, 'wb') as f:
-        f.write(struct.pack('<I', n_rows))
-        f.write(struct.pack('<I', n_cols))
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", n_rows))
+        f.write(struct.pack("<I", n_cols))
         for evt in range(n_events):
             gen = evt % 2048
             # minimal golden hit: one fiber + one ribbon bit per axis
             word = (
-                (1 << 0)   # Y ribbon bit 0
-                | (1 << 10) # Y fiber bit 0
-                | (1 << 32) # X ribbon bit 0
-                | (1 << 42) # X fiber bit 0
+                (1 << 0)  # Y ribbon bit 0
+                | (1 << 10)  # Y fiber bit 0
+                | (1 << 32)  # X ribbon bit 0
+                | (1 << 42)  # X fiber bit 0
                 | (gen << 52)
             )
             for _ in range(16):
                 for _ in range(n_cols):
-                    f.write(struct.pack('<Q', word))
+                    f.write(struct.pack("<Q", word))
 
 
 def test_pre_pps1_events(tmp_path):
@@ -466,14 +465,12 @@ def test_pre_pps1_events(tmp_path):
     records.append(_gps_rec(pps2_tick, gen, True))
     records.append(_gps_rec(pps3_tick, gen, True))
 
-    gps_path = tmp_path / 'test_GPS.bin'
-    pos_path = tmp_path / 'test.bin'
+    gps_path = tmp_path / "test_GPS.bin"
+    pos_path = tmp_path / "test.bin"
     _write_gps(gps_path, records)
     _write_pos(pos_path, total_events)
 
-    results = list(
-        reconstruct_stream([gps_path], [pos_path], utc0, f0)
-    )
+    results = list(reconstruct_stream([gps_path], [pos_path], utc0, f0))
     assert len(results) == total_events
 
     # pre-PPS_1 events: first n_pre, all DEGRADED
@@ -481,18 +478,18 @@ def test_pre_pps1_events(tmp_path):
     # t_ns = utc0_ns + 0 + (tick - 0) * 1e9 * 1 // f0
     for i, (ev, ref) in enumerate(results[:n_pre]):
         assert ev.quality == Quality.DEGRADED, (
-            f'pre-PPS_1 event {i} should be DEGRADED, got {ev.quality}'
+            f"pre-PPS_1 event {i} should be DEGRADED, got {ev.quality}"
         )
         expected = utc0_ns + pre_ticks[i] * 1_000_000_000 // f0
         assert ev.t_ns == expected, (
-            f'pre-PPS_1 event {i}: got {ev.t_ns}, expected {expected}'
+            f"pre-PPS_1 event {i}: got {ev.t_ns}, expected {expected}"
         )
         assert ev.evt_seq == i
 
     # PPS_1→PPS_2 events: next n_mid, all GOOD (trusted interval)
     for j, (ev, ref) in enumerate(results[n_pre:]):
         assert ev.quality == Quality.GOOD, (
-            f'mid event {j} should be GOOD, got {ev.quality}'
+            f"mid event {j} should be GOOD, got {ev.quality}"
         )
         expected = utc0_ns + mid_ticks[j] * 1_000_000_000 // f0
         assert ev.t_ns == expected
@@ -513,7 +510,7 @@ def test_stream_exhaustion_mid_buffer(tmp_path):
     pps1_tick = 0
     pps2_tick = f0
 
-    mid_ticks  = [f0 // 4, f0 // 2, f0 * 3 // 4]  # 3 GOOD events
+    mid_ticks = [f0 // 4, f0 // 2, f0 * 3 // 4]  # 3 GOOD events
     tail_ticks = [f0 + f0 // 4, f0 + f0 // 2, f0 + f0 * 3 // 4]  # 3 DEGRADED
 
     records: list[int] = []
@@ -529,20 +526,18 @@ def test_stream_exhaustion_mid_buffer(tmp_path):
     # No PPS_3 — stream ends here
 
     n_events = len(mid_ticks) + len(tail_ticks)
-    gps_path = tmp_path / 'test_GPS.bin'
-    pos_path = tmp_path / 'test.bin'
+    gps_path = tmp_path / "test_GPS.bin"
+    pos_path = tmp_path / "test.bin"
     _write_gps(gps_path, records)
     _write_pos(pos_path, n_events)
 
-    results = list(
-        reconstruct_stream([gps_path], [pos_path], utc0, f0)
-    )
+    results = list(reconstruct_stream([gps_path], [pos_path], utc0, f0))
     assert len(results) == n_events
 
-    for ev, _ in results[:len(mid_ticks)]:
+    for ev, _ in results[: len(mid_ticks)]:
         assert ev.quality == Quality.GOOD
 
-    for ev, _ in results[len(mid_ticks):]:
+    for ev, _ in results[len(mid_ticks) :]:
         assert ev.quality == Quality.DEGRADED
 
 
@@ -577,48 +572,49 @@ def test_back_to_back_untrusted(tmp_path):
     p5 = p4 + bad_dc
     p6 = p5 + f0
 
-    good1_tick = f0 // 2            # between PPS_1 and PPS_2
-    bad1_tick  = (p2 + p3) // 2    # between PPS_2 and PPS_3
-    bad2_tick  = (p3 + p4) // 2
-    bad3_tick  = (p4 + p5) // 2
-    good2_tick = p5 + f0 // 2      # between PPS_5 and PPS_6
-
-    all_evt_ticks = [good1_tick, bad1_tick, bad2_tick, bad3_tick, good2_tick]
+    good1_tick = f0 // 2  # between PPS_1 and PPS_2
+    bad1_tick = (p2 + p3) // 2  # between PPS_2 and PPS_3
+    bad2_tick = (p3 + p4) // 2
+    bad3_tick = (p4 + p5) // 2
+    good2_tick = p5 + f0 // 2  # between PPS_5 and PPS_6
 
     records: list[int] = []
     gen = 0
 
     records.append(_gps_rec(p1, gen, True))
-    records.append(_gps_rec(good1_tick, gen, False)); gen = (gen+1)%2048
+    records.append(_gps_rec(good1_tick, gen, False))
+    gen = (gen + 1) % 2048
     records.append(_gps_rec(p2, gen, True))
-    records.append(_gps_rec(bad1_tick, gen, False));  gen = (gen+1)%2048
+    records.append(_gps_rec(bad1_tick, gen, False))
+    gen = (gen + 1) % 2048
     records.append(_gps_rec(p3, gen, True))
-    records.append(_gps_rec(bad2_tick, gen, False));  gen = (gen+1)%2048
+    records.append(_gps_rec(bad2_tick, gen, False))
+    gen = (gen + 1) % 2048
     records.append(_gps_rec(p4, gen, True))
-    records.append(_gps_rec(bad3_tick, gen, False));  gen = (gen+1)%2048
+    records.append(_gps_rec(bad3_tick, gen, False))
+    gen = (gen + 1) % 2048
     records.append(_gps_rec(p5, gen, True))
-    records.append(_gps_rec(good2_tick, gen, False)); gen = (gen+1)%2048
+    records.append(_gps_rec(good2_tick, gen, False))
+    gen = (gen + 1) % 2048
     records.append(_gps_rec(p6, gen, True))
 
     n_events = 5
-    gps_path = tmp_path / 'test_GPS.bin'
-    pos_path = tmp_path / 'test.bin'
+    gps_path = tmp_path / "test_GPS.bin"
+    pos_path = tmp_path / "test.bin"
     _write_gps(gps_path, records)
     _write_pos(pos_path, n_events)
 
-    results = list(
-        reconstruct_stream([gps_path], [pos_path], utc0, f0)
-    )
+    results = list(reconstruct_stream([gps_path], [pos_path], utc0, f0))
     assert len(results) == n_events
 
-    ev0, _ = results[0]   # good1 — in trusted PPS_1→PPS_2
-    ev1, _ = results[1]   # bad1  — in untrusted PPS_2→PPS_3
-    ev2, _ = results[2]   # bad2  — in untrusted PPS_3→PPS_4
-    ev3, _ = results[3]   # bad3  — in untrusted PPS_4→PPS_5
-    ev4, _ = results[4]   # good2 — in trusted PPS_5→PPS_6
+    ev0, _ = results[0]  # good1 — in trusted PPS_1→PPS_2
+    ev1, _ = results[1]  # bad1  — in untrusted PPS_2→PPS_3
+    ev2, _ = results[2]  # bad2  — in untrusted PPS_3→PPS_4
+    ev3, _ = results[3]  # bad3  — in untrusted PPS_4→PPS_5
+    ev4, _ = results[4]  # good2 — in trusted PPS_5→PPS_6
 
-    assert ev0.quality == Quality.GOOD,      f'expected GOOD,      got {ev0.quality}'
-    assert ev1.quality == Quality.UNTRUSTED, f'expected UNTRUSTED, got {ev1.quality}'
-    assert ev2.quality == Quality.UNTRUSTED, f'expected UNTRUSTED, got {ev2.quality}'
-    assert ev3.quality == Quality.UNTRUSTED, f'expected UNTRUSTED, got {ev3.quality}'
-    assert ev4.quality == Quality.GOOD,      f'expected GOOD,      got {ev4.quality}'
+    assert ev0.quality == Quality.GOOD, f"expected GOOD,      got {ev0.quality}"
+    assert ev1.quality == Quality.UNTRUSTED, f"expected UNTRUSTED, got {ev1.quality}"
+    assert ev2.quality == Quality.UNTRUSTED, f"expected UNTRUSTED, got {ev2.quality}"
+    assert ev3.quality == Quality.UNTRUSTED, f"expected UNTRUSTED, got {ev3.quality}"
+    assert ev4.quality == Quality.GOOD, f"expected GOOD,      got {ev4.quality}"

@@ -35,14 +35,14 @@ class BinDecoder:
 
         data shape: (n_rows, n_cols), dtype uint64
         """
-        with open(self.filename, 'rb') as f:
+        with open(self.filename, "rb") as f:
             raw = f.read()
 
         if len(raw) < 8:
             raise ValueError(f"File too short: {len(raw)} bytes")
 
-        n_rows = struct.unpack_from('<I', raw, 0)[0]
-        n_cols = struct.unpack_from('<I', raw, 4)[0]
+        n_rows = struct.unpack_from("<I", raw, 0)[0]
+        n_cols = struct.unpack_from("<I", raw, 4)[0]
 
         expected = 8 + n_rows * n_cols * 8
         if len(raw) != expected:
@@ -52,15 +52,15 @@ class BinDecoder:
                 f"got {len(raw)}"
             )
 
-        data = np.frombuffer(raw[8:], dtype='<u8').reshape(n_rows, n_cols)
+        data = np.frombuffer(raw[8:], dtype="<u8").reshape(n_rows, n_cols)
         return n_cols, n_rows, data
 
     @staticmethod
     def _parse_u64(value: int) -> dict:
         return {
-            'Y':   value        & 0xFFFFF,   # bits  0-19  (20 bits)
-            'X':  (value >> 32) & 0xFFFFF,   # bits 32-51  (20 bits)
-            'GEN':(value >> 52) & 0x7FF,     # bits 52-62  (11 bits; bit 63 unused)
+            "Y": value & 0xFFFFF,  # bits  0-19  (20 bits)
+            "X": (value >> 32) & 0xFFFFF,  # bits 32-51  (20 bits)
+            "GEN": (value >> 52) & 0x7FF,  # bits 52-62  (11 bits; bit 63 unused)
         }
 
     def analyze(self):
@@ -70,7 +70,7 @@ class BinDecoder:
         print(f"Rows:    {n_rows}")
         for r in range(n_rows):
             parsed = [self._parse_u64(int(data[r, c])) for c in range(n_cols)]
-            gens = [p['GEN'] for p in parsed]
+            gens = [p["GEN"] for p in parsed]
             gen_ok = len(set(gens)) == 1
             print(f"  row {r}:  GEN={gens}  {'OK' if gen_ok else 'MISMATCH'}")
             for c, p in enumerate(parsed):
@@ -78,18 +78,20 @@ class BinDecoder:
 
     @staticmethod
     def _fmt_bits(value: int, width: int = 20) -> str:
-        s = format(value, f'0{width}b')
+        s = format(value, f"0{width}b")
         h = width // 2
-        return s[:h] + '|' + s[h:]
+        return s[:h] + "|" + s[h:]
 
     @staticmethod
     def _fmt_counts(vals: list, width: int = 20) -> str:
         def ch(n):
-            return str(n) if n <= 9 else chr(ord('a') + n - 10)
-        s = ''.join(ch(sum((v >> bit) & 1 for v in vals))
-                    for bit in range(width - 1, -1, -1))
+            return str(n) if n <= 9 else chr(ord("a") + n - 10)
+
+        s = "".join(
+            ch(sum((v >> bit) & 1 for v in vals)) for bit in range(width - 1, -1, -1)
+        )
         h = width // 2
-        return s[:h] + '|' + s[h:]
+        return s[:h] + "|" + s[h:]
 
     @staticmethod
     def _single_bit_pos(value: int) -> int | None:
@@ -113,7 +115,7 @@ class BinDecoder:
             pos = (remaining & -remaining).bit_length() - 1
             mirror = n - 1 - pos
             if not (remaining >> mirror) & 1:
-                return None          # unpaired bit — not a clean fold pattern
+                return None  # unpaired bit — not a clean fold pattern
             unfolded |= 1 << min(pos, mirror)
             remaining &= ~(1 << pos)
             remaining &= ~(1 << mirror)
@@ -160,17 +162,17 @@ class BinDecoder:
         y_fiber, y_ribbon = (y_or >> 10) & FULL, y_or & FULL
         reasons = []
         if x_fiber == FULL:
-            reasons.append('X_fiber=1023')
+            reasons.append("X_fiber=1023")
         if x_ribbon == FULL:
-            reasons.append('X_ribbon=1023')
+            reasons.append("X_ribbon=1023")
         if y_fiber == FULL:
-            reasons.append('Y_fiber=1023')
+            reasons.append("Y_fiber=1023")
         if y_ribbon == FULL:
-            reasons.append('Y_ribbon=1023')
+            reasons.append("Y_ribbon=1023")
         if x_ribbon == 0:
-            reasons.append('X_ribbon=0')
+            reasons.append("X_ribbon=0")
         if y_ribbon == 0:
-            reasons.append('Y_ribbon=0')
+            reasons.append("Y_ribbon=0")
         return not reasons, reasons
 
     def or_visual(self, max_groups: int = None):
@@ -196,28 +198,31 @@ class BinDecoder:
         remainder = n_rows % GROUP_SIZE
 
         print(f"File:    {self.filename}")
-        print(f"Columns: {n_cols},  Rows: {n_rows},  Groups: {n_groups}"
-              + (f"  (+{remainder} leftover rows ignored)" if remainder else ""))
+        print(
+            f"Columns: {n_cols},  Rows: {n_rows},  Groups: {n_groups}"
+            + (f"  (+{remainder} leftover rows ignored)" if remainder else "")
+        )
 
         limit = n_groups if max_groups is None else min(max_groups, n_groups)
-        stats = {'golden': 0, 'cluster': 0, 'unresolved': 0, 'invalid': 0}
+        stats = {"golden": 0, "cluster": 0, "unresolved": 0, "invalid": 0}
 
         for g in range(limit):
             row_start = g * GROUP_SIZE
             rows = range(row_start, row_start + GROUP_SIZE)
 
-            group = [[self._parse_u64(int(data[r, c])) for c in range(n_cols)]
-                     for r in rows]
+            group = [
+                [self._parse_u64(int(data[r, c])) for c in range(n_cols)] for r in rows
+            ]
 
-            gen_vals = [group[s][0]['GEN'] for s in range(GROUP_SIZE)]
+            gen_vals = [group[s][0]["GEN"] for s in range(GROUP_SIZE)]
             gen_ok = len(set(gen_vals)) == 1
             gen_label = str(gen_vals[0]) if gen_ok else f"MISMATCH {gen_vals}"
 
             # Compute OR and validity for all columns before printing the header
             results = []
             for c in range(n_cols):
-                x_vals = [group[s][c]['X'] for s in range(GROUP_SIZE)]
-                y_vals = [group[s][c]['Y'] for s in range(GROUP_SIZE)]
+                x_vals = [group[s][c]["X"] for s in range(GROUP_SIZE)]
+                y_vals = [group[s][c]["Y"] for s in range(GROUP_SIZE)]
                 x_or = 0
                 y_or = 0
                 for v in x_vals:
@@ -228,30 +233,37 @@ class BinDecoder:
                 results.append((x_vals, y_vals, x_or, y_or, valid, reasons))
 
             group_valid = all(r[4] for r in results)
-            group_tag = 'VALID' if group_valid else 'INVALID'
+            group_tag = "VALID" if group_valid else "INVALID"
 
-            print(f"\n{'='*64}")
-            print(f"Group {g}  (rows {row_start}-{row_start+GROUP_SIZE-1})  "
-                  f"GEN={gen_label}  [{group_tag}]")
+            print(f"\n{'=' * 64}")
+            print(
+                f"Group {g}  (rows {row_start}-{row_start + GROUP_SIZE - 1})  "
+                f"GEN={gen_label}  [{group_tag}]"
+            )
 
-            sep = '-' * 58
+            sep = "-" * 58
             for c, (x_vals, y_vals, x_or, y_or, valid, reasons) in enumerate(results):
-                col_tag = 'VALID' if valid else f"INVALID ({', '.join(reasons)})"
+                col_tag = "VALID" if valid else f"INVALID ({', '.join(reasons)})"
                 print(f"\n  Column {c}  [{col_tag}]")
-                print(f"  {'Sample':>8}  {'X (fiber|ribbon)':^21}  {'Y (fiber|ribbon)':^21}")
+                print(
+                    f"  {'Sample':>8}  {'X (fiber|ribbon)':^21}  {'Y (fiber|ribbon)':^21}"
+                )
                 print(f"  {sep}")
                 for s in range(GROUP_SIZE):
-                    print(f"  {s:>8}  {self._fmt_bits(x_vals[s])}  "
-                          f"{self._fmt_bits(y_vals[s])}")
+                    print(
+                        f"  {s:>8}  {self._fmt_bits(x_vals[s])}  "
+                        f"{self._fmt_bits(y_vals[s])}"
+                    )
                 print(f"  {sep}")
-                print(f"  {'Count':>8}  {self._fmt_counts(x_vals)}  "
-                      f"{self._fmt_counts(y_vals)}")
-                print(f"  {'OR':>8}  {self._fmt_bits(x_or)}  "
-                      f"{self._fmt_bits(y_or)}")
+                print(
+                    f"  {'Count':>8}  {self._fmt_counts(x_vals)}  "
+                    f"{self._fmt_counts(y_vals)}"
+                )
+                print(f"  {'OR':>8}  {self._fmt_bits(x_or)}  {self._fmt_bits(y_or)}")
                 print(f"  {'':>8}  X={x_or:<8d}  Y={y_or:<8d}")
 
                 if not valid:
-                    stats['invalid'] += 1
+                    stats["invalid"] += 1
                     continue
 
                 N = 10
@@ -267,20 +279,26 @@ class BinDecoder:
                     cx, cands_x = res_x
                     cy, cands_y = res_y
                     golden = len(cands_x) == 1 and len(cands_y) == 1
-                    tag = 'golden' if golden else 'cluster'
+                    tag = "golden" if golden else "cluster"
                     stats[tag] += 1
 
                     def fmt_coord(centroid, cands):
-                        v = f"{centroid:.0f}" if centroid == int(centroid) else f"{centroid:.1f}"
+                        v = (
+                            f"{centroid:.0f}"
+                            if centroid == int(centroid)
+                            else f"{centroid:.1f}"
+                        )
                         if len(cands) == 1:
                             r, f = divmod(cands[0], N)
                             return f"{v} (r={r}, f={f})"
                         return f"{v} {{{cands[0]}..{cands[-1]}}}"
 
-                    print(f"  {'Hit':>8}  [{tag}]  "
-                          f"X={fmt_coord(cx, cands_x)}    Y={fmt_coord(cy, cands_y)}")
+                    print(
+                        f"  {'Hit':>8}  [{tag}]  "
+                        f"X={fmt_coord(cx, cands_x)}    Y={fmt_coord(cy, cands_y)}"
+                    )
                 else:
-                    stats['unresolved'] += 1
+                    stats["unresolved"] += 1
 
                     def diag(fc, rc):
                         if len(fc) != 1 or len(rc) != 1:
@@ -288,44 +306,61 @@ class BinDecoder:
                         cands = sorted(N * r + f for r in rc[0] for f in fc[0])
                         return f"non-contiguous {{{','.join(map(str, cands))}}}"
 
-                    print(f"  {'Hit':>8}  [unresolved]  "
-                          f"X: {diag(xfc, xrc)}  Y: {diag(yfc, yrc)}")
+                    print(
+                        f"  {'Hit':>8}  [unresolved]  "
+                        f"X: {diag(xfc, xrc)}  Y: {diag(yfc, yrc)}"
+                    )
 
-        n_valid = stats['golden'] + stats['cluster'] + stats['unresolved']
-        n_total = n_valid + stats['invalid']
-        n_restored = stats['golden'] + stats['cluster']
-        pct = lambda n, d: 100 * n / d if d else 0.0
-        print(f"\n{'='*64}")
-        print(f"Reconstruction summary  ({limit} groups × {n_cols} columns = {n_total} total)")
-        print(f"  Invalid:     {stats['invalid']:>6}  ({pct(stats['invalid'], n_total):5.1f}%)")
-        print(f"  Golden:      {stats['golden']:>6}  ({pct(stats['golden'],  n_total):5.1f}%)  "
-              f"[1 fiber bit + 1 ribbon bit]")
-        print(f"  Cluster:     {stats['cluster']:>6}  ({pct(stats['cluster'], n_total):5.1f}%)  "
-              f"[single contiguous cluster each]")
-        print(f"  Unresolved:  {stats['unresolved']:>6}  ({pct(stats['unresolved'], n_total):5.1f}%)  "
-              f"[multiple clusters or no fiber hit]")
-        print(f"  ---")
-        print(f"  Cluster approach: {n_restored} / {n_valid} valid  ({pct(n_restored, n_valid):.1f}%)")
+        n_valid = stats["golden"] + stats["cluster"] + stats["unresolved"]
+        n_total = n_valid + stats["invalid"]
+        n_restored = stats["golden"] + stats["cluster"]
+
+        def pct(n, d):
+            return 100 * n / d if d else 0.0
+
+        print(f"\n{'=' * 64}")
+        print(
+            f"Reconstruction summary  ({limit} groups × {n_cols} columns = {n_total} total)"
+        )
+        print(
+            f"  Invalid:     {stats['invalid']:>6}  ({pct(stats['invalid'], n_total):5.1f}%)"
+        )
+        print(
+            f"  Golden:      {stats['golden']:>6}  ({pct(stats['golden'], n_total):5.1f}%)  "
+            f"[1 fiber bit + 1 ribbon bit]"
+        )
+        print(
+            f"  Cluster:     {stats['cluster']:>6}  ({pct(stats['cluster'], n_total):5.1f}%)  "
+            f"[single contiguous cluster each]"
+        )
+        print(
+            f"  Unresolved:  {stats['unresolved']:>6}  ({pct(stats['unresolved'], n_total):5.1f}%)  "
+            f"[multiple clusters or no fiber hit]"
+        )
+        print("  ---")
+        print(
+            f"  Cluster approach: {n_restored} / {n_valid} valid  ({pct(n_restored, n_valid):.1f}%)"
+        )
 
     def export_csv(self, output_file: str = None):
         """Export data as CSV with Y, X, GEN fields extracted from each u64."""
         if output_file is None:
-            output_file = self.filename.replace('.bin', '_decoded.csv')
+            output_file = self.filename.replace(".bin", "_decoded.csv")
 
         n_cols, n_rows, data = self.read()
 
-        header = 'row_id,' + ','.join(
-            f'col_{i}_Y,col_{i}_X,col_{i}_GEN' for i in range(n_cols)
+        header = "row_id," + ",".join(
+            f"col_{i}_Y,col_{i}_X,col_{i}_GEN" for i in range(n_cols)
         )
 
-        with open(output_file, 'w') as f:
-            f.write(header + '\n')
+        with open(output_file, "w") as f:
+            f.write(header + "\n")
             for r in range(n_rows):
                 fields = []
                 for c in range(n_cols):
                     p = self._parse_u64(int(data[r, c]))
-                    fields += [str(p['Y']), str(p['X']), str(p['GEN'])]
-                f.write(f"{r}," + ','.join(fields) + '\n')
+                    fields += [str(p["Y"]), str(p["X"]), str(p["GEN"])]
+                f.write(f"{r}," + ",".join(fields) + "\n")
 
         print(f"Exported {n_rows} rows × {n_cols} u64s (Y/X/GEN) to {output_file}")
 
@@ -333,19 +368,29 @@ class BinDecoder:
 def main():
     if len(sys.argv) < 2:
         print("Usage: python decode_bin.py <bin_file> [--csv [output.csv]] [--or [N]]")
-        print("  --or [N]   bitwise-OR visual for each GEN group (optionally limit to N groups)")
+        print(
+            "  --or [N]   bitwise-OR visual for each GEN group (optionally limit to N groups)"
+        )
         sys.exit(1)
 
     bin_file = sys.argv[1]
     decoder = BinDecoder(bin_file)
 
-    if '--csv' in sys.argv:
-        idx = sys.argv.index('--csv')
-        out = sys.argv[idx + 1] if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--') else None
+    if "--csv" in sys.argv:
+        idx = sys.argv.index("--csv")
+        out = (
+            sys.argv[idx + 1]
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--")
+            else None
+        )
         decoder.export_csv(out)
-    elif '--or' in sys.argv:
-        idx = sys.argv.index('--or')
-        nxt = sys.argv[idx + 1] if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--') else None
+    elif "--or" in sys.argv:
+        idx = sys.argv.index("--or")
+        nxt = (
+            sys.argv[idx + 1]
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--")
+            else None
+        )
         max_groups = int(nxt) if nxt is not None else None
         decoder.or_visual(max_groups)
     else:

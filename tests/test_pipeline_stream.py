@@ -29,27 +29,25 @@ from monrad.stage1 import (
 from monrad.stage2 import coincidence_stream
 from monrad.stage3 import decode_position
 from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import PoseFitter, PoseResult
+from monrad.stage5 import PoseFitter
 from monrad.synth import generate, F0, Z_TEL, STRIP_MM
 
-_START_UTC       = datetime(2023, 4, 18, 19, 21, 0)
-_N_TRACKS        = 1000
-_TRUE_TX         = 50.0
-_TRUE_TY         = -30.0
-_TRUE_THETA      = 0.29671          # ≈ radians(17°)
-_TRUE_ZP         = 300.0
-_SIGMA_STRIP     = STRIP_MM / math.sqrt(12)
-_MEM_LIMIT_BYTES = 512 * 1024 * 1024   # 512 MB
+_START_UTC = datetime(2023, 4, 18, 19, 21, 0)
+_N_TRACKS = 1000
+_TRUE_TX = 50.0
+_TRUE_TY = -30.0
+_TRUE_THETA = 0.29671  # ≈ radians(17°)
+_TRUE_ZP = 300.0
+_SIGMA_STRIP = STRIP_MM / math.sqrt(12)
+_MEM_LIMIT_BYTES = 512 * 1024 * 1024  # 512 MB
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
+
 def _theta_err_mod90(theta_fit: float, theta_true: float) -> float:
     """Minimum |theta_fit − (theta_true + k·π/2)| over integer k."""
-    return min(
-        abs(theta_fit - theta_true - k * math.pi / 2)
-        for k in range(-4, 5)
-    )
+    return min(abs(theta_fit - theta_true - k * math.pi / 2) for k in range(-4, 5))
 
 
 def _nearest_k90(theta_fit: float, theta_true: float) -> int:
@@ -62,13 +60,16 @@ def _nearest_k90(theta_fit: float, theta_true: float) -> int:
 
 # ── fixtures ──────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope='module')
+
+@pytest.fixture(scope="module")
 def synth_dir(tmp_path_factory):
-    out = tmp_path_factory.mktemp('pipeline_stream')
+    out = tmp_path_factory.mktemp("pipeline_stream")
     generate(
         out_dir=out,
-        t_x=_TRUE_TX, t_y=_TRUE_TY,
-        theta=_TRUE_THETA, z_p=_TRUE_ZP,
+        t_x=_TRUE_TX,
+        t_y=_TRUE_TY,
+        theta=_TRUE_THETA,
+        z_p=_TRUE_ZP,
         n_tracks=_N_TRACKS,
         seed=42,
         start_utc=_START_UTC,
@@ -77,17 +78,17 @@ def synth_dir(tmp_path_factory):
     return out
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 def pipeline_result(synth_dir):
     """
     Full two-pass streaming pipeline under tracemalloc.
     Returns (PoseResult, peak_bytes).
     """
-    tel_dir = synth_dir / 'telescope'
-    prb_dir = synth_dir / 'probe'
+    tel_dir = synth_dir / "telescope"
+    prb_dir = synth_dir / "probe"
 
-    tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob('*_header.txt')))
-    prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob('*_header.txt')))
+    tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+    prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header.txt")))
     tel_gps, tel_pos = find_file_pairs(tel_dir)
     prb_gps, prb_pos = find_file_pairs(prb_dir)
 
@@ -124,25 +125,25 @@ def pipeline_result(synth_dir):
     tracemalloc.stop()
 
     assert pr is not None, (
-        'PoseFitter.flush() returned None — too few coincidences survived'
+        "PoseFitter.flush() returned None — too few coincidences survived"
     )
     return pr, peak_bytes
 
 
 # ── memory bound ──────────────────────────────────────────────────────────
 
-class TestMemoryBound:
 
+class TestMemoryBound:
     def test_peak_below_512mb(self, pipeline_result):
         _, peak = pipeline_result
         peak_mb = peak / 1024**2
         assert peak <= _MEM_LIMIT_BYTES, (
-            f'peak heap = {peak_mb:.1f} MB, '
-            f'limit = {_MEM_LIMIT_BYTES // 1024**2} MB'
+            f"peak heap = {peak_mb:.1f} MB, limit = {_MEM_LIMIT_BYTES // 1024**2} MB"
         )
 
 
 # ── parameter recovery ────────────────────────────────────────────────────
+
 
 class TestParameterRecovery:
     """
@@ -157,37 +158,37 @@ class TestParameterRecovery:
     def test_zp_within_3sigma(self, pipeline_result):
         pr, _ = pipeline_result
         sigma = math.sqrt(abs(pr.cov[3, 3]))
-        err   = abs(pr.z_p - _TRUE_ZP)
+        err = abs(pr.z_p - _TRUE_ZP)
         assert err < 3 * sigma, (
-            f'z_p={pr.z_p:.2f} mm, true={_TRUE_ZP} mm, '
-            f'err={err:.2f} mm, 3σ={3*sigma:.2f} mm'
+            f"z_p={pr.z_p:.2f} mm, true={_TRUE_ZP} mm, "
+            f"err={err:.2f} mm, 3σ={3 * sigma:.2f} mm"
         )
 
     def test_theta_within_3sigma_mod90(self, pipeline_result):
         pr, _ = pipeline_result
         sigma = math.sqrt(abs(pr.cov[2, 2]))
-        err   = _theta_err_mod90(pr.theta, _TRUE_THETA)
+        err = _theta_err_mod90(pr.theta, _TRUE_THETA)
         assert err < 3 * sigma, (
-            f'theta={math.degrees(pr.theta):.3f}°, '
-            f'err={math.degrees(err):.3f}°, '
-            f'3σ={math.degrees(3*sigma):.3f}°'
+            f"theta={math.degrees(pr.theta):.3f}°, "
+            f"err={math.degrees(err):.3f}°, "
+            f"3σ={math.degrees(3 * sigma):.3f}°"
         )
 
     def test_tx_ty_within_3sigma(self, pipeline_result):
         pr, _ = pipeline_result
-        k        = _nearest_k90(pr.theta, _TRUE_THETA)
+        k = _nearest_k90(pr.theta, _TRUE_THETA)
         sigma_tx = math.sqrt(abs(pr.cov[0, 0]))
         sigma_ty = math.sqrt(abs(pr.cov[1, 1]))
 
         if k == 0:
             assert abs(pr.t_x - _TRUE_TX) < 3 * sigma_tx, (
-                f't_x={pr.t_x:.2f}, true={_TRUE_TX}, 3σ={3*sigma_tx:.2f}'
+                f"t_x={pr.t_x:.2f}, true={_TRUE_TX}, 3σ={3 * sigma_tx:.2f}"
             )
             assert abs(pr.t_y - _TRUE_TY) < 3 * sigma_ty, (
-                f't_y={pr.t_y:.2f}, true={_TRUE_TY}, 3σ={3*sigma_ty:.2f}'
+                f"t_y={pr.t_y:.2f}, true={_TRUE_TY}, 3σ={3 * sigma_ty:.2f}"
             )
         else:
-            n   = pr.n_inliers
+            n = pr.n_inliers
             tol = 3 * _SIGMA_STRIP / math.sqrt(n)
             assert abs(np.mean(pr.residuals_x)) < tol
             assert abs(np.mean(pr.residuals_y)) < tol
