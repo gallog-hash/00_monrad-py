@@ -24,7 +24,16 @@ monrad-decode-bin data/.../20230418_192121.bin --or 5
 monrad-decode-bin data/.../20230418_192121.bin --csv out.csv
 ```
 
-No linter is configured yet. Python ≥ 3.10 is required (`int | None` and `tuple[A, B]` generics are used throughout). Maximum line length is 80 characters.
+## Linting and formatting
+
+This project uses Ruff for both linting and formatting. Always invoke
+through `uv run`. When working with Ruff, invoke `/astral:ruff` to follow
+Astral's recommended usage.
+
+- Lint: `uv run ruff check .`
+- Lint and auto-fix: `uv run ruff check --fix .`
+- Format: `uv run ruff format .`
+- Configuration lives in `pyproject.toml` under `[tool.ruff]`.
 
 ## Architecture
 
