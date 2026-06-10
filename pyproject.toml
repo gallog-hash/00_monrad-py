@@ -21,6 +21,7 @@ dev = [
 [project.scripts]
 monrad-decode-gps = "monrad.decoders.gps:main"
 monrad-decode-bin = "monrad.decoders.position:main"
+monrad-decode-header = "monrad.decoders.header:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

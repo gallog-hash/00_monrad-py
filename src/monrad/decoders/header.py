@@ -208,14 +208,17 @@ def print_header_info(modules: Dict[str, Dict[str, Any]]) -> None:
                 print(f"{key}: {value}")
 
 
-if __name__ == "__main__":
+def main() -> None:
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python decode_header.py <header_file>")
-        print("Example: python decode_header.py 20230418_191621_header.txt")
+        print("Usage: monrad-decode-header <header_file>")
+        print("Example: monrad-decode-header 20230418_191621_header.txt")
         sys.exit(1)
 
-    header_file = sys.argv[1]
-    modules = parse_header(header_file)
+    modules = parse_header(sys.argv[1])
     print_header_info(modules)
+
+
+if __name__ == "__main__":
+    main()

@@ -48,6 +48,8 @@ print(gps_frame["accEst"])  # timing accuracy estimate in ns
 ```
 
 ```bash
+monrad-decode-header data/.../20230418_191621_header.txt
+
 monrad-decode-gps data/.../20230418_192121_GPS.bin
 monrad-decode-gps data/.../20230418_192121_GPS.bin --csv out.csv
 
