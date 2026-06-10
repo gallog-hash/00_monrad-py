@@ -19,16 +19,16 @@ from typing import Literal, NamedTuple, Sequence
 from .stage1 import PosRef
 from .decoders.position import BinDecoder
 
-_STRIP_MM = 10.0      # mm per channel strip — DESIGN.md §5.4
-_N = 10               # fiber × ribbon encoding multiplier
+_STRIP_MM = 10.0  # mm per channel strip — DESIGN.md §5.4
+_N = 10  # fiber × ribbon encoding multiplier
 
 
 class Hit(NamedTuple):
-    x_mm:    float
-    y_mm:    float
+    x_mm: float
+    y_mm: float
     sigma_x: float
     sigma_y: float
-    quality: Literal['golden', 'cluster', 'unresolved', 'invalid']
+    quality: Literal["golden", "cluster", "unresolved", "invalid"]
     # Candidate channel centroids for 'unresolved' hits — used by
     # disambiguate_telescope_hits().  None for all other qualities.
     candidates_x: list[float] | None = None
@@ -37,8 +37,8 @@ class Hit(NamedTuple):
 
 def _read_block(
     pos_paths: list[Path],
-    pos_ref:   PosRef,
-    n_cols:    int,
+    pos_ref: PosRef,
+    n_cols: int,
 ) -> list[int]:
     """
     Read the 16 × n_cols u64 words for one event, handling split blocks.
@@ -46,18 +46,15 @@ def _read_block(
     Returns a flat list of 16 * n_cols ints in row-major order:
       [col0_row0, col1_row0, …, col(n-1)_row0, col0_row1, …]
     """
-    _HDR  = 8   # 4-byte n_rows + 4-byte n_cols
-    _WORD = 8   # bytes per u64
+    _HDR = 8  # 4-byte n_rows + 4-byte n_cols
+    _WORD = 8  # bytes per u64
 
     def _rows(path: Path, row_start: int, n_rows: int) -> list[int]:
         offset = _HDR + row_start * n_cols * _WORD
-        with open(path, 'rb') as fh:
+        with open(path, "rb") as fh:
             fh.seek(offset)
             raw = fh.read(n_rows * n_cols * _WORD)
-        words = [
-            struct.unpack_from('<Q', raw, i)[0]
-            for i in range(0, len(raw), _WORD)
-        ]
+        words = [struct.unpack_from("<Q", raw, i)[0] for i in range(0, len(raw), _WORD)]
         # Pad with zeros if the read fell short of EOF (GPS/pos count mismatch).
         # A zero word has ribbon=0, which _is_valid() rejects as 'invalid'.
         expected = n_rows * n_cols
@@ -84,7 +81,7 @@ def _read_block(
 def _tot_weighted_centroid(
     candidates: list[int],
     ribbon_counts: list[int],
-    fiber_counts:  list[int],
+    fiber_counts: list[int],
 ) -> float:
     """
     Compute a TOT-weighted centroid over the candidate channel list.
@@ -92,35 +89,24 @@ def _tot_weighted_centroid(
     Each candidate ch = 10*r + f gets weight = ribbon_counts[r] * fiber_counts[f].
     Falls back to the unweighted mean if all weights are zero.
     """
-    weights = [ribbon_counts[ch // _N] * fiber_counts[ch % _N]
-               for ch in candidates]
+    weights = [ribbon_counts[ch // _N] * fiber_counts[ch % _N] for ch in candidates]
     total = sum(weights)
     if total == 0:
         return sum(candidates) / len(candidates)
     return sum(w * ch for w, ch in zip(weights, candidates)) / total
 
 
-def _axis_candidates(field_or: int, fold: bool = True) -> list[float]:
+def _axis_candidates(field_or: int) -> list[float]:
     """
     Return candidate channel centroids for an axis that decoded as
     'unresolved'.  Each entry is the centroid (in channel units) of one
     possible (ribbon_cluster × fiber_cluster) hit hypothesis.
-
-    Mirrors the fold logic in _decode_axis: if both halves unfold cleanly,
-    use the unfolded clusters; otherwise use the raw clusters.
     """
-    fiber_half  = (field_or >> _N) & 0x3FF
-    ribbon_half =  field_or        & 0x3FF
+    fiber_half = (field_or >> _N) & 0x3FF
+    ribbon_half = field_or & 0x3FF
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
-
-    if fold:
-        fiber_unf  = BinDecoder._unfold_mask(fiber_half)
-        ribbon_unf = BinDecoder._unfold_mask(ribbon_half)
-        if fiber_unf is not None and ribbon_unf is not None:
-            fcs = BinDecoder._find_clusters(fiber_unf)
-            rcs = BinDecoder._find_clusters(ribbon_unf)
 
     candidates: list[float] = []
     for rc in rcs:
@@ -131,10 +117,9 @@ def _axis_candidates(field_or: int, fold: bool = True) -> list[float]:
 
 
 def _decode_axis(
-    field_or:   int,
-    fold:       bool = True,
+    field_or: int,
     bit_counts: list[int] | None = None,
-) -> tuple[float, float, Literal['golden', 'cluster', 'unresolved']]:
+) -> tuple[float, float, Literal["golden", "cluster", "unresolved"]]:
     """
     Decode one 20-bit fiber×ribbon field (already extracted from u64).
 
@@ -144,17 +129,12 @@ def _decode_axis(
     Returns (centroid_ch, sigma_mm, quality).
     Implements DESIGN.md §5.3 steps 1–5.
 
-    If fold=True and the standard decode fails, attempt fold-pair
-    decoding: if every set bit k has its mirror (9-k) also set in
-    *both* halves, collapse each pair to its lower-index bit and retry.
-    This recovers events from folded-fiber MAROC wiring (DESIGN.md §10).
-
     bit_counts : optional 20-element list of per-bit TOT counts
                  (bit_counts[0..9] = ribbon, bit_counts[10..19] = fiber).
                  When provided, cluster centroids are TOT-weighted.
     """
-    fiber_half  = (field_or >> _N) & 0x3FF
-    ribbon_half =  field_or        & 0x3FF
+    fiber_half = (field_or >> _N) & 0x3FF
+    ribbon_half = field_or & 0x3FF
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
@@ -164,44 +144,21 @@ def _decode_axis(
         centroid, candidates = res
         width = len(candidates)
         sigma = (_STRIP_MM * width) / math.sqrt(12)
-        quality = 'golden' if width == 1 else 'cluster'
+        quality = "golden" if width == 1 else "cluster"
         if bit_counts is not None and width > 1:
             ribbon_counts = bit_counts[:_N]
-            fiber_counts  = bit_counts[_N:]
-            centroid = _tot_weighted_centroid(
-                candidates, ribbon_counts, fiber_counts
-            )
+            fiber_counts = bit_counts[_N:]
+            centroid = _tot_weighted_centroid(candidates, ribbon_counts, fiber_counts)
         return centroid, sigma, quality
 
-    if fold:
-        fiber_unf  = BinDecoder._unfold_mask(fiber_half)
-        ribbon_unf = BinDecoder._unfold_mask(ribbon_half)
-        if fiber_unf is not None and ribbon_unf is not None:
-            fcs_u = BinDecoder._find_clusters(fiber_unf)
-            rcs_u = BinDecoder._find_clusters(ribbon_unf)
-            res_u = BinDecoder._reconstruct_coord(fcs_u, rcs_u, _N)
-            if res_u is not None:
-                centroid, candidates = res_u
-                width = len(candidates)
-                sigma = (_STRIP_MM * width) / math.sqrt(12)
-                quality = 'golden' if width == 1 else 'cluster'
-                if bit_counts is not None and width > 1:
-                    ribbon_counts = bit_counts[:_N]
-                    fiber_counts  = bit_counts[_N:]
-                    centroid = _tot_weighted_centroid(
-                        candidates, ribbon_counts, fiber_counts
-                    )
-                return centroid, sigma, quality
-
-    return 0.0, 0.0, 'unresolved'
+    return 0.0, 0.0, "unresolved"
 
 
 def decode_position(
-    pos_ref:     PosRef,
-    pos_paths:   list[Path],
-    n_cols:      int,
-    fold:        bool = True,
-    tot_thresh:  int  = 1,
+    pos_ref: PosRef,
+    pos_paths: list[Path],
+    n_cols: int,
+    tot_thresh: int = 1,
     tot_weights: bool = False,
 ) -> list[Hit | None]:
     """
@@ -219,8 +176,6 @@ def decode_position(
                    order (indexed by pos_ref.file_idx)
     n_cols       : number of position-sensitive planes in the detector
                    (1 for a probe, 3 for the telescope)
-    fold         : if True (default), attempt fold-pair decoding when the
-                   standard single-cluster decode fails (DESIGN.md §10).
     tot_thresh   : minimum number of the 16 rows in which a bit must fire
                    to be kept in the OR mask (1 = current behaviour; 2–4
                    filter single-row noise spikes without affecting real
@@ -267,12 +222,10 @@ def decode_position(
                         y_counts_col[bit] += 1
             # Apply threshold: keep bit only if count >= tot_thresh.
             x_or = sum(
-                (1 << bit) for bit in range(20)
-                if x_counts_col[bit] >= tot_thresh
+                (1 << bit) for bit in range(20) if x_counts_col[bit] >= tot_thresh
             )
             y_or = sum(
-                (1 << bit) for bit in range(20)
-                if y_counts_col[bit] >= tot_thresh
+                (1 << bit) for bit in range(20) if y_counts_col[bit] >= tot_thresh
             )
             if not tot_weights:
                 x_counts_col = None
@@ -281,31 +234,29 @@ def decode_position(
         # Validity prefilter — DESIGN.md §5.2
         valid, _ = BinDecoder._is_valid(x_or, y_or)
         if not valid:
-            hits.append(Hit(0.0, 0.0, 0.0, 0.0, 'invalid'))
+            hits.append(Hit(0.0, 0.0, 0.0, 0.0, "invalid"))
             continue
 
-        cx, sx, qx = _decode_axis(x_or, fold=fold,
-                                   bit_counts=x_counts_col)
-        cy, sy, qy = _decode_axis(y_or, fold=fold,
-                                   bit_counts=y_counts_col)
+        cx, sx, qx = _decode_axis(x_or, bit_counts=x_counts_col)
+        cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col)
 
-        if qx == 'unresolved' or qy == 'unresolved':
-            cands_x = _axis_candidates(x_or, fold) if qx == 'unresolved' else None
-            cands_y = _axis_candidates(y_or, fold) if qy == 'unresolved' else None
-            hits.append(Hit(0.0, 0.0, 0.0, 0.0, 'unresolved', cands_x, cands_y))
+        if qx == "unresolved" or qy == "unresolved":
+            cands_x = _axis_candidates(x_or) if qx == "unresolved" else None
+            cands_y = _axis_candidates(y_or) if qy == "unresolved" else None
+            hits.append(Hit(0.0, 0.0, 0.0, 0.0, "unresolved", cands_x, cands_y))
             continue
 
         # Channel → physical coordinate — DESIGN.md §5.4
         x_mm = (cx + 0.5) * _STRIP_MM
         y_mm = (cy + 0.5) * _STRIP_MM
-        quality = 'golden' if (qx == 'golden' and qy == 'golden') else 'cluster'
+        quality = "golden" if (qx == "golden" and qy == "golden") else "cluster"
         hits.append(Hit(x_mm, y_mm, sx, sy, quality))
 
     return hits
 
 
 def disambiguate_telescope_hits(
-    hits:  list[Hit],
+    hits: list[Hit],
     z_tel: Sequence[float],
 ) -> list[Hit]:
     """
@@ -329,14 +280,14 @@ def disambiguate_telescope_hits(
     result = list(hits)
     for k in range(3):
         hit_k = hits[k]
-        if hit_k.quality != 'unresolved':
+        if hit_k.quality != "unresolved":
             continue
 
         j1, j2 = [j for j in range(3) if j != k]
         ref1, ref2 = hits[j1], hits[j2]
-        if ref1.quality not in ('golden', 'cluster'):
+        if ref1.quality not in ("golden", "cluster"):
             continue
-        if ref2.quality not in ('golden', 'cluster'):
+        if ref2.quality not in ("golden", "cluster"):
             continue
 
         t = (z_tel[k] - z_tel[j1]) / (z_tel[j2] - z_tel[j1])
@@ -345,19 +296,21 @@ def disambiguate_telescope_hits(
 
         new_x = new_y = None
         if hit_k.candidates_x:
-            best = min(hit_k.candidates_x,
-                       key=lambda ch: abs((ch + 0.5) * _STRIP_MM - x_pred))
+            best = min(
+                hit_k.candidates_x, key=lambda ch: abs((ch + 0.5) * _STRIP_MM - x_pred)
+            )
             if abs((best + 0.5) * _STRIP_MM - x_pred) <= _MATCH_TOL:
                 new_x = (best + 0.5) * _STRIP_MM
 
         if hit_k.candidates_y:
-            best = min(hit_k.candidates_y,
-                       key=lambda ch: abs((ch + 0.5) * _STRIP_MM - y_pred))
+            best = min(
+                hit_k.candidates_y, key=lambda ch: abs((ch + 0.5) * _STRIP_MM - y_pred)
+            )
             if abs((best + 0.5) * _STRIP_MM - y_pred) <= _MATCH_TOL:
                 new_y = (best + 0.5) * _STRIP_MM
 
         if new_x is not None and new_y is not None:
             sigma = _STRIP_MM / math.sqrt(12)
-            result[k] = Hit(new_x, new_y, sigma, sigma, 'cluster')
+            result[k] = Hit(new_x, new_y, sigma, sigma, "cluster")
 
     return result

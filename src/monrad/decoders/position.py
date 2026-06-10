@@ -101,27 +101,6 @@ class BinDecoder:
         return value.bit_length() - 1
 
     @staticmethod
-    def _unfold_mask(mask: int, n: int = 10) -> int | None:
-        """
-        If every set bit in *mask* has its mirror partner at position
-        (n-1-bit) also set, return a mask with only the lower-index bit
-        of each pair kept.  Returns None if any bit is unpaired.
-
-        Example (n=10): 0b1000000001 (bits 0 and 9) → 0b0000000001 (bit 0).
-        """
-        unfolded = 0
-        remaining = mask
-        while remaining:
-            pos = (remaining & -remaining).bit_length() - 1
-            mirror = n - 1 - pos
-            if not (remaining >> mirror) & 1:
-                return None  # unpaired bit — not a clean fold pattern
-            unfolded |= 1 << min(pos, mirror)
-            remaining &= ~(1 << pos)
-            remaining &= ~(1 << mirror)
-        return unfolded
-
-    @staticmethod
     def _find_clusters(value: int, width: int = 10) -> list[list[int]]:
         """Find contiguous groups of set bits. Position 0 = LSB."""
         clusters, current = [], []
@@ -261,6 +240,23 @@ class BinDecoder:
                 )
                 print(f"  {'OR':>8}  {self._fmt_bits(x_or)}  {self._fmt_bits(y_or)}")
                 print(f"  {'':>8}  X={x_or:<8d}  Y={y_or:<8d}")
+
+                def _mirror_pairs(half: int, n: int = 10) -> list[tuple[int, int]]:
+                    return [
+                        (k, n - 1 - k)
+                        for k in range(n // 2)
+                        if ((half >> k) & 1) and ((half >> (n - 1 - k)) & 1)
+                    ]
+
+                mp = {
+                    "X_fib": _mirror_pairs((x_or >> 10) & 0x3FF),
+                    "X_rib": _mirror_pairs(x_or & 0x3FF),
+                    "Y_fib": _mirror_pairs((y_or >> 10) & 0x3FF),
+                    "Y_rib": _mirror_pairs(y_or & 0x3FF),
+                }
+                if any(mp.values()):
+                    parts = [f"{k}:{v}" for k, v in mp.items() if v]
+                    print(f"  {'Fold-pairs':>8}  {',  '.join(parts)}")
 
                 if not valid:
                     stats["invalid"] += 1

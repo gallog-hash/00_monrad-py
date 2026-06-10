@@ -17,7 +17,6 @@ from monrad.stage1 import (
     reconstruct_stream,
 )
 from monrad.stage3 import decode_position, disambiguate_telescope_hits, Hit
-from monrad.decoders.position import BinDecoder
 from monrad.synth import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
@@ -121,39 +120,6 @@ class TestDecodePosition:
                 assert hit.y_mm == pytest.approx(exp_y), (
                     f"event {i} plane {k}: y_mm={hit.y_mm}, expected {exp_y} (cy={cy})"
                 )
-
-
-# ── unfold_mask unit tests ─────────────────────────────────────────────
-
-
-class TestUnfoldMask:
-    def test_single_fold_pair(self):
-        # bits 0 and 9 set → unfolded to bit 0
-        mask = (1 << 0) | (1 << 9)
-        assert BinDecoder._unfold_mask(mask) == (1 << 0)
-
-    def test_middle_fold_pair(self):
-        # bits 4 and 5 set → unfolded to bit 4
-        mask = (1 << 4) | (1 << 5)
-        assert BinDecoder._unfold_mask(mask) == (1 << 4)
-
-    def test_multiple_pairs(self):
-        # bits 0,9 and bits 2,7 → unfolded to bits 0 and 2
-        mask = (1 << 0) | (1 << 9) | (1 << 2) | (1 << 7)
-        assert BinDecoder._unfold_mask(mask) == ((1 << 0) | (1 << 2))
-
-    def test_unpaired_bit_returns_none(self):
-        # bit 0 set but not bit 9
-        assert BinDecoder._unfold_mask(1 << 0) is None
-
-    def test_empty_mask(self):
-        assert BinDecoder._unfold_mask(0) == 0
-
-    def test_all_pairs(self):
-        # all five pairs (0,9),(1,8),(2,7),(3,6),(4,5)
-        mask = 0b1111111111
-        expected = 0b0000011111  # bits 0-4
-        assert BinDecoder._unfold_mask(mask) == expected
 
 
 # ── TOT threshold tests ────────────────────────────────────────────────
@@ -301,122 +267,6 @@ class TestTOTThreshold:
         assert hits2[0].y_mm == pytest.approx(3.5 * STRIP_MM)
 
 
-# ── fold-encoded synthetic data ────────────────────────────────────────
-
-
-@pytest.fixture(scope="module")
-def synth_fold(tmp_path_factory):
-    out = tmp_path_factory.mktemp("synth_stage3_fold")
-    result = generate(
-        out_dir=out,
-        t_x=50.0,
-        t_y=-30.0,
-        theta=0.29671,
-        z_p=300.0,
-        n_tracks=_N_TRACKS,
-        seed=42,
-        start_utc=_START_UTC,
-        f0=F0,
-        fold=True,  # encode as folded-fiber MAROC wiring
-    )
-    return result, out
-
-
-class TestFoldDecoder:
-    """Verify that fold-encoded synthetic hits are recovered correctly."""
-
-    def test_fold_decoded_all_good(self, synth_fold):
-        """Every fold-encoded hit should decode to 'golden' with fold=True."""
-        result, out = synth_fold
-        tel_dir = out / "telescope"
-        utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
-        gps_paths, pos_paths = find_file_pairs(tel_dir)
-
-        n_bad = 0
-        for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
-            hits = decode_position(ref, pos_paths, n_cols=_N_COLS, fold=True)
-            for h in hits:
-                if h.quality not in ("golden", "cluster"):
-                    n_bad += 1
-        assert n_bad == 0, f"{n_bad} hits not decoded with fold=True"
-
-    def test_fold_off_gives_unresolved(self, synth_fold):
-        """With fold=False the same data should come back as 'unresolved'."""
-        result, out = synth_fold
-        tel_dir = out / "telescope"
-        utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
-        gps_paths, pos_paths = find_file_pairs(tel_dir)
-
-        n_unresolved = 0
-        n_total = 0
-        for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
-            hits = decode_position(ref, pos_paths, n_cols=_N_COLS, fold=False)
-            for h in hits:
-                n_total += 1
-                if h.quality == "unresolved":
-                    n_unresolved += 1
-        # fold=False on folded data → almost all hits unresolved
-        assert n_unresolved / n_total > 0.9, (
-            f"Expected >90% unresolved with fold=False on folded data, "
-            f"got {n_unresolved}/{n_total}"
-        )
-
-    def test_fold_and_tot_combined(self, synth_fold):
-        """fold=True + tot_thresh=16 still decodes all synthetic events
-        (they fire the same bit in all 16 rows)."""
-        result, out = synth_fold
-        tel_dir = out / "telescope"
-        utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
-        gps_paths, pos_paths = find_file_pairs(tel_dir)
-
-        n_bad = 0
-        for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
-            hits = decode_position(
-                ref, pos_paths, n_cols=_N_COLS, fold=True, tot_thresh=16
-            )
-            for h in hits:
-                if h.quality not in ("golden", "cluster"):
-                    n_bad += 1
-        assert n_bad == 0, f"{n_bad} hits failed with fold=True, tot_thresh=16"
-
-    def test_fold_decoded_coordinates(self, synth_fold):
-        """Fold-decoded coordinates are consistent with the fold mapping.
-
-        Fold-decoding maps each (ribbon_bit, fiber_bit) pair to
-        (min(r, 9-r), min(f, 9-f)), which is NOT the same as the
-        original channel for bits > 4.  The test checks against the
-        expected fold-decoded value rather than the original channel.
-        """
-
-        def _fold_ch(c: int) -> int:
-            r = min(c // 10, 9 - c // 10)
-            f = min(c % 10, 9 - c % 10)
-            return 10 * r + f
-
-        result, out = synth_fold
-        tracks = result["tracks"]
-        tel_dir = out / "telescope"
-        utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
-        gps_paths, pos_paths = find_file_pairs(tel_dir)
-
-        mismatches = 0
-        for i, (_ev, ref) in enumerate(
-            reconstruct_stream(gps_paths, pos_paths, utc0, f0)
-        ):
-            hits = decode_position(ref, pos_paths, n_cols=_N_COLS, fold=True)
-            ax, bx, ay, by = tracks[i]
-            for k, (hit, z) in enumerate(zip(hits, Z_TEL)):
-                cx = _fold_ch(int((ax + bx * z) / STRIP_MM))
-                cy = _fold_ch(int((ay + by * z) / STRIP_MM))
-                exp_x = (cx + 0.5) * STRIP_MM
-                exp_y = (cy + 0.5) * STRIP_MM
-                if abs(hit.x_mm - exp_x) > 1e-6 or abs(hit.y_mm - exp_y) > 1e-6:
-                    mismatches += 1
-        assert mismatches == 0, (
-            f"{mismatches} coordinate mismatches in fold-decoded data"
-        )
-
-
 # ── Tests for disambiguate_telescope_hits ─────────────────────────────────
 
 _Z3 = np.array([0.0, 400.0, 800.0])
@@ -522,24 +372,27 @@ class TestDisambiguateHits:
 class TestCandidatesPopulated:
     """Unresolved hits from decode_position() carry non-empty candidate lists."""
 
-    def test_fold_off_candidates_present(self, synth_fold):
-        """fold=False → some hits are unresolved; their candidate lists are set."""
-        result, out = synth_fold
-        tel_dir = out / "telescope"
-        utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
-        gps_paths, pos_paths = find_file_pairs(tel_dir)
+    def test_unresolved_candidates_present(self, tmp_path):
+        """An unresolved hit (multiple clusters) carries a non-empty candidate list."""
+        import struct
+        from monrad.stage1 import PosRef
 
-        found_unresolved = 0
-        for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
-            hits = decode_position(ref, pos_paths, n_cols=_N_COLS, fold=False)
-            for h in hits:
-                if h.quality == "unresolved":
-                    assert h.candidates_x is not None, (
-                        "unresolved hit missing candidates_x"
-                    )
-                    assert h.candidates_y is not None, (
-                        "unresolved hit missing candidates_y"
-                    )
-                    assert len(h.candidates_x) > 0 or len(h.candidates_y) > 0
-                    found_unresolved += 1
-        assert found_unresolved > 0, "no unresolved hits found in fold=False run"
+        # X: two disconnected fiber clusters (bits 0 and 5 both set, ribbon bit 2)
+        # → candidates [20, 25], which are non-contiguous → unresolved
+        x_rib = 1 << 2
+        x_fib = (1 << 0) | (1 << 5)
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / "unresolved.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        hits = decode_position(ref, [bin_path], n_cols=1)
+        h = hits[0]
+        assert h.quality == "unresolved"
+        assert h.candidates_x is not None and len(h.candidates_x) > 0

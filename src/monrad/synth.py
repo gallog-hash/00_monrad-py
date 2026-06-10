@@ -13,15 +13,16 @@ from pathlib import Path
 import numpy as np
 
 GPS_EPOCH = datetime(1980, 1, 6)
-F0 = 100_000_000        # Hz — nominal 100 MHz clock
-STRIP_MM = 10.0         # strip pitch (mm)
-N_TEL = 99              # telescope channels per axis
-N_PROBE_DEFAULT = 30    # probe channels per axis
+F0 = 100_000_000  # Hz — nominal 100 MHz clock
+STRIP_MM = 10.0  # strip pitch (mm)
+N_TEL = 99  # telescope channels per axis
+N_PROBE_DEFAULT = 30  # probe channels per axis
 # Telescope plane z-coordinates (mm); lever arm = 800 mm
 Z_TEL = np.array([0.0, 400.0, 800.0])
 
 
 # ── binary helpers ──────────────────────────────────────────────
+
 
 def _make_ubx_tm2(utc: datetime, acc_ns: int = 30) -> bytes:
     """Return a 36-byte UBX-TIM-TM2 frame for the given UTC time."""
@@ -29,17 +30,20 @@ def _make_ubx_tm2(utc: datetime, acc_ns: int = 30) -> bytes:
     total_ms = int(delta.total_seconds() * 1000)
     week, tow_ms = divmod(total_ms, 7 * 24 * 3600 * 1000)
     payload = struct.pack(
-        '<BBHHHIIIII',
-        0,           # ch = 0 (TIMEPULSE)
-        0x0F,        # flags
-        1,           # rising-edge count
-        week, week,
-        tow_ms, 0,
-        tow_ms + 500, 0,
+        "<BBHHHIIIII",
+        0,  # ch = 0 (TIMEPULSE)
+        0x0F,  # flags
+        1,  # rising-edge count
+        week,
+        week,
+        tow_ms,
+        0,
+        tow_ms + 500,
+        0,
         acc_ns,
     )
     assert len(payload) == 28
-    hdr = bytes([0xB5, 0x62, 0x0D, 0x03]) + struct.pack('<H', 28)
+    hdr = bytes([0xB5, 0x62, 0x0D, 0x03]) + struct.pack("<H", 28)
     ck_a = ck_b = 0
     for b in hdr[2:] + payload:
         ck_a = (ck_a + b) & 0xFF
@@ -52,28 +56,28 @@ def _escape(data: bytes) -> str:
     out = []
     for b in data:
         if b == 0x5C:
-            out.append('\\\\')
+            out.append("\\\\")
         elif 0x20 <= b <= 0x7E:
             out.append(chr(b))
         else:
-            out.append(f'\\{b:02X}')
-    return ''.join(out)
+            out.append(f"\\{b:02X}")
+    return "".join(out)
 
 
 def _write_header(path: Path, utc: datetime, f0: int) -> None:
     ubx = _make_ubx_tm2(utc)
-    with open(path, 'w', encoding='latin-1') as fh:
-        fh.write('[System]\n')
-        fh.write(f'Clock frequency (Hz) = {f0}\n')
-        fh.write('\n[GPS]\n')
+    with open(path, "w", encoding="latin-1") as fh:
+        fh.write("[System]\n")
+        fh.write(f"Clock frequency (Hz) = {f0}\n")
+        fh.write("\n[GPS]\n")
         fh.write(f'GPS_String_00 = "{_escape(ubx)}"\n')
 
 
 def _write_gps_bin(path: Path, records: list[int]) -> None:
-    with open(path, 'wb') as fh:
-        fh.write(struct.pack('<I', len(records)))
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<I", len(records)))
         for r in records:
-            fh.write(struct.pack('<Q', r))
+            fh.write(struct.pack("<Q", r))
 
 
 def _write_pos_bin(
@@ -86,16 +90,17 @@ def _write_pos_bin(
     words (one per plane).  The block is replicated 16× as rows.
     """
     n_rows = len(blocks) * 16
-    with open(path, 'wb') as fh:
-        fh.write(struct.pack('<I', n_rows))
-        fh.write(struct.pack('<I', n_cols))
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<I", n_rows))
+        fh.write(struct.pack("<I", n_cols))
         for words in blocks:
             for _ in range(16):
                 for w in words:
-                    fh.write(struct.pack('<Q', w))
+                    fh.write(struct.pack("<Q", w))
 
 
 # ── encoding ────────────────────────────────────────────────────
+
 
 def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
     """Encode a hit as a u64 word.
@@ -105,8 +110,8 @@ def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
 
     fold=True: folded-fiber encoding — each axis fires both bit k and
     bit (9-k) in both the fiber and ribbon halves, mimicking the real
-    telescope MAROC wiring.  The fold-pair decoder (_unfold_mask) should
-    recover the original channel.
+    telescope MAROC wiring.  Mirror-pair patterns are reported as
+    diagnostics by or_visual() but are not resolved in reconstruction.
     """
     # ch = 10 * ribbon_bit + fiber_bit
     r_y, f_y = c_y // 10, c_y % 10
@@ -121,13 +126,7 @@ def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
         y_fib = 1 << f_y
         x_rib = 1 << r_x
         x_fib = 1 << f_x
-    return (
-        y_rib
-        | (y_fib << 10)
-        | (x_rib << 32)
-        | (x_fib << 42)
-        | (gen << 52)
-    )
+    return y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
 
 
 def _gps_rec(tick: int, gen: int, pps: bool) -> int:
@@ -160,6 +159,7 @@ def _build_gps_stream(
 
 # ── track generation ─────────────────────────────────────────────
 
+
 def _quantize(coord_mm: float, n_ch: int) -> int | None:
     ch = int(coord_mm / STRIP_MM)
     return ch if 0 <= ch < n_ch else None
@@ -178,8 +178,8 @@ def _sample_tracks(
     Angular distribution: I ∝ cos²θ (standard muon approximation).
     Entry positions uniform over the active area at z=0.
     """
-    active = N_TEL * STRIP_MM   # 990 mm
-    z_bot = Z_TEL[-1]           # 800 mm
+    active = N_TEL * STRIP_MM  # 990 mm
+    z_bot = Z_TEL[-1]  # 800 mm
     tracks: list[tuple] = []
     while len(tracks) < n:
         batch = max(n * 5, 2000)
@@ -193,21 +193,16 @@ def _sample_tracks(
         by = np.tan(zen) * np.sin(phi)
         x_b = x0 + bx * z_bot
         y_b = y0 + by * z_bot
-        ok = (
-            (x_b >= 0) & (x_b < active)
-            & (y_b >= 0) & (y_b < active)
-        )
+        ok = (x_b >= 0) & (x_b < active) & (y_b >= 0) & (y_b < active)
         for i in np.where(ok)[0]:
             if len(tracks) >= n:
                 break
-            tracks.append(
-                (float(x0[i]), float(bx[i]),
-                 float(y0[i]), float(by[i]))
-            )
+            tracks.append((float(x0[i]), float(bx[i]), float(y0[i]), float(by[i])))
     return tracks[:n]
 
 
 # ── public API ───────────────────────────────────────────────────
+
 
 def _quantize_clamp(coord_mm: float, n_ch: int) -> int:
     """Quantize to strip channel, clamping to [0, n_ch-1]."""
@@ -218,7 +213,7 @@ def generate(
     out_dir: str | Path,
     t_x: float = 50.0,
     t_y: float = -30.0,
-    theta: float = 0.29671,   # radians (≈ 17°)
+    theta: float = 0.29671,  # radians (≈ 17°)
     z_p: float = 300.0,
     n_probe_ch: int = N_PROBE_DEFAULT,
     n_tracks: int = 1000,
@@ -260,8 +255,8 @@ def generate(
     if z_tel_offsets is None:
         z_tel_offsets = {}
     out_dir = Path(out_dir)
-    tel_dir = out_dir / 'telescope'
-    prb_dir = out_dir / 'probe'
+    tel_dir = out_dir / "telescope"
+    prb_dir = out_dir / "probe"
     tel_dir.mkdir(parents=True, exist_ok=True)
     prb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,8 +279,8 @@ def generate(
             probe_hits[i] = (cu, cv)
 
     # ── timing ───────────────────────────────────────────────────
-    dt = f0 // 10           # 10 Hz telescope rate
-    t_off = dt // 2         # offset events away from PPS ticks
+    dt = f0 // 10  # 10 Hz telescope rate
+    t_off = dt // 2  # offset events away from PPS ticks
     tel_ticks = [t_off + i * dt for i in range(n_tracks)]
     duration = tel_ticks[-1] + dt
     pps_ticks = list(range(0, duration + f0, f0))
@@ -308,7 +303,7 @@ def generate(
                 cy = _quantize(ay + by * z, N_TEL)
                 assert cx is not None and cy is not None, (
                     f"Track out of range at z={z}: "
-                    f"x={ax+bx*z:.1f}, y={ay+by*z:.1f}"
+                    f"x={ax + bx * z:.1f}, y={ay + by * z:.1f}"
                 )
             else:
                 cx = _quantize_clamp(ax + bx * z + off_x, N_TEL)
@@ -331,23 +326,23 @@ def generate(
         gen = (gen + 1) % 2048
 
     # ── write files ──────────────────────────────────────────────
-    ts = start_utc.strftime('%Y%m%d_%H%M%S')
+    ts = start_utc.strftime("%Y%m%d_%H%M%S")
 
-    _write_header(tel_dir / f'{ts}_header.txt', start_utc, f0)
-    _write_gps_bin(tel_dir / f'{ts}_GPS.bin', tel_gps)
-    _write_pos_bin(tel_dir / f'{ts}.bin', tel_blocks, n_cols=3)
+    _write_header(tel_dir / f"{ts}_header.txt", start_utc, f0)
+    _write_gps_bin(tel_dir / f"{ts}_GPS.bin", tel_gps)
+    _write_pos_bin(tel_dir / f"{ts}.bin", tel_blocks, n_cols=3)
 
-    _write_header(prb_dir / f'{ts}_header.txt', start_utc, f0)
-    _write_gps_bin(prb_dir / f'{ts}_GPS.bin', prb_gps)
-    _write_pos_bin(prb_dir / f'{ts}.bin', prb_blocks, n_cols=1)
+    _write_header(prb_dir / f"{ts}_header.txt", start_utc, f0)
+    _write_gps_bin(prb_dir / f"{ts}_GPS.bin", prb_gps)
+    _write_pos_bin(prb_dir / f"{ts}.bin", prb_blocks, n_cols=1)
 
     return {
-        'tracks':          tracks,
-        'probe_hits':      probe_hits,
-        'n_coincidences':  len(probe_hits),
-        'tel_dir':         tel_dir,
-        'probe_dir':       prb_dir,
-        'pose':            (t_x, t_y, theta, z_p),
-        'plane_offsets':   plane_offsets,
-        'z_tel_offsets':   z_tel_offsets,
+        "tracks": tracks,
+        "probe_hits": probe_hits,
+        "n_coincidences": len(probe_hits),
+        "tel_dir": tel_dir,
+        "probe_dir": prb_dir,
+        "pose": (t_x, t_y, theta, z_p),
+        "plane_offsets": plane_offsets,
+        "z_tel_offsets": z_tel_offsets,
     }
