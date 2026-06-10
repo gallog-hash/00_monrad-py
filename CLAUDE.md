@@ -22,6 +22,11 @@ monrad-decode-gps data/.../20230418_192121_GPS.bin --csv out.csv
 # Inspect a position file (--or shows the OR-folded hit reconstruction)
 monrad-decode-bin data/.../20230418_192121.bin --or 5
 monrad-decode-bin data/.../20230418_192121.bin --csv out.csv
+
+# Run the full pipeline (stages 1–5) against real data
+python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir>
+python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir> \
+    --z-tel 0 400 800 --tot-thresh 2 --tot-weights
 ```
 
 ## Linting and formatting
@@ -90,7 +95,7 @@ Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 ### Key invariants to preserve
 
 - **Integer nanoseconds throughout stage 1.** Use `f_local = (C_{k+1} − C_k) / Δsec` (measured PPS interval, not the nominal `f₀`) to absorb oscillator drift. Never use floats for `t_ns`.
-- **`*.bin` rows come in blocks of 16** (one 80 ns acquisition window). Each block must be bitwise-OR'd across all 16 rows before hit reconstruction. Row count must be a multiple of 16.
+- **`*.bin` rows come in blocks of 16** (one 80 ns acquisition window). By default each block is bitwise-OR'd across all 16 rows before hit reconstruction (`tot_thresh=1`). `decode_position(tot_thresh=N)` keeps only bits that fired in ≥ N rows — an intentional noise filter, not a bug. Row count must be a multiple of 16.
 - **`*.bin` and `*_GPS.bin` are always decoded as a pair.** Row count / 16 in `*.bin` must equal the number of event records (FLAG=0) in `*_GPS.bin`. GEN fields must agree.
 - **5-minute file boundaries are transparent.** `evt_seq`, the PPS chain, and 16-row blocks all continue across file boundaries. The pipeline stitches split blocks when the DAQ rotates files mid-block.
 - **GEN is 11-bit and wraps every 2048 events.** Always use the unwrapped `evt_seq` (monotonically assigned as events are encountered) for cross-file bookkeeping.

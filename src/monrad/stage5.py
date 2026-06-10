@@ -362,6 +362,8 @@ class PoseFitter:
         tel_pos_paths: list[Path],
         prb_pos_paths: list[Path],
         refit_every: int = REFIT_EVERY,
+        tot_thresh: int = 1,
+        tot_weights: bool = False,
     ) -> None:
         self.tel_z = tel_z
         self.alignment = alignment
@@ -370,6 +372,8 @@ class PoseFitter:
         self.tel_pos_paths = tel_pos_paths
         self.prb_pos_paths = prb_pos_paths
         self.refit_every = refit_every
+        self.tot_thresh = tot_thresh
+        self.tot_weights = tot_weights
         self._coincs: list[Coincidence] = []
         self._since_last = 0
         self.result: PoseResult | None = None
@@ -419,7 +423,13 @@ class PoseFitter:
             return None
 
         # Decode telescope (3 planes)
-        tel_hits = decode_position(tel_ref, self.tel_pos_paths, n_cols=3)
+        tel_hits = decode_position(
+            tel_ref,
+            self.tel_pos_paths,
+            n_cols=3,
+            tot_thresh=self.tot_thresh,
+            tot_weights=self.tot_weights,
+        )
         if any(h.quality not in ("golden", "cluster") for h in tel_hits):
             return None
 
@@ -437,7 +447,13 @@ class PoseFitter:
             return None
 
         # Decode probe (1 plane)
-        prb_hits = decode_position(prb_ref, self.prb_pos_paths, n_cols=1)
+        prb_hits = decode_position(
+            prb_ref,
+            self.prb_pos_paths,
+            n_cols=1,
+            tot_thresh=self.tot_thresh,
+            tot_weights=self.tot_weights,
+        )
         prb_hit = prb_hits[0]
         if prb_hit.quality not in ("golden", "cluster"):
             return None
