@@ -413,14 +413,20 @@ class PoseFitter:
         apply alignment correction, fit a telescope line, apply the
         track quality cut, and return a Coincidence or None.
         """
-        tel_ref = prb_ref = None
-        for det_id, _ev, ref in cluster:
-            if det_id == self.tel_id:
-                tel_ref = ref
-            elif det_id == self.prb_id:
-                prb_ref = ref
-        if tel_ref is None or prb_ref is None:
+        # A genuine coincidence pairs exactly one telescope track with exactly
+        # one hit in *this* probe.  A cluster carrying two or more events from
+        # either of those two detectors is ambiguous (two particles inside the
+        # window, or a random coincidence) — reject it rather than silently
+        # picking one and fabricating a pairing.  Events belonging to *other*
+        # probe detectors are ignored here: a single telescope event may
+        # legitimately be in coincidence with several distinct probes, each
+        # handled by its own PoseFitter.
+        tel_refs = [ref for det_id, _ev, ref in cluster if det_id == self.tel_id]
+        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
+        if len(tel_refs) != 1 or len(prb_refs) != 1:
             return None
+        tel_ref = tel_refs[0]
+        prb_ref = prb_refs[0]
 
         # Decode telescope (3 planes)
         tel_hits = decode_position(

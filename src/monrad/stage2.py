@@ -15,7 +15,7 @@ from .stage1 import TimedEvent, PosRef
 
 log = logging.getLogger(__name__)
 
-_WINDOW_NS_DEFAULT = 200   # ns — see DESIGN.md §4
+_WINDOW_NS_DEFAULT = 200  # ns — see DESIGN.md §4
 
 
 def coincidence_stream(
@@ -41,15 +41,12 @@ def coincidence_stream(
     window_ns    : coincidence window in nanoseconds (default 200 ns)
     """
     if len(streams) != len(detector_ids):
-        raise ValueError(
-            'streams and detector_ids must have the same length'
-        )
+        raise ValueError("streams and detector_ids must have the same length")
     if len(set(detector_ids)) != len(detector_ids):
-        raise ValueError('detector_ids must be unique')
+        raise ValueError("detector_ids must be unique")
 
     stream_map: dict[int, Iterator[tuple[TimedEvent, PosRef]]] = {
-        det_id: stream
-        for det_id, stream in zip(detector_ids, streams)
+        det_id: stream for det_id, stream in zip(detector_ids, streams)
     }
 
     # Heap element: (t_ns, det_id, counter, ev, ref).
@@ -64,22 +61,27 @@ def coincidence_stream(
             heappush(heap, (ev.t_ns, det_id, _ctr, ev, ref))
             _ctr += 1
 
-    # Sliding deque: (det_id, TimedEvent, PosRef)
-    deque: list[tuple[int, TimedEvent, PosRef]] = []
+    # Open transitive-closure cluster: a maximal run of events whose
+    # consecutive (time-ordered) gaps are ≤ window_ns.  Per DESIGN.md §5.1 a
+    # cluster is emitted exactly once, when it *closes* — i.e. when the next
+    # popped event is more than window_ns after the cluster's most recent
+    # event, so nothing further can extend it.  Clusters are therefore
+    # disjoint: every event is reported in at most one cluster, which is what
+    # keeps stage 5 from double-counting coincidences.
+    cluster: list[tuple[int, TimedEvent, PosRef]] = []
+    last_t: int | None = None
 
     while heap:
         t_now, det_id, _, ev, ref = heappop(heap)
 
-        # Evict entries older than window_ns before the current event.
-        deque = [
-            (d, e, r) for d, e, r in deque
-            if e.t_ns >= t_now - window_ns
-        ]
-        deque.append((det_id, ev, ref))
+        # A gap larger than the window closes the current cluster.
+        if last_t is not None and t_now - last_t > window_ns:
+            if len({d for d, _, _ in cluster}) >= 2:
+                yield cluster
+            cluster = []
 
-        # Emit when the window contains events from 2+ distinct detectors.
-        if len({d for d, _, _ in deque}) >= 2:
-            yield list(deque)
+        cluster.append((det_id, ev, ref))
+        last_t = t_now
 
         # Advance the stream for this detector.
         nxt = next(stream_map[det_id], None)
@@ -87,3 +89,7 @@ def coincidence_stream(
             nev, nref = nxt
             heappush(heap, (nev.t_ns, det_id, _ctr, nev, nref))
             _ctr += 1
+
+    # Flush the final open cluster.
+    if len({d for d, _, _ in cluster}) >= 2:
+        yield cluster
