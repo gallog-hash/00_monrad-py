@@ -298,3 +298,58 @@ class TestPoseParameterRecovery:
             tol = 3 * _SIGMA_STRIP / math.sqrt(n)
             assert abs(np.mean(pose_result.residuals_x)) < tol
             assert abs(np.mean(pose_result.residuals_y)) < tol
+
+
+# ── unit tests for cluster disambiguation in PoseFitter._decode_cluster ─────
+
+
+from monrad.stage1 import TimedEvent, PosRef, Quality  # noqa: E402
+
+
+def _entry(det_id, seq):
+    """A (det_id, TimedEvent, PosRef) cluster entry with throwaway payload."""
+    return det_id, TimedEvent(seq, seq, Quality.GOOD), PosRef(0, seq * 16)
+
+
+class TestDecodeClusterDisambiguation:
+    """
+    _decode_cluster must accept exactly one telescope event and exactly one
+    event from *its* probe, and reject any ambiguous cluster *before* touching
+    the position files.  Reaching decode_position() with the dummy refs below
+    would raise, so a clean None return proves the guard short-circuits.
+    """
+
+    def _fitter(self):
+        return PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=[],
+            prb_pos_paths=[],
+        )
+
+    def test_two_telescope_events_rejected(self):
+        cluster = [_entry(0, 0), _entry(0, 1), _entry(1, 2)]
+        assert self._fitter()._decode_cluster(cluster) is None
+
+    def test_two_probe_events_rejected(self):
+        cluster = [_entry(0, 0), _entry(1, 1), _entry(1, 2)]
+        assert self._fitter()._decode_cluster(cluster) is None
+
+    def test_missing_telescope_rejected(self):
+        cluster = [_entry(1, 0)]
+        assert self._fitter()._decode_cluster(cluster) is None
+
+    def test_missing_probe_rejected(self):
+        cluster = [_entry(0, 0)]
+        assert self._fitter()._decode_cluster(cluster) is None
+
+    def test_other_probe_does_not_count(self):
+        # A second, different probe detector (id 2) in the cluster must not
+        # make this probe's pairing ambiguous: one tel + one prb-1 is still a
+        # valid pairing, so the guard passes and execution proceeds past it
+        # (and then fails at decode_position with the empty path list).
+        cluster = [_entry(0, 0), _entry(1, 1), _entry(2, 2)]
+        with pytest.raises((IndexError, ValueError, FileNotFoundError)):
+            self._fitter()._decode_cluster(cluster)
