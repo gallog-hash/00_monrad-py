@@ -55,6 +55,49 @@ damage to stage 4 was unfounded. The fix belongs in stage 2.
 
 All 120 tests pass; ruff clean. Done.
 
+## Open PR
+
+Branch `fix/coincidence-double-counting` →
+https://github.com/gallog-hash/00_monrad-py/pull/new/fix/coincidence-double-counting
+
+## Reviewer checklist
+
+- [ ] Confirm the transitive-closure semantics match DESIGN.md §5.1 (a cluster
+      spans events with consecutive gaps ≤ `window_ns`, so a cluster can be
+      wider than `window_ns` end-to-end). Confirm this is intended vs. a hard
+      `window_ns` span cap.
+- [ ] Confirm rejecting (not keeping) clusters with ≥2 telescope or ≥2
+      same-probe events is the desired policy for the pose fit.
+- [ ] `git diff main...HEAD` and verify the ruff-format reflow didn't bury a
+      logic change (the hook reformatted both source files on commit).
+
+## Follow-ups (out of scope for this PR)
+
+- [ ] **Validate on real detector data.** The synthetic data spaces tracks
+      ~10 ms apart, so it never exercised the high-rate growing-window path.
+      Run the pipeline on a real telescope+probe pair and confirm `n_inliers`
+      and pose covariance are no longer inflated.
+- [ ] **Quantify the impact.** Compare `n_inliers` / `cov` before vs. after on
+      real data to document how much the bug was inflating results.
+- [ ] **Multi-probe path.** `_decode_cluster` already supports it, but there is
+      no end-to-end test with ≥2 probe detectors sharing telescope events. Add
+      one when a multi-probe dataset exists.
+- [ ] **Stage 2 multi-probe clusters.** `coincidence_stream` can still yield
+      probe-only clusters (≥2 probes, no telescope). Harmless for the current
+      single-`PoseFitter` use, but decide whether stage 2 should filter them.
+- [ ] **Window tightening.** DESIGN.md §5 notes Δt may drop from 200 ns to
+      ~100 ns once the empirical Δt distribution is measured.
+- [ ] **Pre-existing ty diagnostics** (not introduced here):
+      `decode_position` returns `Hit | None` but `_decode_cluster` accesses
+      `.quality`/`.x_mm` without a None guard; scipy stubs unresolved. Address
+      separately.
+
+## Housekeeping
+
+- [ ] Untracked scratch still in the tree to delete or `.gitignore`:
+      `memory/`, `pipeline_out/`, `.claude/`, `1`. (`handoff.md` and the new
+      test are now committed; `to-do.md` and `scripts/synth_plot.png` removed.)
+
 ---
 
 # Session handoff — 2026-06-11 (corner-probe edge-case audit)
