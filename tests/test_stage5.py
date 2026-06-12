@@ -130,7 +130,9 @@ class TestTelLineFit:
         ax, bx, ay, by = 200.0, 0.1, 150.0, -0.05
         x = ax + bx * z
         y = ay + by * z
-        a_x, b_x, a_y, b_y, cov_x, cov_y, chi2 = _tel_line_fit(x, y, z, _SIGMA_STRIP)
+        a_x, b_x, a_y, b_y, cov_x, cov_y, chi2 = _tel_line_fit(
+            x, y, z, _SIGMA_STRIP, _SIGMA_STRIP
+        )
         assert abs(a_x - ax) < 1e-9
         assert abs(b_x - bx) < 1e-9
         assert abs(a_y - ay) < 1e-9
@@ -141,7 +143,7 @@ class TestTelLineFit:
         z = Z_TEL
         x = np.array([205.0, 255.0, 310.0])
         y = np.array([150.0, 148.0, 147.0])
-        _, _, _, _, cov_x, cov_y, _ = _tel_line_fit(x, y, z, _SIGMA_STRIP)
+        _, _, _, _, cov_x, cov_y, _ = _tel_line_fit(x, y, z, _SIGMA_STRIP, _SIGMA_STRIP)
         va, cab, vb = cov_x
         assert va > 0 and vb > 0
 
@@ -174,13 +176,15 @@ class TestLinearSolveFixedTheta:
             u = (x_at_p - _TRUE_TX) * c + (y_at_p - _TRUE_TY) * s
             v = -(x_at_p - _TRUE_TX) * s + (y_at_p - _TRUE_TY) * c
             cov = (_SIGMA_STRIP**2, 0.0, _SIGMA_STRIP**2 / 1e6)
-            coincs.append(Coincidence(ax, bx, ay, by, cov, u, v, _SIGMA_STRIP))
+            coincs.append(
+                Coincidence(ax, bx, ay, by, cov, cov, u, v, _SIGMA_STRIP, _SIGMA_STRIP)
+            )
         return coincs
 
     def test_recovers_pose(self):
         coincs = self._make_coincs(200)
         c, s = math.cos(_TRUE_THETA), math.sin(_TRUE_THETA)
-        tx, ty, zp, _ = _linear_solve_fixed_theta(coincs, c, s, _SIGMA_STRIP)
+        tx, ty, zp, _ = _linear_solve_fixed_theta(coincs, c, s)
         assert abs(tx - _TRUE_TX) < 1.0
         assert abs(ty - _TRUE_TY) < 1.0
         assert abs(zp - _TRUE_ZP) < 5.0

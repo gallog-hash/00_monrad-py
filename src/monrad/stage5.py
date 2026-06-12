@@ -41,12 +41,15 @@ class Coincidence(NamedTuple):
     b_x: float
     a_y: float  # telescope y(z) = a_y + b_y*z
     b_y: float
-    # Covariance of (a, b): (var_a, cov_ab, var_b) — same for x and y
-    # since both axes use the same z values and hit sigma.
-    cov_ab: tuple[float, float, float]
+    # Covariance of (a, b) per axis: (var_a, cov_ab, var_b).  X and Y differ
+    # because each plane's hit sigma is per-axis (DESIGN.md §6.4, §8.2): the
+    # two axes share the same z values but not the same weights.
+    cov_ab_x: tuple[float, float, float]
+    cov_ab_y: tuple[float, float, float]
     u: float  # probe u-coordinate (mm)
     v: float  # probe v-coordinate (mm)
-    sigma_prb: float  # probe position uncertainty (mm)
+    sigma_prb_x: float  # probe position uncertainty along x (mm)
+    sigma_prb_y: float  # probe position uncertainty along y (mm)
 
 
 # ── Result bundle ─────────────────────────────────────────────────────────
@@ -90,7 +93,8 @@ def _tel_line_fit(
     x_arr: np.ndarray,
     y_arr: np.ndarray,
     z_arr: np.ndarray,
-    sigma_hit: float,
+    sigma_x: float | np.ndarray,
+    sigma_y: float | np.ndarray,
 ) -> tuple[
     float,
     float,
@@ -103,34 +107,46 @@ def _tel_line_fit(
     """
     Weighted least-squares fit of x(z) and y(z) through n telescope planes.
 
+    Each plane carries its own per-axis position uncertainty (DESIGN.md §6.4),
+    so the X and Y fits use independent diagonal weight matrices and yield
+    distinct covariances (DESIGN.md §8.2).
+
+    sigma_x and sigma_y may each be a scalar (uniform across planes) or an
+    (n,) array of per-plane sigmas.
+
     Returns (a_x, b_x, a_y, b_y, cov_x, cov_y, chi2_total).
     chi2_total is the combined x+y chi² (ndof = 2*(n-2)).
-    cov_x = cov_y = (var_a, cov_ab, var_b) since both axes share the
-    same z values and sigma_hit.
+    cov_x / cov_y = (var_a, cov_ab, var_b) for the respective axis.
     """
-    w = 1.0 / sigma_hit**2
-    A = np.column_stack([np.ones(len(z_arr)), z_arr])  # (n, 2)
-    AtA = w * (A.T @ A)  # (2, 2)
-    Atx = w * (A.T @ x_arr)
-    Aty = w * (A.T @ y_arr)
+    n = len(z_arr)
+    wx = 1.0 / np.broadcast_to(np.asarray(sigma_x, dtype=float), (n,)) ** 2
+    wy = 1.0 / np.broadcast_to(np.asarray(sigma_y, dtype=float), (n,)) ** 2
 
-    px = np.linalg.solve(AtA, Atx)  # [a_x, b_x]
-    py = np.linalg.solve(AtA, Aty)  # [a_y, b_y]
+    A = np.column_stack([np.ones(n), z_arr])  # (n, 2)
+    AtA_x = A.T @ (wx[:, None] * A)  # (2, 2)
+    AtA_y = A.T @ (wy[:, None] * A)
+    Atx = A.T @ (wx * x_arr)
+    Aty = A.T @ (wy * y_arr)
 
-    cov2 = np.linalg.inv(AtA)  # (2, 2) covariance of [a, b]
-    cov_ab = (float(cov2[0, 0]), float(cov2[0, 1]), float(cov2[1, 1]))
+    px = np.linalg.solve(AtA_x, Atx)  # [a_x, b_x]
+    py = np.linalg.solve(AtA_y, Aty)  # [a_y, b_y]
+
+    cov2_x = np.linalg.inv(AtA_x)  # (2, 2) covariance of [a_x, b_x]
+    cov2_y = np.linalg.inv(AtA_y)
+    cov_x = (float(cov2_x[0, 0]), float(cov2_x[0, 1]), float(cov2_x[1, 1]))
+    cov_y = (float(cov2_y[0, 0]), float(cov2_y[0, 1]), float(cov2_y[1, 1]))
 
     rx = x_arr - A @ px
     ry = y_arr - A @ py
-    chi2 = float(np.sum(rx**2 + ry**2)) * w
+    chi2 = float(np.sum(wx * rx**2) + np.sum(wy * ry**2))
 
     return (
         float(px[0]),
         float(px[1]),
         float(py[0]),
         float(py[1]),
-        cov_ab,
-        cov_ab,
+        cov_x,
+        cov_y,
         chi2,
     )
 
@@ -139,7 +155,6 @@ def _linear_solve_fixed_theta(
     coincs: list[Coincidence],
     c: float,  # cos θ
     s: float,  # sin θ
-    sigma_prb: float,
 ) -> tuple[float, float, float, float]:
     """
     Solve for (t_x, t_y, z_p) at fixed θ using probe-only weights.
@@ -148,22 +163,32 @@ def _linear_solve_fixed_theta(
       t_x - b_x·z_p = a_x - (u·c - v·s)
       t_y - b_y·z_p = a_y - (u·s + v·c)
 
+    Each equation is weighted by the per-axis probe uncertainty
+    (DESIGN.md §8.4 step 1: W_i held at the probe-only weight Σ_probe,i⁻¹).
+    The x and y rows therefore carry independent weights, and chi2 is the
+    already-normalised weighted sum of squares.
+
     Returns (t_x, t_y, z_p, chi2).
     """
     N = len(coincs)
     A = np.zeros((2 * N, 3))
     b_vec = np.zeros(2 * N)
+    wsqrt = np.zeros(2 * N)
     for i, co in enumerate(coincs):
         A[2 * i, 0] = 1.0
         A[2 * i, 2] = -co.b_x
         b_vec[2 * i] = co.a_x - (co.u * c - co.v * s)
+        wsqrt[2 * i] = 1.0 / co.sigma_prb_x
         A[2 * i + 1, 1] = 1.0
         A[2 * i + 1, 2] = -co.b_y
         b_vec[2 * i + 1] = co.a_y - (co.u * s + co.v * c)
+        wsqrt[2 * i + 1] = 1.0 / co.sigma_prb_y
 
-    params, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
-    res = A @ params - b_vec
-    chi2 = float(np.dot(res, res)) / sigma_prb**2
+    Aw = A * wsqrt[:, None]
+    bw = b_vec * wsqrt
+    params, _, _, _ = np.linalg.lstsq(Aw, bw, rcond=None)
+    res = Aw @ params - bw
+    chi2 = float(np.dot(res, res))
 
     return float(params[0]), float(params[1]), float(params[2]), chi2
 
@@ -187,8 +212,8 @@ def _weighted_residuals(
         y_pred = co.a_y + co.b_y * zp
         x_meas = tx + co.u * c - co.v * s
         y_meas = ty + co.u * s + co.v * c
-        var_x = co.sigma_prb**2 + _sigma_tel_at_z(co.cov_ab, zp)
-        var_y = var_x  # cov_ab same for both axes
+        var_x = co.sigma_prb_x**2 + _sigma_tel_at_z(co.cov_ab_x, zp)
+        var_y = co.sigma_prb_y**2 + _sigma_tel_at_z(co.cov_ab_y, zp)
         res[2 * i] = (x_meas - x_pred) / math.sqrt(max(var_x, 1e-12))
         res[2 * i + 1] = (y_meas - y_pred) / math.sqrt(max(var_y, 1e-12))
     return res
@@ -223,7 +248,6 @@ def fit_probe_pose(
     coincs = coincidences
     if len(coincs) < 3:
         raise ValueError(f"fit_probe_pose needs ≥ 3 coincidences, got {len(coincs)}")
-    sigma_prb = coincs[0].sigma_prb
 
     # ── Step 1: coarse θ scan at 1° ──────────────────────────────
     theta_coarse = np.deg2rad(np.arange(-180.0, 180.0, 1.0))
@@ -236,7 +260,7 @@ def fit_probe_pose(
 
     for j, th in enumerate(theta_coarse):
         c, s = math.cos(th), math.sin(th)
-        tx, ty, zp, chi2 = _linear_solve_fixed_theta(coincs, c, s, sigma_prb)
+        tx, ty, zp, chi2 = _linear_solve_fixed_theta(coincs, c, s)
         chi2_curve[j, 0] = th
         chi2_curve[j, 1] = chi2
         if chi2 < best_chi2:
@@ -250,7 +274,7 @@ def fit_probe_pose(
     theta_fine = best_theta + np.deg2rad(np.arange(-2.0, 2.01, 0.01))
     for th in theta_fine:
         c, s = math.cos(th), math.sin(th)
-        tx, ty, zp, chi2 = _linear_solve_fixed_theta(coincs, c, s, sigma_prb)
+        tx, ty, zp, chi2 = _linear_solve_fixed_theta(coincs, c, s)
         if chi2 < best_chi2:
             best_chi2 = chi2
             best_theta = th
@@ -282,9 +306,11 @@ def fit_probe_pose(
         y_pred = co.a_y + co.b_y * zp_lm
         x_meas = tx_lm + co.u * c_lm - co.v * s_lm
         y_meas = ty_lm + co.u * s_lm + co.v * c_lm
-        var = co.sigma_prb**2 + _sigma_tel_at_z(co.cov_ab, zp_lm)
-        var = max(var, 1e-12)
-        maha[i] = math.sqrt((x_meas - x_pred) ** 2 / var + (y_meas - y_pred) ** 2 / var)
+        var_x = max(co.sigma_prb_x**2 + _sigma_tel_at_z(co.cov_ab_x, zp_lm), 1e-12)
+        var_y = max(co.sigma_prb_y**2 + _sigma_tel_at_z(co.cov_ab_y, zp_lm), 1e-12)
+        maha[i] = math.sqrt(
+            (x_meas - x_pred) ** 2 / var_x + (y_meas - y_pred) ** 2 / var_y
+        )
 
     mask = maha <= _MAHAL_CUT
     inliers = [co for co, m in zip(coincs, mask) if m]
@@ -324,7 +350,7 @@ def fit_probe_pose(
     odd = [co for i, co in enumerate(inliers) if i % 2 == 1]
     for j, half in enumerate((even, odd)):
         if len(half) >= 3:
-            tx_h, ty_h, zp_h, _ = _linear_solve_fixed_theta(half, c_f, s_f, sigma_prb)
+            tx_h, ty_h, zp_h, _ = _linear_solve_fixed_theta(half, c_f, s_f)
             half_params[j] = [tx_h, ty_h, theta_lm, zp_h]
 
     return PoseResult(
@@ -443,11 +469,12 @@ class PoseFitter:
         corr = self.alignment
         x_arr = np.array([tel_hits[k].x_mm - corr.planes[k].delta_x for k in range(3)])
         y_arr = np.array([tel_hits[k].y_mm - corr.planes[k].delta_y for k in range(3)])
-        sigma_tel = tel_hits[0].sigma_x
+        sigma_x_arr = np.array([tel_hits[k].sigma_x for k in range(3)])
+        sigma_y_arr = np.array([tel_hits[k].sigma_y for k in range(3)])
 
         z_arr = self.alignment.corrected_z_tel(self.tel_z)
-        a_x, b_x, a_y, b_y, cov_x, _, chi2_line = _tel_line_fit(
-            x_arr, y_arr, z_arr, sigma_tel
+        a_x, b_x, a_y, b_y, cov_x, cov_y, chi2_line = _tel_line_fit(
+            x_arr, y_arr, z_arr, sigma_x_arr, sigma_y_arr
         )
         if chi2_line >= _CHI2_TRACK:
             return None
@@ -469,10 +496,12 @@ class PoseFitter:
             b_x=b_x,
             a_y=a_y,
             b_y=b_y,
-            cov_ab=cov_x,
+            cov_ab_x=cov_x,
+            cov_ab_y=cov_y,
             u=prb_hit.x_mm,
             v=prb_hit.y_mm,
-            sigma_prb=prb_hit.sigma_x,
+            sigma_prb_x=prb_hit.sigma_x,
+            sigma_prb_y=prb_hit.sigma_y,
         )
 
     def _refit(self) -> "PoseResult":
