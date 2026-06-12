@@ -29,10 +29,10 @@ class Hit(NamedTuple):
     sigma_x: float
     sigma_y: float
     quality: Literal["golden", "cluster", "unresolved", "invalid"]
-    # Candidate channel centroids for 'unresolved' hits — used by
+    # Candidate (centroid_ch, width) pairs for 'unresolved' hits — used by
     # disambiguate_telescope_hits().  None for all other qualities.
-    candidates_x: list[float] | None = None
-    candidates_y: list[float] | None = None
+    candidates_x: list[tuple[float, int]] | None = None
+    candidates_y: list[tuple[float, int]] | None = None
 
 
 def _read_block(
@@ -96,11 +96,11 @@ def _tot_weighted_centroid(
     return sum(w * ch for w, ch in zip(weights, candidates)) / total
 
 
-def _axis_candidates(field_or: int) -> list[float]:
+def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
     """
-    Return candidate channel centroids for an axis that decoded as
-    'unresolved'.  Each entry is the centroid (in channel units) of one
-    possible (ribbon_cluster × fiber_cluster) hit hypothesis.
+    Return candidate (centroid_ch, width) pairs for an axis that decoded as
+    'unresolved'.  centroid_ch is in channel units; width is the number of
+    combined channels in the hypothesis, used to compute sigma on selection.
     """
     fiber_half = (field_or >> _N) & 0x3FF
     ribbon_half = field_or & 0x3FF
@@ -108,11 +108,11 @@ def _axis_candidates(field_or: int) -> list[float]:
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
 
-    candidates: list[float] = []
+    candidates: list[tuple[float, int]] = []
     for rc in rcs:
         for fc in fcs:
             chs = [_N * r + f for r in rc for f in fc]
-            candidates.append(sum(chs) / len(chs))
+            candidates.append((sum(chs) / len(chs), len(chs)))
     return candidates
 
 
@@ -295,22 +295,28 @@ def disambiguate_telescope_hits(
         y_pred = ref1.y_mm + t * (ref2.y_mm - ref1.y_mm)
 
         new_x = new_y = None
+        width_x = width_y = 1
         if hit_k.candidates_x:
-            best = min(
-                hit_k.candidates_x, key=lambda ch: abs((ch + 0.5) * _STRIP_MM - x_pred)
+            best_ch, best_w = min(
+                hit_k.candidates_x,
+                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - x_pred),
             )
-            if abs((best + 0.5) * _STRIP_MM - x_pred) <= _MATCH_TOL:
-                new_x = (best + 0.5) * _STRIP_MM
+            if abs((best_ch + 0.5) * _STRIP_MM - x_pred) <= _MATCH_TOL:
+                new_x = (best_ch + 0.5) * _STRIP_MM
+                width_x = best_w
 
         if hit_k.candidates_y:
-            best = min(
-                hit_k.candidates_y, key=lambda ch: abs((ch + 0.5) * _STRIP_MM - y_pred)
+            best_ch, best_w = min(
+                hit_k.candidates_y,
+                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - y_pred),
             )
-            if abs((best + 0.5) * _STRIP_MM - y_pred) <= _MATCH_TOL:
-                new_y = (best + 0.5) * _STRIP_MM
+            if abs((best_ch + 0.5) * _STRIP_MM - y_pred) <= _MATCH_TOL:
+                new_y = (best_ch + 0.5) * _STRIP_MM
+                width_y = best_w
 
         if new_x is not None and new_y is not None:
-            sigma = _STRIP_MM / math.sqrt(12)
-            result[k] = Hit(new_x, new_y, sigma, sigma, "cluster")
+            sigma_x = (_STRIP_MM * width_x) / math.sqrt(12)
+            sigma_y = (_STRIP_MM * width_y) / math.sqrt(12)
+            result[k] = Hit(new_x, new_y, sigma_x, sigma_y, "cluster")
 
     return result

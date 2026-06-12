@@ -301,7 +301,9 @@ class TestDisambiguateHits:
                     ch=0.0  → 5 mm   (Δ=295 mm)             ✗
         """
         h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[0.0, 29.0], cy=[0.0, 29.0])
+        h1 = _h(
+            0.0, 0.0, "unresolved", cx=[(0.0, 1), (29.0, 1)], cy=[(0.0, 1), (29.0, 1)]
+        )
         h2 = _h(500.0, 500.0)
         result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
         assert result[0] == h0
@@ -317,7 +319,9 @@ class TestDisambiguateHits:
         Track: x1=300, x2=500 → slope=(500-300)/(800-400)=0.5 mm/mm
                x_pred at z=0: t=(0-400)/(800-400)=-1.0 → x=300-1*(500-300)=100 mm.
         """
-        h0 = _h(0.0, 0.0, "unresolved", cx=[0.0, 9.0], cy=[0.0, 9.0])
+        h0 = _h(
+            0.0, 0.0, "unresolved", cx=[(0.0, 1), (9.0, 1)], cy=[(0.0, 1), (9.0, 1)]
+        )
         h1 = _h(300.0, 300.0)
         h2 = _h(500.0, 500.0)
         # ch=9: x_mm=(9.0+0.5)*10=95 mm; |95-100|=5<15 ✓
@@ -328,10 +332,21 @@ class TestDisambiguateHits:
         assert result[0].quality == "cluster"
         assert abs(result[0].x_mm - 95.0) < 1e-6
 
+    def test_sigma_carries_cluster_width(self):
+        """Disambiguated sigma reflects each axis's cluster width, not always 1 strip."""
+        h0 = _h(100.0, 100.0)
+        # cx: width-2 cluster centroid near prediction; cy: width-1
+        h1 = _h(0.0, 0.0, "unresolved", cx=[(29.0, 2)], cy=[(29.0, 1)])
+        h2 = _h(500.0, 500.0)
+        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
+        assert result[1].quality == "cluster"
+        assert abs(result[1].sigma_x - STRIP_MM * 2 / math.sqrt(12)) < 1e-9
+        assert abs(result[1].sigma_y - STRIP_MM * 1 / math.sqrt(12)) < 1e-9
+
     def test_no_match_candidate_out_of_range(self):
         """Nearest candidate is more than 1.5 strips away → hit unchanged."""
         h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[0.0], cy=[0.0])
+        h1 = _h(0.0, 0.0, "unresolved", cx=[(0.0, 1)], cy=[(0.0, 1)])
         h2 = _h(500.0, 500.0)
         # x_pred at z=400: 300 mm; ch=0 → 5 mm; Δ=295 mm > 15 mm
         result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
@@ -344,8 +359,8 @@ class TestDisambiguateHits:
             0.0,
             0.0,
             "unresolved",
-            cx=[29.0],  # x_mm=295 ≈ pred 300 → within tol
-            cy=[0.0],
+            cx=[(29.0, 1)],  # x_mm=295 ≈ pred 300 → within tol
+            cy=[(0.0, 1)],
         )  # y_mm=5   far from pred 300 → out of tol
         h2 = _h(500.0, 500.0)
         result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
@@ -354,8 +369,8 @@ class TestDisambiguateHits:
     def test_two_unresolved_planes_unchanged(self):
         """Two unresolved planes → can't form a 2-good-plane predictor."""
         h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[29.0], cy=[29.0])
-        h2 = _h(0.0, 0.0, "unresolved", cx=[49.0], cy=[49.0])
+        h1 = _h(0.0, 0.0, "unresolved", cx=[(29.0, 1)], cy=[(29.0, 1)])
+        h2 = _h(0.0, 0.0, "unresolved", cx=[(49.0, 1)], cy=[(49.0, 1)])
         result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
         assert result[1].quality == "unresolved"
         assert result[2].quality == "unresolved"
