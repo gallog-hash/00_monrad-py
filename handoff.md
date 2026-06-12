@@ -1,107 +1,40 @@
-# Session handoff — 2026-06-12 (per-plane / per-axis σ in stage 5)
+# Session handoff — 2026-06-12 (per-plane / per-axis σ in stage 5) — RESOLVED
 
-## Goal
+## Goal (done)
 
 Make stage 5's weighting comply with DESIGN.md §6.4 / §8.2 / §8.3: use the
-**per-plane, per-axis** position uncertainties that `stage3.Hit` already
-carries, instead of collapsing them to a single broadcast scalar. This is
-the fix for finding #1 of the 2026-06-11 corner-probe audit (below):
-`_tel_line_fit` applied plane-0's `sigma_x` uniformly to all 3 planes and
-both axes, so a `cluster` plane's larger σ was ignored, mis-scaling the
-line covariance and the χ²<4 track cut.
-
-## Origin of the task
-
-Started from a code-reading question: "is it correct for `_tel_line_fit`
-to expect `sigma_hit` to be a float?" Answer: no. DESIGN.md §8.2 says
-`Σ_line` is "derived from the **per-plane** position uncertainties (§6.4)",
-and §6.4 computes σ per axis (`σ = cluster_width·strip/√12`). The scalar
-only cancelled for the line *point estimates*; it wrong-scaled `cov_ab` and
-χ² whenever plane/axis widths differed.
-
-## What was changed (all in this session)
-
-Done in three rounds, each requested and verified:
-
-1. **Telescope per-plane/per-axis** (`src/monrad/stage5.py`):
-   - `_tel_line_fit` now takes `sigma_x`, `sigma_y` (each scalar **or**
-     `(n,)` array), builds independent diagonal weight matrices per axis,
-     and returns genuinely distinct `cov_x` / `cov_y`. χ² is the weighted
-     sum `Σ wₖrₖ²` over both axes.
-   - `Coincidence.cov_ab` split into `cov_ab_x` / `cov_ab_y`.
-   - `_decode_cluster` builds `sigma_x_arr` / `sigma_y_arr` from all 3
-     planes (was `tel_hits[0].sigma_x`) and stores both covariances.
-   - `_weighted_residuals` + Mahalanobis cut use the per-axis covariances.
-
-2. **Probe per-axis** (`src/monrad/stage5.py`):
-   - `Coincidence.sigma_prb` split into `sigma_prb_x` / `sigma_prb_y`
-     (from `prb_hit.sigma_x` / `.sigma_y`).
-   - `_linear_solve_fixed_theta` **substantive change**: it previously took
-     a single `sigma_prb` used only as a uniform post-hoc χ² divisor — the
-     θ-scan was effectively *unweighted*. It now weights each row of the 2N
-     system by its per-axis probe weight `1/σ_prb,{x,y}` (`Aw = A·√w`,
-     `bw = b·√w`, χ² = weighted SSR). The scalar param is gone. **This
-     changes the recovered θ/pose on data with mixed golden/cluster probe
-     hits** — correctly, not a regression.
-   - Removed `sigma_prb = coincs[0].sigma_prb` and threaded the param out
-     of all 3 call sites (coarse scan, fine scan, half-consistency).
-
-3. **Tests updated to the new API + removed the back-compat crutch**:
-   - `_tel_line_fit`'s `sigma_y` was briefly given a `None` default (→
-     reuse `sigma_x`) to keep legacy scalar test calls working. User then
-     asked to update the tests and drop the default, so `sigma_y` is now
-     **required**. The fallback line is gone.
-   - `tests/test_stage5.py`: `_tel_line_fit(...)` calls pass both σ;
-     `Coincidence(...)` positional ctor gets the extra cov + probe-σ args;
-     `_linear_solve_fixed_theta(coincs, c, s)` dropped its scalar arg.
-   - `tests/test_corner_probe_edge_cases.py`: `_line_chi2` passes both σ;
-     the in-loop `_tel_line_fit` now builds per-plane `sx`/`sy` arrays from
-     the decoded hits (mirrors production); `_maha` uses `sigma_prb_x/y`
-     and `cov_ab_x/y`.
+**per-plane, per-axis** position uncertainties `stage3.Hit` carries instead
+of collapsing them to a broadcast scalar. Fixes finding #1 of the
+corner-probe audit below (`_tel_line_fit` applied plane-0's σ uniformly to
+all planes/axes, so a `cluster` plane's larger σ was ignored, mis-scaling
+the line covariance and the χ²<4 track cut).
 
 ## State
 
-**133 tests pass; `ruff check` + `ruff format --check` clean** on all three
-touched files. Changes are **uncommitted and on `main`** — needs a branch
-before committing (repo convention: branch off main for PRs).
+`_tel_line_fit` and the probe path now thread per-plane/per-axis σ end to
+end: `Coincidence.cov_ab`→`cov_ab_x`/`cov_ab_y`,
+`sigma_prb`→`sigma_prb_x`/`sigma_prb_y`, and `_linear_solve_fixed_theta`'s
+θ-scan is now genuinely per-axis weighted (was effectively unweighted).
+`synth.generate()` gained `tel_cluster_widths` / `probe_cluster_width` to
+emit controllable-width `cluster` hits (via `_cluster_fiber_mask`), and
+`tests/test_stage5.py` now proves distinct per-axis/per-plane σ *changes the
+fit* (`TestHeteroscedasticLineFit`, `TestPerAxisSigmaPropagation`).
+**138 tests pass; ruff clean.**
 
-## Files actively edited
+## Open PR
 
-- `src/monrad/stage5.py`        (the real change)
-- `tests/test_stage5.py`        (API updates)
-- `tests/test_corner_probe_edge_cases.py` (API updates)
+Branch `fix/per-axis-sigma`.
 
-## What did NOT work / was reversed
+## Follow-ups (out of scope for this PR)
 
-- No technical dead-ends — the implementation passed on first run each
-  round. The only reversal was the `sigma_y=None` back-compat default,
-  added then removed at the user's request once the tests were updated.
-- Pre-existing `ty` diagnostics persist and were **not** addressed (out of
-  scope): `scipy.optimize` unresolved import; `_decode_cluster` accesses
+- **`Hit | None` None-guard.** `_decode_cluster` accesses
   `.quality`/`.x_mm`/`.sigma_*` on `decode_position`'s `Hit | None` return
-  without a None guard. Same list as the prior session's follow-ups.
-
-## Next step
-
-**Close the coverage gap, then commit.** `synth.generate()` only emits
-**golden** hits (`_ch_to_u64` sets one fiber + one ribbon bit → width 1 →
-`σ_x == σ_y`, identical across planes); `fold=True` yields `unresolved`,
-not `cluster`. So the new heteroscedastic branches *run* but always with
-equal weights — **no test actually proves distinct per-axis/per-plane σ
-changes the fit.** The stage5 unit tests also pass equal `cov`/σ for both
-axes.
-
-1. Extend `src/monrad/synth.py` with a way to emit `cluster` hits of
-   controllable width, **differing per axis and per plane** (set 2
-   contiguous fiber/ribbon bits so a plane decodes `cluster`, width 2,
-   σ≈5.77 mm on one axis vs width 1 on the other). Likely a
-   `cluster_widths` param threaded into `_ch_to_u64`.
-2. Add a stage5 test asserting the sharper plane/axis is weighted more
-   heavily (e.g. cov / residual shifts toward the low-σ plane).
-3. Branch (`fix/per-axis-sigma` or similar), commit, open PR.
-
-Secondary: address the `Hit | None` None-guard in `_decode_cluster` while
-in the file.
+  without a None guard; scipy stubs unresolved. Pre-existing ty diagnostics.
+- **Telescope cluster vs. the χ² cut.** A width-2 telescope `cluster`'s
+  inherent ~5 mm half-strip centroid offset fights the χ²<4 track cut (only
+  ~8/200 survive in a quick check), so telescope per-plane weighting is
+  proven via the deterministic `_tel_line_fit` unit test, not the
+  end-to-end path. Revisit if cluster planes become common on real data.
 
 ---
 

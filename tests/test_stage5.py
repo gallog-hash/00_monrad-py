@@ -29,6 +29,7 @@ from monrad.stage5 import (
     Coincidence,
     PoseResult,
     PoseFitter,
+    fit_probe_pose,
     _tel_line_fit,
     _linear_solve_fixed_theta,
     _sigma_tel_at_z,
@@ -41,7 +42,8 @@ _TRUE_TX = 50.0
 _TRUE_TY = -30.0
 _TRUE_THETA = 0.29671  # ≈ radians(17°)
 _TRUE_ZP = 300.0
-_SIGMA_STRIP = STRIP_MM / math.sqrt(12)
+_SIGMA_STRIP = STRIP_MM / math.sqrt(12)  # golden hit σ (width-1)
+_SIGMA_CLUSTER2 = 2 * STRIP_MM / math.sqrt(12)  # width-2 cluster σ
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────
@@ -146,6 +148,75 @@ class TestTelLineFit:
         _, _, _, _, cov_x, cov_y, _ = _tel_line_fit(x, y, z, _SIGMA_STRIP, _SIGMA_STRIP)
         va, cab, vb = cov_x
         assert va > 0 and vb > 0
+
+
+class TestHeteroscedasticLineFit:
+    """
+    Per-plane / per-axis σ weighting (DESIGN.md §6.4, §8.2).  A plane that
+    decodes as a wide `cluster` carries a larger σ and must be weighted
+    *less* than the sharp `golden` planes — the line should follow the
+    sharp planes more closely.  Before the per-axis-σ fix, _tel_line_fit
+    broadcast plane-0's σ to all planes and both axes, so a cluster plane's
+    larger σ was ignored; these tests pin the corrected behaviour.
+
+    Geometry: outer planes (0, 2) sit on a flat line at x=100; the middle
+    plane (1) is displaced 10 mm off it.  The weights are z-symmetric, so
+    the fitted slope stays 0 and the fit reduces to a weighted mean — the
+    intercept moves toward whichever planes are trusted more.
+    """
+
+    _Z = Z_TEL
+    _X = np.array([100.0, 110.0, 100.0])  # plane 1 is 10 mm off the outer line
+    _Y = np.array([200.0, 220.0, 240.0])  # clean line, never reweighted here
+
+    def _fit(self, sigma_x, sigma_y):
+        return _tel_line_fit(self._X, self._Y, self._Z, sigma_x, sigma_y)
+
+    def test_sharp_planes_followed_more_closely(self):
+        """
+        Inflating only the middle-plane X σ (golden→cluster) must pull the X
+        line toward the sharp outer planes: their |residual| shrinks while
+        the down-weighted middle plane's |residual| grows.
+        """
+        ax_u, bx_u, *_ = self._fit(_SIGMA_STRIP, _SIGMA_STRIP)
+        sx = np.array([_SIGMA_STRIP, _SIGMA_CLUSTER2, _SIGMA_STRIP])
+        ax_h, bx_h, *_ = self._fit(sx, _SIGMA_STRIP)
+
+        res_outer_u = abs(self._X[0] - (ax_u + bx_u * self._Z[0]))
+        res_outer_h = abs(self._X[0] - (ax_h + bx_h * self._Z[0]))
+        res_mid_u = abs(self._X[1] - (ax_u + bx_u * self._Z[1]))
+        res_mid_h = abs(self._X[1] - (ax_h + bx_h * self._Z[1]))
+
+        assert res_outer_h < res_outer_u, (
+            f"sharp-plane residual should shrink: {res_outer_u:.3f} → {res_outer_h:.3f}"
+        )
+        assert res_mid_h > res_mid_u, (
+            f"down-weighted-plane residual should grow: {res_mid_u:.3f} → {res_mid_h:.3f}"
+        )
+
+    def test_cov_diverges_between_axes(self):
+        """
+        With a wide cluster on X but golden Y, the X fit holds less
+        information than Y, so its parameter variance must be strictly
+        larger — and the two axes' covariances must genuinely differ.
+        """
+        sx = np.array([_SIGMA_STRIP, _SIGMA_CLUSTER2, _SIGMA_STRIP])
+        _, _, _, _, cov_x, cov_y, _ = self._fit(sx, _SIGMA_STRIP)
+        assert cov_x != cov_y
+        assert cov_x[0] > cov_y[0], "X intercept variance should exceed Y's"
+
+    def test_differs_from_scalar_collapse(self):
+        """
+        Regression guard for the original bug: passing the real per-plane σ
+        array must give a different fit than collapsing to a single scalar
+        (plane-0's σ broadcast to all planes).
+        """
+        sx = np.array([_SIGMA_STRIP, _SIGMA_CLUSTER2, _SIGMA_STRIP])
+        ax_arr, *_ = self._fit(sx, _SIGMA_STRIP)
+        ax_scalar, *_ = self._fit(_SIGMA_STRIP, _SIGMA_STRIP)
+        assert abs(ax_arr - ax_scalar) > 1.0, (
+            f"per-plane σ must change the fit: {ax_scalar:.3f} vs {ax_arr:.3f}"
+        )
 
 
 class TestSigmaTelAtZ:
@@ -357,3 +428,94 @@ class TestDecodeClusterDisambiguation:
         cluster = [_entry(0, 0), _entry(1, 1), _entry(2, 2)]
         with pytest.raises((IndexError, ValueError, FileNotFoundError)):
             self._fitter()._decode_cluster(cluster)
+
+
+# ── per-axis probe σ propagation through the full pipeline ─────────────────
+
+
+def _run_pipeline(out, **gen_kwargs):
+    """Generate a synthetic dataset and run stages 1+2+5; return the
+    PoseFitter (with its accumulated coincidences) after a flush()."""
+    result = generate(
+        out_dir=out,
+        t_x=_TRUE_TX,
+        t_y=_TRUE_TY,
+        theta=_TRUE_THETA,
+        z_p=_TRUE_ZP,
+        n_tracks=_N_TRACKS,
+        seed=42,
+        start_utc=_START_UTC,
+        f0=F0,
+        **gen_kwargs,
+    )
+    tel_dir = out / "telescope"
+    prb_dir = out / "probe"
+    tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+    prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header.txt")))
+    tel_gps, tel_pos = find_file_pairs(tel_dir)
+    prb_gps, prb_pos = find_file_pairs(prb_dir)
+    tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
+    prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
+
+    fitter = PoseFitter(
+        tel_z=Z_TEL,
+        alignment=AlignmentCorrection.identity(),
+        tel_id=0,
+        prb_id=1,
+        tel_pos_paths=tel_pos,
+        prb_pos_paths=prb_pos,
+        refit_every=_N_TRACKS + 1,  # no auto-flush
+    )
+    for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
+        fitter.add(cluster)
+    fitter.flush()
+    return result, fitter
+
+
+class TestPerAxisSigmaPropagation:
+    """
+    End-to-end proof that a probe hit decoding as a `cluster` carries a
+    larger σ on the wide axis, that this per-axis σ reaches the optimizer
+    inputs intact, and that it genuinely changes the pose fit (the gap the
+    synth `cluster_widths` support was added to close).
+
+    The probe is encoded with a width-2 cluster on its v-axis only
+    (`probe_cluster_width=(1, 2)`), so σ_prb,v = 2·σ_prb,u.  The telescope
+    stays golden, so the χ²<4 track cut keeps full statistics.
+    """
+
+    @pytest.fixture(scope="class")
+    def cluster_fitter(self, tmp_path_factory):
+        out = tmp_path_factory.mktemp("synth_stage5_probe_cluster")
+        _, fitter = _run_pipeline(out, probe_cluster_width=(1, 2))
+        return fitter
+
+    def test_probe_sigma_is_anisotropic(self, cluster_fitter):
+        """Every coincidence's probe σ is golden on u, width-2 cluster on v."""
+        coincs = cluster_fitter._coincs
+        assert len(coincs) >= 3
+        for co in coincs:
+            assert co.sigma_prb_x == pytest.approx(_SIGMA_STRIP)
+            assert co.sigma_prb_y == pytest.approx(_SIGMA_CLUSTER2)
+            assert co.sigma_prb_y > co.sigma_prb_x
+
+    def test_per_axis_sigma_changes_the_fit(self, cluster_fitter):
+        """
+        Refit the same coincidences with the per-axis probe σ collapsed to
+        a single scalar (σ_v forced to σ_u — the pre-fix behaviour).  The
+        recovered covariance must differ, proving the anisotropic σ is not
+        silently ignored downstream.
+        """
+        coincs = cluster_fitter._coincs
+        ident = AlignmentCorrection.identity()
+        pr_hetero = fit_probe_pose(coincs, Z_TEL, ident)
+        collapsed = [co._replace(sigma_prb_y=co.sigma_prb_x) for co in coincs]
+        pr_scalar = fit_probe_pose(collapsed, Z_TEL, ident)
+
+        assert not np.allclose(pr_hetero.cov, pr_scalar.cov), (
+            "collapsing probe σ to a scalar left the pose covariance unchanged"
+        )
+        # The down-weighted v-axis carries less information, so the hetero
+        # fit must be no tighter than the (over-confident) scalar fit on the
+        # v-coupled parameters.
+        assert np.trace(pr_hetero.cov) > np.trace(pr_scalar.cov)
