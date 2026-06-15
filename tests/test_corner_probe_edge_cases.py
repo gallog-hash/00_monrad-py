@@ -140,7 +140,7 @@ def _line_chi2(planes) -> float:
     """χ² of the quantized telescope line — same cut stage 5 applies."""
     x = np.array([(cx + 0.5) * STRIP_MM for cx, _ in planes])
     y = np.array([(cy + 0.5) * STRIP_MM for _, cy in planes])
-    *_, chi2 = _tel_line_fit(x, y, np.asarray(Z_TEL), _SIGMA_STRIP)
+    *_, chi2 = _tel_line_fit(x, y, np.asarray(Z_TEL), _SIGMA_STRIP, _SIGMA_STRIP)
     return chi2
 
 
@@ -418,7 +418,9 @@ def _run_pipeline(out_dir, label_by_slot) -> Results:
             if all(q in ("golden", "cluster") for q in tel_quals):
                 x = np.array([h.x_mm for h in th])
                 y = np.array([h.y_mm for h in th])
-                *_, chi2 = _tel_line_fit(x, y, np.asarray(Z_TEL), th[0].sigma_x)
+                sx = np.array([h.sigma_x for h in th])
+                sy = np.array([h.sigma_y for h in th])
+                *_, chi2 = _tel_line_fit(x, y, np.asarray(Z_TEL), sx, sy)
 
         if label == "E1-genuine":
             if accepted:
@@ -447,8 +449,9 @@ def _run_pipeline(out_dir, label_by_slot) -> Results:
         ym = pr.t_y + co.u * s + co.v * c
         xp = co.a_x + co.b_x * pr.z_p
         yp = co.a_y + co.b_y * pr.z_p
-        var = max(co.sigma_prb**2 + _sigma_tel_at_z(co.cov_ab, pr.z_p), 1e-12)
-        return math.sqrt((xm - xp) ** 2 / var + (ym - yp) ** 2 / var)
+        var_x = max(co.sigma_prb_x**2 + _sigma_tel_at_z(co.cov_ab_x, pr.z_p), 1e-12)
+        var_y = max(co.sigma_prb_y**2 + _sigma_tel_at_z(co.cov_ab_y, pr.z_p), 1e-12)
+        return math.sqrt((xm - xp) ** 2 / var_x + (ym - yp) ** 2 / var_y)
 
     return Results(
         verdicts=verdicts,

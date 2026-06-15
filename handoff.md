@@ -1,3 +1,43 @@
+# Session handoff — 2026-06-12 (per-plane / per-axis σ in stage 5) — RESOLVED
+
+## Goal (done)
+
+Make stage 5's weighting comply with DESIGN.md §6.4 / §8.2 / §8.3: use the
+**per-plane, per-axis** position uncertainties `stage3.Hit` carries instead
+of collapsing them to a broadcast scalar. Fixes finding #1 of the
+corner-probe audit below (`_tel_line_fit` applied plane-0's σ uniformly to
+all planes/axes, so a `cluster` plane's larger σ was ignored, mis-scaling
+the line covariance and the χ²<4 track cut).
+
+## State
+
+`_tel_line_fit` and the probe path now thread per-plane/per-axis σ end to
+end: `Coincidence.cov_ab`→`cov_ab_x`/`cov_ab_y`,
+`sigma_prb`→`sigma_prb_x`/`sigma_prb_y`, and `_linear_solve_fixed_theta`'s
+θ-scan is now genuinely per-axis weighted (was effectively unweighted).
+`synth.generate()` gained `tel_cluster_widths` / `probe_cluster_width` to
+emit controllable-width `cluster` hits (via `_cluster_fiber_mask`), and
+`tests/test_stage5.py` now proves distinct per-axis/per-plane σ *changes the
+fit* (`TestHeteroscedasticLineFit`, `TestPerAxisSigmaPropagation`).
+**138 tests pass; ruff clean.**
+
+## Open PR
+
+Branch `fix/per-axis-sigma`.
+
+## Follow-ups (out of scope for this PR)
+
+- **`Hit | None` None-guard.** `_decode_cluster` accesses
+  `.quality`/`.x_mm`/`.sigma_*` on `decode_position`'s `Hit | None` return
+  without a None guard; scipy stubs unresolved. Pre-existing ty diagnostics.
+- **Telescope cluster vs. the χ² cut.** A width-2 telescope `cluster`'s
+  inherent ~5 mm half-strip centroid offset fights the χ²<4 track cut (only
+  ~8/200 survive in a quick check), so telescope per-plane weighting is
+  proven via the deterministic `_tel_line_fit` unit test, not the
+  end-to-end path. Revisit if cluster planes become common on real data.
+
+---
+
 # Session handoff — 2026-06-11 (RESOLVED)
 
 ## Goal

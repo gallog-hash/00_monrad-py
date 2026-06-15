@@ -102,7 +102,30 @@ def _write_pos_bin(
 # ── encoding ────────────────────────────────────────────────────
 
 
-def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
+def _cluster_fiber_mask(f: int, width: int) -> int:
+    """Return a fiber mask of `width` contiguous bits whose centroid sits
+    as close as possible to bit `f`, kept within a single ribbon [0, 9].
+
+    width=1 reproduces the golden single-bit mask.  For width W>1 the
+    combined-coordinate candidates 10*r + (f_start … f_start+W-1) form a
+    contiguous range, so the axis decodes as a `cluster` with
+    σ = STRIP_MM*W/√12 (decoded centroid channel = f_start + (W-1)/2).
+    """
+    if not 1 <= width <= 10:
+        raise ValueError(f"cluster width must be in 1..10, got {width}")
+    f_start = f - (width - 1) // 2
+    f_start = max(0, min(10 - width, f_start))
+    return ((1 << width) - 1) << f_start
+
+
+def _ch_to_u64(
+    c_x: int,
+    c_y: int,
+    gen: int,
+    fold: bool = False,
+    width_x: int = 1,
+    width_y: int = 1,
+) -> int:
     """Encode a hit as a u64 word.
 
     fold=False (default): golden hit — single fiber bit + single ribbon
@@ -112,6 +135,12 @@ def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
     bit (9-k) in both the fiber and ribbon halves, mimicking the real
     telescope MAROC wiring.  Mirror-pair patterns are reported as
     diagnostics by or_visual() but are not resolved in reconstruction.
+
+    width_x, width_y: per-axis cluster widths (channels).  width=1 is a
+    golden hit; width>1 fires that many contiguous fiber bits so the axis
+    decodes as a `cluster` of that width (σ = STRIP_MM*width/√12), letting
+    a single plane carry a different σ on each axis.  Ignored when fold is
+    True (the two encodings are mutually exclusive).
     """
     # ch = 10 * ribbon_bit + fiber_bit
     r_y, f_y = c_y // 10, c_y % 10
@@ -123,9 +152,9 @@ def _ch_to_u64(c_x: int, c_y: int, gen: int, fold: bool = False) -> int:
         x_fib = (1 << f_x) | (1 << (9 - f_x))
     else:
         y_rib = 1 << r_y
-        y_fib = 1 << f_y
+        y_fib = _cluster_fiber_mask(f_y, width_y)
         x_rib = 1 << r_x
-        x_fib = 1 << f_x
+        x_fib = _cluster_fiber_mask(f_x, width_x)
     return y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
 
 
@@ -223,6 +252,8 @@ def generate(
     plane_offsets: dict[int, tuple[float, float]] | None = None,
     fold: bool = False,
     z_tel_offsets: dict[int, float] | None = None,
+    tel_cluster_widths: dict[int, tuple[int, int]] | None = None,
+    probe_cluster_width: tuple[int, int] | None = None,
 ) -> dict:
     """
     Write synthetic telescope + probe files to out_dir.
@@ -240,6 +271,15 @@ def generate(
                      *.bin file is written with hits computed at
                      Z_TEL[k] + dz, but the header still records the
                      nominal Z_TEL.  Used to test stage-4 Z-correction.
+    tel_cluster_widths : optional dict {plane_idx: (width_x, width_y)} —
+                     encode that telescope plane's hit as a `cluster` of
+                     the given per-axis width (channels) instead of a
+                     golden hit, so the plane carries σ = STRIP_MM*width/√12
+                     that can differ per axis and per plane.  Planes absent
+                     from the dict stay golden (width 1).  Ignored when fold
+                     is True.
+    probe_cluster_width : optional (width_x, width_y) — same idea for the
+                     probe plane's hit.
 
     Returns a dict with keys:
       tracks          list of (a_x, b_x, a_y, b_y)
@@ -254,6 +294,8 @@ def generate(
         plane_offsets = {}
     if z_tel_offsets is None:
         z_tel_offsets = {}
+    if tel_cluster_widths is None:
+        tel_cluster_widths = {}
     out_dir = Path(out_dir)
     tel_dir = out_dir / "telescope"
     prb_dir = out_dir / "probe"
@@ -308,7 +350,8 @@ def generate(
             else:
                 cx = _quantize_clamp(ax + bx * z + off_x, N_TEL)
                 cy = _quantize_clamp(ay + by * z + off_y, N_TEL)
-            words.append(_ch_to_u64(cx, cy, gen, fold=fold))
+            wx, wy = tel_cluster_widths.get(k, (1, 1))
+            words.append(_ch_to_u64(cx, cy, gen, fold=fold, width_x=wx, width_y=wy))
         tel_blocks.append(words)
         gen = (gen + 1) % 2048
 
@@ -319,10 +362,11 @@ def generate(
 
     # ── probe position blocks ────────────────────────────────────
     gen = 0
+    prb_wx, prb_wy = probe_cluster_width or (1, 1)
     prb_blocks: list[list[int]] = []
     for i in coinc_idx:
         cu, cv = probe_hits[i]
-        prb_blocks.append([_ch_to_u64(cu, cv, gen)])
+        prb_blocks.append([_ch_to_u64(cu, cv, gen, width_x=prb_wx, width_y=prb_wy)])
         gen = (gen + 1) % 2048
 
     # ── write files ──────────────────────────────────────────────
@@ -345,4 +389,6 @@ def generate(
         "pose": (t_x, t_y, theta, z_p),
         "plane_offsets": plane_offsets,
         "z_tel_offsets": z_tel_offsets,
+        "tel_cluster_widths": tel_cluster_widths,
+        "probe_cluster_width": probe_cluster_width,
     }
