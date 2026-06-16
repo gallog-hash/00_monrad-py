@@ -28,13 +28,13 @@ class GPSDecoder:
 
         data shape: (n_rows,), dtype uint64
         """
-        with open(self.filename, 'rb') as f:
+        with open(self.filename, "rb") as f:
             raw = f.read()
 
         if len(raw) < 4:
             raise ValueError(f"File too short: {len(raw)} bytes")
 
-        n_rows = struct.unpack_from('<I', raw, 0)[0]
+        n_rows = struct.unpack_from("<I", raw, 0)[0]
 
         expected = 4 + n_rows * 8
         if len(raw) != expected:
@@ -43,15 +43,15 @@ class GPSDecoder:
                 f"({n_rows} rows × 8 bytes + 4-byte header), got {len(raw)}"
             )
 
-        data = np.frombuffer(raw[4:], dtype='<u8')
+        data = np.frombuffer(raw[4:], dtype="<u8")
         return n_rows, data
 
     @staticmethod
     def _parse_u64(value: int) -> dict:
         return {
-            'CLK':  value        & 0xFFFFFFFFFFFFF,  # bits  0-51 (52 bits)
-            'GEN': (value >> 52) & 0x7FF,             # bits 52-62 (11 bits)
-            'FLAG':(value >> 63) & 0x1,               # bit  63    ( 1 bit)
+            "CLK": value & 0xFFFFFFFFFFFFF,  # bits  0-51 (52 bits)
+            "GEN": (value >> 52) & 0x7FF,  # bits 52-62 (11 bits)
+            "FLAG": (value >> 63) & 0x1,  # bit  63    ( 1 bit)
         }
 
     def analyze(self):
@@ -65,11 +65,11 @@ class GPSDecoder:
     def export_csv(self, output_file: str = None):
         """Export data as CSV with CLK, GEN, FLAG fields extracted from each u64."""
         if output_file is None:
-            output_file = self.filename.replace('.bin', '_decoded.csv')
+            output_file = self.filename.replace(".bin", "_decoded.csv")
 
         n_rows, data = self.read()
 
-        with open(output_file, 'w') as f:
+        with open(output_file, "w") as f:
             f.write("row_id,CLK,GEN,FLAG\n")
             for r in range(n_rows):
                 p = self._parse_u64(int(data[r]))
@@ -85,9 +85,13 @@ def main():
 
     decoder = GPSDecoder(sys.argv[1])
 
-    if '--csv' in sys.argv:
-        idx = sys.argv.index('--csv')
-        out = sys.argv[idx + 1] if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--') else None
+    if "--csv" in sys.argv:
+        idx = sys.argv.index("--csv")
+        out = (
+            sys.argv[idx + 1]
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--")
+            else None
+        )
         decoder.export_csv(out)
     else:
         decoder.analyze()
