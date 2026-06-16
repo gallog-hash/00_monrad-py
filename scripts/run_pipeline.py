@@ -22,9 +22,14 @@ Expected console output (example values):
 
     === Stage 4: Telescope alignment ===
       Plane 0   delta_x =  +0.12 mm   delta_y =  -0.05 mm   rot_z =  +3.00e-04 rad
+                delta_z =  +0.00 mm   tilt_x =  +0.00e+00 rad   tilt_y =  +0.00e+00 rad
       Plane 1   delta_x =  -0.08 mm   delta_y =  +0.11 mm   rot_z =  -1.00e-04 rad
+                delta_z =  +1.20 mm   tilt_x =  +4.00e-03 rad   tilt_y =  -2.00e-03 rad
       Plane 2   delta_x =  +0.04 mm   delta_y =  +0.02 mm   rot_z =  +2.00e-04 rad
+                delta_z =  +0.00 mm   tilt_x =  +0.00e+00 rad   tilt_y =  +0.00e+00 rad
       needs_correction: True
+      (delta_z/tilt_x/tilt_y are fitted for the middle plane only; outer
+       planes carry these degrees of freedom degenerate with track slope.)
       Symmetry check (Plane 0 vs Plane 2):
         |delta_x[0] - delta_x[2]| =  0.00 mm   |delta_y[0] - delta_y[2]| =  0.00 mm
         delta_x[1]/delta_x[0] = -0.50   (expected -0.50: algorithm identity for z=[0,400,800])
@@ -61,6 +66,7 @@ import argparse
 import math
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -132,7 +138,7 @@ def _parse_args() -> argparse.Namespace:
 def _load_detector(
     d: Path,
     label: str,
-) -> tuple[object, int, list[Path], list[Path]]:
+) -> tuple[datetime, int, list[Path], list[Path]]:
     headers = list(d.glob("*_header*.txt"))
     if not headers:
         sys.exit(f"ERROR: no *_header.txt found in {d} ({label})")
@@ -211,7 +217,21 @@ def main() -> None:
             f"delta_y = {pc.delta_y:+7.2f} mm   "
             f"rot_z = {pc.rotation_z:+.2e} rad",
         )
+        _emit(
+            lines,
+            f"            "
+            f"delta_z = {pc.delta_z:+7.2f} mm   "
+            f"tilt_x = {pc.tilt_x:+.2e} rad   "
+            f"tilt_y = {pc.tilt_y:+.2e} rad",
+        )
     _emit(lines, f"  needs_correction: {alignment.needs_correction}")
+    # delta_z/tilt_x/tilt_y are fitted for the middle plane only (k=1);
+    # the outer planes leave them at 0 (degenerate with track slope).
+    _emit(
+        lines,
+        "  (delta_z/tilt_x/tilt_y are fitted for the middle plane only; outer"
+        " planes carry these degrees of freedom degenerate with track slope.)",
+    )
     # Symmetry / spacing check.
     # Sort columns by z to identify the physical outer and middle planes,
     # regardless of column order in the *.bin file.
