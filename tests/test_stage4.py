@@ -387,3 +387,75 @@ class TestTiltRecovery:
     def test_needs_correction_flag(self, correction_tilt):
         """A 30 mrad tilt exceeds _TILT_THRESH = 5 mrad."""
         assert correction_tilt.needs_correction
+
+
+# ── Middle plane selected by z, not by file-column index ────────────────
+#
+# Regression for the 0_testLab_20210723 geometry: the telescope columns are
+# not stored in z order (column 1 is the *far* plane, column 2 the middle).
+# fit_telescope_alignment must fit delta_z/tilt on the geometric middle
+# (argsort(z)[1]), not on hardcoded column 1.  Build straight-track hits
+# directly — a displaced middle plane reports x = a + b·(z_mid + dz), so the
+# two-plane predictor leaves a residual b·dz that the fit must attribute to
+# the correct column.
+
+
+def _straight_track_hits(z_cols, dz_col, dz, n=600, seed=7):
+    """N events of 3 collinear hits at z_cols, with column dz_col shifted by dz."""
+    import numpy as np
+
+    from monrad.stage3 import Hit
+
+    rng = np.random.default_rng(seed)
+    z = np.asarray(z_cols, dtype=float)
+    z_eff = z.copy()
+    z_eff[dz_col] += dz  # the displaced plane samples the track at z + dz
+    hits = []
+    for _ in range(n):
+        # Random straight tracks; spread of slopes gives the b-regression
+        # something to bite on.  Intercepts keep coords on the 0–1000 mm area.
+        a_x, b_x = rng.uniform(300.0, 700.0), rng.uniform(-0.3, 0.3)
+        a_y, b_y = rng.uniform(300.0, 700.0), rng.uniform(-0.3, 0.3)
+        event = [
+            Hit(
+                float(a_x + b_x * z_eff[k]),
+                float(a_y + b_y * z_eff[k]),
+                _SIGMA_STRIP,
+                _SIGMA_STRIP,
+                "golden",
+            )
+            for k in range(3)
+        ]
+        hits.append(event)
+    return hits
+
+
+class TestMiddlePlaneByZOrder:
+    # Columns in file order map to z = [0, 800, 400]: column 2 is the middle.
+    _Z_SHUFFLED = [0.0, 800.0, 400.0]
+    _MID_COL = 2  # argsort([0,800,400])[1]
+    _DZ = 30.0
+
+    @pytest.fixture(scope="class")
+    def correction_shuffled(self):
+        hits = _straight_track_hits(self._Z_SHUFFLED, self._MID_COL, self._DZ)
+        import numpy as np
+
+        return fit_telescope_alignment(hits, np.asarray(self._Z_SHUFFLED))
+
+    def test_delta_z_on_geometric_middle(self, correction_shuffled):
+        """delta_z is fitted on column 2 (the middle by z), not column 1."""
+        dz = correction_shuffled.planes[self._MID_COL].delta_z
+        assert abs(dz - self._DZ) < _DZ_TOL, (
+            f"delta_z[{self._MID_COL}]={dz:.2f} mm, expected {self._DZ} ± {_DZ_TOL}"
+        )
+
+    def test_outer_columns_delta_z_zero(self, correction_shuffled):
+        """The two non-middle columns (0 and 1) leave delta_z untouched."""
+        assert correction_shuffled.planes[0].delta_z == 0.0
+        assert correction_shuffled.planes[1].delta_z == 0.0
+
+    def test_far_column_one_not_treated_as_middle(self, correction_shuffled):
+        """The old code fit column 1; it is an outer plane here and stays 0."""
+        assert correction_shuffled.planes[1].tilt_x == 0.0
+        assert correction_shuffled.planes[1].tilt_y == 0.0

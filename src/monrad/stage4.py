@@ -141,6 +141,10 @@ def fit_telescope_alignment(
     z = z_tel if z_tel is not None else _Z_TEL
 
     # ── Two-plane prediction ──────────────────────────────────────────
+    # The geometric middle plane is the column with the median z, regardless
+    # of the order columns appear in the *.bin file.  Only this plane gets a
+    # delta_z/tilt fit; for it, _OTHERS[mid] is exactly the two outer planes.
+    mid = int(np.argsort(z)[1])
     planes: list[PlaneCorrection] = []
     needs = False
 
@@ -178,7 +182,7 @@ def fit_telescope_alignment(
         )
         rotation_z = (alpha_x + alpha_y) / 2.0
 
-        # ── Z-offset and tilt for the middle plane (k=1) only ─────
+        # ── Z-offset and tilt for the middle plane (k == mid) only ─────
         # Both a Z offset and an out-of-plane tilt give plane k a
         # slope-dependent two-plane residual.  Their shapes differ:
         #   Z offset δz : r ≈ δz·b            (b = track slope)
@@ -191,7 +195,7 @@ def fit_telescope_alignment(
         delta_z = 0.0
         tilt_x = 0.0
         tilt_y = 0.0
-        if k == 1:
+        if k == mid:
             b_x = (x[:, j2] - x[:, j1]) / (z[j2] - z[j1])
             b_y = (y[:, j2] - y[:, j1]) / (z[j2] - z[j1])
             dz_x, tilt_y = _fit_dz_and_tilt(rx_c, b_x, x_pred)
