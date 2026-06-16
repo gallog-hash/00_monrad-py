@@ -173,6 +173,18 @@ def main() -> None:
 
     lines: list[str] = []
 
+    # ── Run configuration ────────────────────────────────────────────────
+    # Record the input data directories and the telescope plane
+    # z-coordinates used: the alignment and pose fits depend on them, and
+    # columns are not always stored in z order (the middle plane is
+    # argsort(z)[1], not necessarily column 1).
+    z_str = "  ".join(f"{zz:g}" for zz in args.z_tel)
+    _emit(lines, "=== Run configuration ===")
+    _emit(lines, f"  Telescope data: {tel_dir}")
+    _emit(lines, f"  Probe data:     {prb_dir}")
+    _emit(lines, f"  Telescope plane z (mm): {z_str}")
+    _emit(lines)
+
     # ── Load both detectors ──────────────────────────────────────────────
     tel_utc0, tel_f0, tel_gps, tel_pos = _load_detector(tel_dir, "telescope")
     prb_utc0, prb_f0, prb_gps, prb_pos = _load_detector(prb_dir, "probe")
