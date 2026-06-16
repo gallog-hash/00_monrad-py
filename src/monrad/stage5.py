@@ -95,6 +95,7 @@ def _tel_line_fit(
     z_arr: np.ndarray,
     sigma_x: float | np.ndarray,
     sigma_y: float | np.ndarray,
+    z_y_arr: np.ndarray | None = None,
 ) -> tuple[
     float,
     float,
@@ -114,19 +115,27 @@ def _tel_line_fit(
     sigma_x and sigma_y may each be a scalar (uniform across planes) or an
     (n,) array of per-plane sigmas.
 
+    z_arr is the plane z used for the x(z) fit.  z_y_arr, if given, is the
+    plane z for the y(z) fit; it defaults to z_arr.  The two differ only when
+    an out-of-plane tilt has been folded in (DESIGN.md §7.3/§10): a tilt about
+    the y-axis shifts the effective z of the x measurement and a tilt about
+    the x-axis shifts it for y, so each axis is fit in its own corrected frame.
+
     Returns (a_x, b_x, a_y, b_y, cov_x, cov_y, chi2_total).
     chi2_total is the combined x+y chi² (ndof = 2*(n-2)).
     cov_x / cov_y = (var_a, cov_ab, var_b) for the respective axis.
     """
     n = len(z_arr)
+    z_y = z_arr if z_y_arr is None else z_y_arr
     wx = 1.0 / np.broadcast_to(np.asarray(sigma_x, dtype=float), (n,)) ** 2
     wy = 1.0 / np.broadcast_to(np.asarray(sigma_y, dtype=float), (n,)) ** 2
 
-    A = np.column_stack([np.ones(n), z_arr])  # (n, 2)
-    AtA_x = A.T @ (wx[:, None] * A)  # (2, 2)
-    AtA_y = A.T @ (wy[:, None] * A)
-    Atx = A.T @ (wx * x_arr)
-    Aty = A.T @ (wy * y_arr)
+    A_x = np.column_stack([np.ones(n), z_arr])  # (n, 2)
+    A_y = np.column_stack([np.ones(n), z_y])
+    AtA_x = A_x.T @ (wx[:, None] * A_x)  # (2, 2)
+    AtA_y = A_y.T @ (wy[:, None] * A_y)
+    Atx = A_x.T @ (wx * x_arr)
+    Aty = A_y.T @ (wy * y_arr)
 
     px = np.linalg.solve(AtA_x, Atx)  # [a_x, b_x]
     py = np.linalg.solve(AtA_y, Aty)  # [a_y, b_y]
@@ -136,8 +145,8 @@ def _tel_line_fit(
     cov_x = (float(cov2_x[0, 0]), float(cov2_x[0, 1]), float(cov2_x[1, 1]))
     cov_y = (float(cov2_y[0, 0]), float(cov2_y[0, 1]), float(cov2_y[1, 1]))
 
-    rx = x_arr - A @ px
-    ry = y_arr - A @ py
+    rx = x_arr - A_x @ px
+    ry = y_arr - A_y @ py
     chi2 = float(np.sum(wx * rx**2) + np.sum(wy * ry**2))
 
     return (
@@ -472,9 +481,18 @@ class PoseFitter:
         sigma_x_arr = np.array([tel_hits[k].sigma_x for k in range(3)])
         sigma_y_arr = np.array([tel_hits[k].sigma_y for k in range(3)])
 
+        # A tilted plane reports its hit at an effective z that depends on the
+        # in-plane coordinate (DESIGN.md §7.3/§10): a tilt about the y-axis
+        # puts the x measurement at z + tilt_y·x, and a tilt about the x-axis
+        # puts the y measurement at z + tilt_x·y.  Fitting each axis in its own
+        # corrected z-frame removes the tilt exactly, with no iteration — the
+        # coordinate that sets the z shift is itself measured.  Identity/
+        # translation-only corrections carry tilt = 0, so this is a no-op.
         z_arr = self.alignment.corrected_z_tel(self.tel_z)
+        z_x_arr = z_arr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
+        z_y_arr = z_arr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
         a_x, b_x, a_y, b_y, cov_x, cov_y, chi2_line = _tel_line_fit(
-            x_arr, y_arr, z_arr, sigma_x_arr, sigma_y_arr
+            x_arr, y_arr, z_x_arr, sigma_x_arr, sigma_y_arr, z_y_arr=z_y_arr
         )
         if chi2_line >= _CHI2_TRACK:
             return None
