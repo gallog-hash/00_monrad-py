@@ -465,30 +465,25 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "matplotlib" },
     { name = "pytest" },
+    { name = "ruff" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "ruff" },
-]
-
 [package.metadata]
-requires-dist = [
-    { name = "matplotlib", marker = "extra == 'dev'", specifier = ">=3.7" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.11" },
-]
-provides-extras = ["dev"]
+requires-dist = [{ name = "numpy", specifier = ">=1.24" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "ruff", specifier = ">=0.15.14" }]
+dev = [
+    { name = "matplotlib", specifier = ">=3.7" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.15.14" },
+    { name = "scipy", specifier = ">=1.11" },
+]
 
 [[package]]
 name = "numpy"

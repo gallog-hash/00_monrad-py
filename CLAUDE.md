@@ -5,11 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Editable install (run once, or after adding dependencies)
-pip install -e ".[dev]"
+# Editable install + dev tooling (run once, or after adding dependencies)
+# All dev deps (pytest, scipy, matplotlib, ruff) live in the `dev`
+# dependency-group, which uv installs by default.
+uv sync
 
 # Run all tests
-pytest
+uv run pytest
 
 # Run a single test file or test function
 pytest tests/test_foo.py
