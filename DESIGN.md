@@ -494,7 +494,12 @@ look at the residual on each plane in turn. For plane `k`:
   angle equal to the slope.
 - A linear correlation between `x`-residual and the track's x-direction
   cosine indicates a tilt of plane `k` about the y-axis (and likewise for y
-  about x).
+  about x). Equivalently, the residual carries a slope×lever-arm term
+  `r ≈ φ·b·coord`, distinct from the Z-offset term `r ≈ δz·b` (slope only)
+  and the z-rotation term `r ∝ ⊥ coordinate`. For the middle plane these are
+  separated by a joint regression of the residual on `(b, b·coord)`; the two
+  regressors are strongly correlated for a cosmic-ray sample, so a univariate
+  fit per term would cross-contaminate `δz` and `φ`.
 
 **(b) Two-plane prediction.** For each plane `k` in turn, fit a line through
 the *other two* planes and predict the hit on plane `k`. Compare to the
@@ -512,6 +517,13 @@ If all per-plane offsets are below ~1 mm (sub-strip) and rotations below
 proceeds to §8 with no corrections. If systematics exceed those thresholds,
 the recovered offsets and rotations are folded into the telescope geometry
 as corrections that propagate to every subsequent line fit in §8.2.
+
+The same applies to the two slope-dependent middle-plane corrections — the
+Z offset `δz` (threshold ~5 mm) and the out-of-plane tilt `φ` (threshold
+~5 mrad, set above the ~3 mrad statistical floor at ~1000 tracks). Because
+the telescope mechanics suppress rotation about z but permit a small tilt
+about x or y, `rotation_z` is in practice a quality monitor (expected ≈ 0)
+while the tilt is the per-plane non-parallelism actually worth correcting.
 
 Thresholds are set by physics, not statistics: with thousands of tracks the
 statistical uncertainty per plane is well below 0.1 mm, so any systematic
@@ -534,7 +546,8 @@ for ev, ref in reconstruct_stream(tel_gps, tel_pos, utc0, f0):
             log.info('Alignment updated: %s', correction)
 ```
 
-`AlignmentCorrection` carries the per-plane `(Δx, Δy, rotation_z)` values
+`AlignmentCorrection` carries the per-plane `(Δx, Δy, rotation_z, δz,
+tilt_x, tilt_y)` values (the last three non-zero only for the middle plane)
 and a `needs_correction` boolean that downstream consumers (stage 5) read to
 decide whether to apply it.
 
@@ -564,8 +577,9 @@ it.
 ### 8.1 Geometry and parameterisation
 
 We assume — and have validated by §7 — that all telescope planes are
-mutually parallel and X-Y aligned, and that the probe plane is parallel to
-the telescope planes. Place the telescope frame so the planes are at
+mutually parallel and X-Y aligned (or have been made so by the §7
+corrections, including the middle-plane tilt), and that the probe plane is
+parallel to the telescope planes. Place the telescope frame so the planes are at
 constant `z` values `z₁, z₂, z₃` (the geometric centre of the top plane is
 the reference origin in `z`). The probe plane then sits at a single unknown
 `z = z_p`, and the probe's own (u, v) coordinates are related to
@@ -588,6 +602,14 @@ For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 `x(z) = a_x + b_x · z` and `y(z) = a_y + b_y · z`. Each fit yields the four
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
+
+When a middle-plane tilt has been fitted, the X and Y fits use *different*
+plane `z` values: a tilted plane reports its hit at an effective
+`z = z_k + φ·coord` (a tilt about y shifts the x measurement, a tilt about x
+shifts y), so the x fit uses `z_k + tilt_y·x` and the y fit uses
+`z_k + tilt_x·y`. This places each measurement at its true z and removes the
+tilt exactly, without iteration, since the coordinate setting the shift is
+itself measured.
 
 A **track quality cut** (e.g. χ² of the line fit < 4, equivalent to ≤ 1 strip
 of residual on each plane) is applied here to remove ghost tracks before
@@ -780,7 +802,7 @@ Key types:
 | `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
 | `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
 | `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality)` |
-| `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z)` |
+| `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
 | `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
 | `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
 | `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
@@ -825,12 +847,16 @@ real data on first inspection:
 - **Telescope plane z-coordinates.** `_Z_TEL = [0, 400, 800] mm` is hardcoded.
   Verify against hardware drawings before the first stage-4 run; a few-mm
   error biases the line-fit covariance and the probe z_p estimate.
-- **Plane tilt detection.** The 2 cm physical thickness of each
-  position-sensitive plane (two perpendicular scintillator layers) introduces
-  a z-ambiguity.  A tilt of a plane about x or y would manifest as a residual
-  that correlates with the track direction cosine (§7.3).  Detecting and
-  correcting tilts requires fitting one extra parameter per plane per axis and
-  is deferred until a tilt signal is observed above noise in real data.
+- **Plane tilt detection.** *Implemented for the middle plane.* The telescope
+  mechanics suppress rotation about z but permit a small tilt of a plane about
+  x or y, breaking parallelism. Such a tilt manifests as a residual that
+  correlates with the track direction cosine (§7.3). Stage 4 now fits a
+  middle-plane `tilt_x`/`tilt_y` (joint `(b, b·coord)` regression, §7.3) and
+  stage 5 applies it as a per-axis effective-z shift (§8.2). Outer-plane tilts
+  remain degenerate with track slope and are left at 0; resolving them, like
+  individual-plane offsets, needs external survey data or a 4-plane geometry.
+  The 2 cm physical thickness of each plane (two perpendicular scintillator
+  layers) also introduces a z-ambiguity that is not separately modelled.
 - **Diagnostic plots.** No visualisation is currently produced.  Before first
   real-data validation, implement residual histograms (stage 4), the χ²(θ)
   curve (stage 5), and the alignment drift log.  These are the primary

@@ -252,6 +252,7 @@ def generate(
     plane_offsets: dict[int, tuple[float, float]] | None = None,
     fold: bool = False,
     z_tel_offsets: dict[int, float] | None = None,
+    z_tel_tilts: dict[int, tuple[float, float]] | None = None,
     tel_cluster_widths: dict[int, tuple[int, int]] | None = None,
     probe_cluster_width: tuple[int, int] | None = None,
 ) -> dict:
@@ -271,6 +272,13 @@ def generate(
                      *.bin file is written with hits computed at
                      Z_TEL[k] + dz, but the header still records the
                      nominal Z_TEL.  Used to test stage-4 Z-correction.
+    z_tel_tilts    : optional dict {plane_idx: (tilt_x_rad, tilt_y_rad)} —
+                     give that plane a small out-of-plane tilt so it is no
+                     longer parallel to the others.  tilt_y (about the
+                     y-axis) displaces the x hit by tilt_y·b_x·x, tilt_x
+                     (about the x-axis) displaces the y hit by tilt_x·b_y·y,
+                     reproducing the slope×lever-arm residual of DESIGN.md
+                     §7.3.  Used to test stage-4 tilt detection.
     tel_cluster_widths : optional dict {plane_idx: (width_x, width_y)} —
                      encode that telescope plane's hit as a `cluster` of
                      the given per-axis width (channels) instead of a
@@ -294,6 +302,8 @@ def generate(
         plane_offsets = {}
     if z_tel_offsets is None:
         z_tel_offsets = {}
+    if z_tel_tilts is None:
+        z_tel_tilts = {}
     if tel_cluster_widths is None:
         tel_cluster_widths = {}
     out_dir = Path(out_dir)
@@ -340,16 +350,24 @@ def generate(
             # is told the nominal z — this lets stage 4 detect the offset.
             z = z_nom + z_tel_offsets.get(k, 0.0)
             off_x, off_y = plane_offsets.get(k, (0.0, 0.0))
-            if off_x == 0.0 and off_y == 0.0:
-                cx = _quantize(ax + bx * z, N_TEL)
-                cy = _quantize(ay + by * z, N_TEL)
+            tilt_x, tilt_y = z_tel_tilts.get(k, (0.0, 0.0))
+            # Nominal intersection of the track with this plane.
+            x_base = ax + bx * z
+            y_base = ay + by * z
+            # A tilt about the y-axis tips the plane in x-z, so its x reading
+            # is displaced by tilt_y·(track x-slope)·(lever arm) — and likewise
+            # tilt_x for y.  This is the slope×position residual of §7.3.
+            x_coord = x_base + off_x + tilt_y * bx * x_base
+            y_coord = y_base + off_y + tilt_x * by * y_base
+            if off_x == 0.0 and off_y == 0.0 and tilt_x == 0.0 and tilt_y == 0.0:
+                cx = _quantize(x_coord, N_TEL)
+                cy = _quantize(y_coord, N_TEL)
                 assert cx is not None and cy is not None, (
-                    f"Track out of range at z={z}: "
-                    f"x={ax + bx * z:.1f}, y={ay + by * z:.1f}"
+                    f"Track out of range at z={z}: x={x_coord:.1f}, y={y_coord:.1f}"
                 )
             else:
-                cx = _quantize_clamp(ax + bx * z + off_x, N_TEL)
-                cy = _quantize_clamp(ay + by * z + off_y, N_TEL)
+                cx = _quantize_clamp(x_coord, N_TEL)
+                cy = _quantize_clamp(y_coord, N_TEL)
             wx, wy = tel_cluster_widths.get(k, (1, 1))
             words.append(_ch_to_u64(cx, cy, gen, fold=fold, width_x=wx, width_y=wy))
         tel_blocks.append(words)
@@ -389,6 +407,7 @@ def generate(
         "pose": (t_x, t_y, theta, z_p),
         "plane_offsets": plane_offsets,
         "z_tel_offsets": z_tel_offsets,
+        "z_tel_tilts": z_tel_tilts,
         "tel_cluster_widths": tel_cluster_widths,
         "probe_cluster_width": probe_cluster_width,
     }

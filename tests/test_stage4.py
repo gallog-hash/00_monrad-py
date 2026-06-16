@@ -314,3 +314,76 @@ class TestZOffsetRecovery:
         assert abs(z_corr[2] - Z_TEL[2]) < 1e-6
         # Middle plane shifted by ≈ DZ_INJECT
         assert abs(z_corr[1] - (Z_TEL[1] + _DZ_INJECT)) < _DZ_TOL
+
+
+# ── Tilt injection + recovery ───────────────────────────────────────────
+
+# A tilt about the y-axis on the middle plane displaces its x hit by
+# tilt_y·b_x·x — the slope×lever-arm residual of DESIGN.md §7.3.  At ~1000
+# tracks the b·x regression resolves the tilt to ≈3 mrad, so a 30 mrad
+# injection sits well clear of noise; allow a loose half-injection bound.
+_TILT_INJECT = 0.03  # rad — middle-plane tilt about the y-axis
+_TILT_TOL = 0.015  # rad
+
+
+@pytest.fixture(scope="module")
+def synth_tilt(tmp_path_factory):
+    out = tmp_path_factory.mktemp("synth_stage4_tilt")
+    result = generate(
+        out_dir=out,
+        t_x=50.0,
+        t_y=-30.0,
+        theta=0.29671,
+        z_p=300.0,
+        n_tracks=_N_TRACKS,
+        seed=42,
+        start_utc=_START_UTC,
+        f0=F0,
+        z_tel_tilts={1: (0.0, _TILT_INJECT)},  # (tilt_x, tilt_y)
+    )
+    return result, out
+
+
+@pytest.fixture(scope="module")
+def correction_tilt(synth_tilt):
+    result, out = synth_tilt
+    tel_dir = out / "telescope"
+    utc0, f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+    gps_paths, pos_paths = find_file_pairs(tel_dir)
+
+    accum = AlignmentAccumulator(flush_every=_N_TRACKS + 1)
+    for _ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
+        hits = decode_position(ref, pos_paths, n_cols=3)
+        accum.add(hits)
+    return accum.flush()
+
+
+class TestTiltRecovery:
+    def test_plane1_tilt_y_detected(self, correction_tilt):
+        """Injected 30 mrad tilt about y on the middle plane is recovered."""
+        ty = correction_tilt.planes[1].tilt_y
+        assert abs(ty - _TILT_INJECT) < _TILT_TOL, (
+            f"tilt_y[1]={ty:.5f} rad, expected {_TILT_INJECT} ± {_TILT_TOL} rad"
+        )
+
+    def test_plane1_tilt_x_near_zero(self, correction_tilt):
+        """No tilt about x was injected; the orthogonal axis stays ≈ 0."""
+        tx = correction_tilt.planes[1].tilt_x
+        assert abs(tx) < _TILT_TOL, f"tilt_x[1]={tx:.5f} rad, expected ≈ 0"
+
+    def test_tilt_not_absorbed_into_delta_z(self, correction_tilt):
+        """The joint b/b·x fit keeps a pure tilt out of the Z offset."""
+        assert abs(correction_tilt.planes[1].delta_z) < _DZ_TOL, (
+            f"delta_z[1]={correction_tilt.planes[1].delta_z:.2f} mm "
+            f"should stay near zero for a pure tilt"
+        )
+
+    def test_outer_planes_tilt_zero(self, correction_tilt):
+        """Outer planes never get a tilt fitted."""
+        for k in (0, 2):
+            assert correction_tilt.planes[k].tilt_x == 0.0
+            assert correction_tilt.planes[k].tilt_y == 0.0
+
+    def test_needs_correction_flag(self, correction_tilt):
+        """A 30 mrad tilt exceeds _TILT_THRESH = 5 mrad."""
+        assert correction_tilt.needs_correction
