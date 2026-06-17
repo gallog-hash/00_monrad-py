@@ -24,7 +24,8 @@ from monrad.stage1 import (
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream
-from monrad.stage4 import AlignmentCorrection
+from monrad.stage3 import Hit, disambiguate_telescope_hits
+from monrad.stage4 import AlignmentCorrection, PlaneCorrection
 from monrad.stage5 import (
     Coincidence,
     PoseResult,
@@ -519,3 +520,105 @@ class TestPerAxisSigmaPropagation:
         # fit must be no tighter than the (over-confident) scalar fit on the
         # v-coupled parameters.
         assert np.trace(pr_hetero.cov) > np.trace(pr_scalar.cov)
+
+
+class TestDecodeClusterUnresolvedRecovery:
+    """
+    PoseFitter._decode_cluster recovers a single 'unresolved' telescope plane
+    via the two-plane projection (DESIGN.md §6.3b/§8.2), selecting the
+    candidate in the *alignment-corrected* frame.
+    """
+
+    _Z = np.array([0.0, 400.0, 800.0])
+    _SIG = STRIP_MM / math.sqrt(12)
+
+    def _make_fitter(self, monkeypatch, tel_hits, prb_hit, alignment):
+        """A PoseFitter whose decode_position returns canned hits."""
+        import monrad.stage5 as s5
+
+        def fake_decode_position(ref, paths, n_cols, tot_thresh=1, tot_weights=False):
+            return list(tel_hits) if n_cols == 3 else [prb_hit]
+
+        monkeypatch.setattr(s5, "decode_position", fake_decode_position)
+        return PoseFitter(
+            tel_z=self._Z,
+            alignment=alignment,
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=[],
+            prb_pos_paths=[],
+        )
+
+    def _scenario(self):
+        """
+        Flat track at corrected (x, y) = (100, 50).  Outer planes carry no
+        offset, the middle plane carries delta_x = +10 mm.  The unresolved
+        middle plane offers two x candidates:
+          A: raw 110 mm -> corrected 100 mm  (ON the track)
+          B: raw  96 mm -> corrected  86 mm  (off track by 14 mm)
+        Raw-frame selection (no offset) would pick B — closer to the raw
+        prediction of 100 mm — and the resulting kinked track fails the χ²
+        cut.  Corrected-frame selection picks A, giving an on-track line.
+        """
+        h = lambda x, y, q="golden", cx=None, cy=None: Hit(  # noqa: E731
+            x, y, self._SIG, self._SIG, q, cx, cy
+        )
+        tel_hits = [
+            h(100.0, 50.0),
+            h(
+                0.0,
+                0.0,
+                "unresolved",
+                cx=[(10.5, 1), (9.1, 1)],  # raw 110, 96
+                cy=[(4.5, 1)],  # raw 50
+            ),
+            h(100.0, 50.0),
+        ]
+        prb_hit = h(10.0, 20.0)
+        alignment = AlignmentCorrection(
+            planes=[
+                PlaneCorrection(0.0, 0.0, 0.0),
+                PlaneCorrection(10.0, 0.0, 0.0),  # middle plane δx = +10 mm
+                PlaneCorrection(0.0, 0.0, 0.0),
+            ],
+            needs_correction=True,
+        )
+        return tel_hits, prb_hit, alignment
+
+    def test_corrected_frame_recovers_on_track(self, monkeypatch):
+        """The recovered coincidence is accepted with an on-track line."""
+        tel_hits, prb_hit, alignment = self._scenario()
+        fitter = self._make_fitter(monkeypatch, tel_hits, prb_hit, alignment)
+        co = fitter._decode_cluster([(0, object(), object()), (1, object(), object())])
+
+        assert co is not None  # recovered AND passed the track-χ² cut
+        # Flat track in the corrected frame: slope ≈ 0, intercept ≈ (100, 50).
+        assert co.b_x == pytest.approx(0.0, abs=1e-6)
+        assert co.a_x == pytest.approx(100.0, abs=1e-6)
+        assert co.b_y == pytest.approx(0.0, abs=1e-6)
+        assert co.a_y == pytest.approx(50.0, abs=1e-6)
+        # Probe hit passes straight through to the coincidence.
+        assert co.u == pytest.approx(10.0)
+        assert co.v == pytest.approx(20.0)
+
+    def test_offsets_change_selected_candidate(self):
+        """
+        Guard the refinement at the disambiguation level: the raw frame and
+        the corrected frame pick *different* candidates for the same hit.
+
+        Prediction at the middle plane is 100 mm (flat track through the
+        outer planes).  Raw frame: nearest raw candidate is 96 mm (Δ=4 <
+        Δ=10 for 110 mm) — the wrong one.  Corrected frame (+10 mm middle
+        offset): candidate 110 mm sits at corrected 100 mm (Δ=0) and is
+        selected; 96 mm is corrected 86 mm (Δ=14).
+        """
+        tel_hits, _, _ = self._scenario()
+        raw = disambiguate_telescope_hits(tel_hits, self._Z)
+        assert raw[1].quality == "cluster"
+        assert raw[1].x_mm == pytest.approx(96.0)  # raw frame → wrong candidate
+
+        corrected = disambiguate_telescope_hits(
+            tel_hits, self._Z, offsets=[(0.0, 0.0), (10.0, 0.0), (0.0, 0.0)]
+        )
+        assert corrected[1].quality == "cluster"
+        assert corrected[1].x_mm == pytest.approx(110.0)  # corrected → right one

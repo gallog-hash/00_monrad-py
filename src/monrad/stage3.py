@@ -241,8 +241,23 @@ def decode_position(
         cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col)
 
         if qx == "unresolved" or qy == "unresolved":
-            cands_x = _axis_candidates(x_or) if qx == "unresolved" else None
-            cands_y = _axis_candidates(y_or) if qy == "unresolved" else None
+            # An axis that DID resolve is kept as a one-element candidate at
+            # its own centroid (width recovered from sigma) so that a plane
+            # which failed on only one axis can still be recovered by
+            # disambiguate_telescope_hits(): the known axis is matched
+            # trivially and only the failed axis is filled from the two-plane
+            # projection.  An axis that failed contributes its real candidate
+            # hypotheses.  (DESIGN.md §6.4 / §6.6.)
+            cands_x = (
+                _axis_candidates(x_or)
+                if qx == "unresolved"
+                else [(cx, max(1, round(sx * math.sqrt(12) / _STRIP_MM)))]
+            )
+            cands_y = (
+                _axis_candidates(y_or)
+                if qy == "unresolved"
+                else [(cy, max(1, round(sy * math.sqrt(12) / _STRIP_MM)))]
+            )
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "unresolved", cands_x, cands_y))
             continue
 
@@ -258,6 +273,7 @@ def decode_position(
 def disambiguate_telescope_hits(
     hits: list[Hit],
     z_tel: Sequence[float],
+    offsets: Sequence[tuple[float, float]] | None = None,
 ) -> list[Hit]:
     """
     Replace 'unresolved' hits with 'cluster' hits using a two-plane linear
@@ -271,11 +287,26 @@ def disambiguate_telescope_hits(
     for the quality to change.
 
     Only applied to 3-plane inputs; returns hits unchanged otherwise.
+
+    offsets : optional per-plane (delta_x, delta_y) alignment offsets in mm.
+              When given, the two-plane prediction and the candidate-distance
+              test are evaluated in the alignment-corrected frame
+              (coord - delta), so a plane's recovery is not biased by the
+              telescope's internal misalignment.  The returned hit always
+              carries the *raw* candidate position; callers apply the same
+              offset downstream.  Defaults to zero offsets (raw frame), which
+              reproduces the Stage 4 behaviour exactly.
     """
     if len(hits) != 3:
         return hits
 
     _MATCH_TOL = 1.5 * _STRIP_MM  # acceptance window in mm
+    if offsets is None:
+        dx = (0.0, 0.0, 0.0)
+        dy = (0.0, 0.0, 0.0)
+    else:
+        dx = tuple(o[0] for o in offsets)
+        dy = tuple(o[1] for o in offsets)
 
     result = list(hits)
     for k in range(3):
@@ -291,26 +322,32 @@ def disambiguate_telescope_hits(
             continue
 
         t = (z_tel[k] - z_tel[j1]) / (z_tel[j2] - z_tel[j1])
-        x_pred = ref1.x_mm + t * (ref2.x_mm - ref1.x_mm)
-        y_pred = ref1.y_mm + t * (ref2.y_mm - ref1.y_mm)
+        # Predict in the alignment-corrected frame (coord - delta).  With the
+        # default zero offsets this is identical to the raw-frame prediction.
+        rx1, rx2 = ref1.x_mm - dx[j1], ref2.x_mm - dx[j2]
+        ry1, ry2 = ref1.y_mm - dy[j1], ref2.y_mm - dy[j2]
+        x_pred = rx1 + t * (rx2 - rx1)
+        y_pred = ry1 + t * (ry2 - ry1)
 
         new_x = new_y = None
         width_x = width_y = 1
+        # Candidate positions are compared in the same corrected frame
+        # (raw channel position - delta[k]); the stored hit keeps raw position.
         if hit_k.candidates_x:
             best_ch, best_w = min(
                 hit_k.candidates_x,
-                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - x_pred),
+                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - dx[k] - x_pred),
             )
-            if abs((best_ch + 0.5) * _STRIP_MM - x_pred) <= _MATCH_TOL:
+            if abs((best_ch + 0.5) * _STRIP_MM - dx[k] - x_pred) <= _MATCH_TOL:
                 new_x = (best_ch + 0.5) * _STRIP_MM
                 width_x = best_w
 
         if hit_k.candidates_y:
             best_ch, best_w = min(
                 hit_k.candidates_y,
-                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - y_pred),
+                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - dy[k] - y_pred),
             )
-            if abs((best_ch + 0.5) * _STRIP_MM - y_pred) <= _MATCH_TOL:
+            if abs((best_ch + 0.5) * _STRIP_MM - dy[k] - y_pred) <= _MATCH_TOL:
                 new_y = (best_ch + 0.5) * _STRIP_MM
                 width_y = best_w
 

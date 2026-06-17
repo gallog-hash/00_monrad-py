@@ -419,6 +419,15 @@ For each valid axis (X or Y separately):
 A hit is delivered to the caller only if both X and Y are reconstructed. The
 quality flag is `golden`, `cluster`, `unresolved`, or `invalid`.
 
+When a hit is `unresolved` because only **one** axis failed, the axis that
+*did* reconstruct is retained as a single candidate hypothesis (its centroid
+and width); the failed axis carries its real multi-candidate list. This lets
+the two-plane recovery (§8.2) fill only the failed axis from the projected
+track while matching the known axis trivially. On real data roughly half of
+all `unresolved` telescope readings fail on a single axis, so keeping the
+good coordinate materially increases the recovered-track yield rather than
+discarding the whole plane.
+
 ### 6.5 Channel → physical coordinate
 
 ```
@@ -602,6 +611,19 @@ For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 `x(z) = a_x + b_x · z` and `y(z) = a_y + b_y · z`. Each fit yields the four
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
+
+Before the fit, a single `unresolved` plane is recovered by the two-plane
+projection of §6.3b (the same step Stage 4 applies before its alignment
+fit): if the other two planes are `golden`/`cluster`, the line they define
+predicts plane `k`, and the nearest candidate within 1.5 strips is promoted
+to `cluster`. On real data this is the single largest source of recovered
+coincidences — most events with all three planes resolved are otherwise lost
+at the telescope-quality cut. Unlike Stage 4, the alignment is already known
+here, so the prediction and the candidate-distance test are evaluated in the
+alignment-corrected frame (`coord − δ`): the sharper prediction admits fewer
+but cleaner candidates than the raw frame, which would otherwise pass wrong
+matches that the §8.2 track-χ² cut then rejects. A coincidence is fit only if
+all three planes resolve after this step.
 
 When a middle-plane tilt has been fitted, the X and Y fits use *different*
 plane `z` values: a tilted plane reports its hit at an effective

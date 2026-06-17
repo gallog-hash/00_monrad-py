@@ -78,7 +78,7 @@ from monrad.stage1 import (
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position
+from monrad.stage3 import decode_position, disambiguate_telescope_hits
 from monrad.stage4 import AlignmentAccumulator
 from monrad.stage5 import PoseFitter
 
@@ -332,6 +332,17 @@ def main() -> None:
                 tot_weights=tot_weights,
             )
             if det_id == 0:
+                # Reflect the two-plane recovery the pose fit applies, so the
+                # quality table is not artificially dominated by 'unresolved'
+                # (corrected-frame offsets, matching PoseFitter._decode_cluster).
+                hits = disambiguate_telescope_hits(
+                    hits,
+                    z_tel,
+                    offsets=[
+                        (alignment.planes[k].delta_x, alignment.planes[k].delta_y)
+                        for k in range(3)
+                    ],
+                )
                 for plane_idx, h in enumerate(hits):
                     tel_hit_q[plane_idx][h.quality if h is not None else "missing"] += 1
             else:
@@ -350,6 +361,11 @@ def main() -> None:
 
     # ── Print stage 3 ────────────────────────────────────────────────────
     _emit(lines, "=== Stage 3: Hit quality (coincidence survivors) ===")
+    _emit(
+        lines,
+        "  (telescope quality is after two-plane recovery, as used by the pose "
+        "fit; probe is raw)",
+    )
     _emit(
         lines, f"  {n_coinc} coincidences x 3 telescope planes = {n_coinc * 3} readings"
     )
