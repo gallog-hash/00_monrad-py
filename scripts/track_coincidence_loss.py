@@ -58,7 +58,14 @@ class CountingPoseFitter(PoseFitter):
             tot_weights=self.tot_weights,
         )
         fail_before = any(h.quality not in ("golden", "cluster") for h in tel_hits)
-        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z)
+        align = self.alignment
+        tel_hits = disambiguate_telescope_hits(
+            tel_hits,
+            self.tel_z,
+            offsets=[
+                (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
+            ],
+        )
         fail_after = any(h.quality not in ("golden", "cluster") for h in tel_hits)
         if fail_before and not fail_after:
             self.reasons["recovered_by_disambiguation"] += 1

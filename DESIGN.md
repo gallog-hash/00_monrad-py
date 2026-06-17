@@ -609,8 +609,12 @@ fit): if the other two planes are `golden`/`cluster`, the line they define
 predicts plane `k`, and the nearest candidate within 1.5 strips is promoted
 to `cluster`. On real data this is the single largest source of recovered
 coincidences — most events with all three planes resolved are otherwise lost
-at the telescope-quality cut. A coincidence is fit only if all three planes
-resolve after this step.
+at the telescope-quality cut. Unlike Stage 4, the alignment is already known
+here, so the prediction and the candidate-distance test are evaluated in the
+alignment-corrected frame (`coord − δ`): the sharper prediction admits fewer
+but cleaner candidates than the raw frame, which would otherwise pass wrong
+matches that the §8.2 track-χ² cut then rejects. A coincidence is fit only if
+all three planes resolve after this step.
 
 When a middle-plane tilt has been fitted, the X and Y fits use *different*
 plane `z` values: a tilted plane reports its hit at an effective

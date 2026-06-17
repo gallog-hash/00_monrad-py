@@ -476,8 +476,17 @@ class PoseFitter:
         # Stage 4 already does this before the alignment fit; applying it here
         # lets the pose fit keep coincidences where exactly one plane is
         # ambiguous but its candidate lands on the track predicted by the
-        # other two — the dominant loss at this gate on real data.
-        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z)
+        # other two — the dominant loss at this gate on real data.  Unlike
+        # Stage 4 the alignment is known here, so predict and select in the
+        # alignment-corrected frame (the same delta_x/delta_y applied below).
+        align = self.alignment
+        tel_hits = disambiguate_telescope_hits(
+            tel_hits,
+            self.tel_z,
+            offsets=[
+                (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
+            ],
+        )
         if any(h.quality not in ("golden", "cluster") for h in tel_hits):
             return None
 
