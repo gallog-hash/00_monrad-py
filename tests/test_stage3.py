@@ -383,6 +383,31 @@ class TestDisambiguateHits:
         result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
         assert result[1].quality == "unresolved"
 
+    def test_single_axis_unresolved_recovered(self):
+        """
+        Single-axis failure: x failed (two candidates), y was resolved and is
+        carried as a one-element candidate.  The failed x is filled from the
+        projection and the known y matches trivially → the plane is recovered.
+
+        Track: x0=100, x2=500 → x_pred at z=400 is 300 mm.
+               y0=100, y2=500 → y_pred at z=400 is 300 mm.
+        cx: ch=29.0 → 295 mm (Δ=5 < 15) ✓ ; ch=0.0 → 5 mm (Δ=295) ✗
+        cy: ch=29.5 → 300 mm (the resolved axis, Δ=0)            ✓
+        """
+        h0 = _h(100.0, 100.0)
+        h1 = _h(
+            0.0,
+            0.0,
+            "unresolved",
+            cx=[(0.0, 1), (29.0, 1)],  # failed axis: real hypotheses
+            cy=[(29.5, 1)],  # resolved axis: single kept candidate
+        )
+        h2 = _h(500.0, 500.0)
+        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
+        assert result[1].quality == "cluster"
+        assert abs(result[1].x_mm - 295.0) < 1e-6
+        assert abs(result[1].y_mm - 300.0) < 1e-6
+
 
 class TestCandidatesPopulated:
     """Unresolved hits from decode_position() carry non-empty candidate lists."""
@@ -411,3 +436,35 @@ class TestCandidatesPopulated:
         h = hits[0]
         assert h.quality == "unresolved"
         assert h.candidates_x is not None and len(h.candidates_x) > 0
+
+    def test_single_axis_resolved_kept_as_candidate(self, tmp_path):
+        """
+        When only one axis fails, the axis that resolved is retained as a
+        single candidate (its centroid + width) so the plane can still be
+        recovered by the two-plane projection.
+
+        Same word as above: x is unresolved (fiber bits 0,5 on ribbon bit 2),
+        y is golden (ribbon bit 1, fiber bit 1 → channel 10*1+1 = 11).
+        """
+        import struct
+        from monrad.stage1 import PosRef
+
+        x_rib = 1 << 2
+        x_fib = (1 << 0) | (1 << 5)
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / "single_axis.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        h = decode_position(ref, [bin_path], n_cols=1)[0]
+        assert h.quality == "unresolved"
+        # Failed axis: real multi-candidate hypotheses.
+        assert h.candidates_x is not None and len(h.candidates_x) > 0
+        # Resolved axis: kept as one golden candidate at channel 11, width 1.
+        assert h.candidates_y == [(11.0, 1)]

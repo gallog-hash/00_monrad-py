@@ -419,6 +419,15 @@ For each valid axis (X or Y separately):
 A hit is delivered to the caller only if both X and Y are reconstructed. The
 quality flag is `golden`, `cluster`, `unresolved`, or `invalid`.
 
+When a hit is `unresolved` because only **one** axis failed, the axis that
+*did* reconstruct is retained as a single candidate hypothesis (its centroid
+and width); the failed axis carries its real multi-candidate list. This lets
+the two-plane recovery (§8.2) fill only the failed axis from the projected
+track while matching the known axis trivially. On real data roughly half of
+all `unresolved` telescope readings fail on a single axis, so keeping the
+good coordinate materially increases the recovered-track yield rather than
+discarding the whole plane.
+
 ### 6.5 Channel → physical coordinate
 
 ```

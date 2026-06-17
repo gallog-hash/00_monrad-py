@@ -241,8 +241,23 @@ def decode_position(
         cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col)
 
         if qx == "unresolved" or qy == "unresolved":
-            cands_x = _axis_candidates(x_or) if qx == "unresolved" else None
-            cands_y = _axis_candidates(y_or) if qy == "unresolved" else None
+            # An axis that DID resolve is kept as a one-element candidate at
+            # its own centroid (width recovered from sigma) so that a plane
+            # which failed on only one axis can still be recovered by
+            # disambiguate_telescope_hits(): the known axis is matched
+            # trivially and only the failed axis is filled from the two-plane
+            # projection.  An axis that failed contributes its real candidate
+            # hypotheses.  (DESIGN.md §6.4 / §6.6.)
+            cands_x = (
+                _axis_candidates(x_or)
+                if qx == "unresolved"
+                else [(cx, max(1, round(sx * math.sqrt(12) / _STRIP_MM)))]
+            )
+            cands_y = (
+                _axis_candidates(y_or)
+                if qy == "unresolved"
+                else [(cy, max(1, round(sy * math.sqrt(12) / _STRIP_MM)))]
+            )
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "unresolved", cands_x, cands_y))
             continue
 
