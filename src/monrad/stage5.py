@@ -24,7 +24,7 @@ from typing import NamedTuple
 import numpy as np
 from scipy.optimize import least_squares
 
-from .stage3 import decode_position
+from .stage3 import decode_position, disambiguate_telescope_hits
 from .stage4 import AlignmentCorrection
 
 _MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §7.4
@@ -471,6 +471,13 @@ class PoseFitter:
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
         )
+        # Recover an 'unresolved' plane from the other two via the two-plane
+        # line projection (stage3.disambiguate_telescope_hits, DESIGN.md §6.3b).
+        # Stage 4 already does this before the alignment fit; applying it here
+        # lets the pose fit keep coincidences where exactly one plane is
+        # ambiguous but its candidate lands on the track predicted by the
+        # other two — the dominant loss at this gate on real data.
+        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z)
         if any(h.quality not in ("golden", "cluster") for h in tel_hits):
             return None
 

@@ -23,7 +23,10 @@ from monrad.stage1 import (  # noqa: E402
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream  # noqa: E402
-from monrad.stage3 import decode_position  # noqa: E402
+from monrad.stage3 import (  # noqa: E402
+    decode_position,
+    disambiguate_telescope_hits,
+)
 from monrad.stage4 import AlignmentAccumulator  # noqa: E402
 from monrad.stage5 import _CHI2_TRACK, PoseFitter, _tel_line_fit  # noqa: E402
 
@@ -54,7 +57,12 @@ class CountingPoseFitter(PoseFitter):
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
         )
-        if any(h.quality not in ("golden", "cluster") for h in tel_hits):
+        fail_before = any(h.quality not in ("golden", "cluster") for h in tel_hits)
+        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z)
+        fail_after = any(h.quality not in ("golden", "cluster") for h in tel_hits)
+        if fail_before and not fail_after:
+            self.reasons["recovered_by_disambiguation"] += 1
+        if fail_after:
             self.reasons["gate2_tel_hit_quality"] += 1
             return None
 
@@ -150,6 +158,10 @@ def main() -> None:
     print(f"  Clean coincidences fed to fit         : {clean:>8}")
     print(f"  - gate5: RANSAC Mahalanobis outliers      : {ransac:>8}")
     print(f"  Stage 5 inliers (final)               : {n_inliers:>8}")
+    print(
+        f"\n  (of which recovered by two-plane disambiguation at gate2: "
+        f"{r['recovered_by_disambiguation']})"
+    )
     if n_coinc:
         print(
             f"\n  Overall survival: {n_inliers}/{n_coinc} = "

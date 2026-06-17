@@ -603,6 +603,15 @@ For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
 
+Before the fit, a single `unresolved` plane is recovered by the two-plane
+projection of §6.3b (the same step Stage 4 applies before its alignment
+fit): if the other two planes are `golden`/`cluster`, the line they define
+predicts plane `k`, and the nearest candidate within 1.5 strips is promoted
+to `cluster`. On real data this is the single largest source of recovered
+coincidences — most events with all three planes resolved are otherwise lost
+at the telescope-quality cut. A coincidence is fit only if all three planes
+resolve after this step.
+
 When a middle-plane tilt has been fitted, the X and Y fits use *different*
 plane `z` values: a tilted plane reports its hit at an effective
 `z = z_k + φ·coord` (a tilt about y shifts the x measurement, a tilt about x
