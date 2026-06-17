@@ -24,7 +24,12 @@ from typing import NamedTuple
 import numpy as np
 from scipy.optimize import least_squares
 
-from .stage3 import decode_position, disambiguate_telescope_hits
+from .stage3 import (
+    GOOD_QUALITIES,
+    decode_position,
+    disambiguate_telescope_hits,
+    recover_efficiency_hits,
+)
 from .stage4 import AlignmentCorrection
 
 _MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §7.4
@@ -480,14 +485,14 @@ class PoseFitter:
         # Stage 4 the alignment is known here, so predict and select in the
         # alignment-corrected frame (the same delta_x/delta_y applied below).
         align = self.alignment
-        tel_hits = disambiguate_telescope_hits(
-            tel_hits,
-            self.tel_z,
-            offsets=[
-                (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
-            ],
-        )
-        if any(h.quality not in ("golden", "cluster") for h in tel_hits):
+        offsets = [(align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)]
+        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z, offsets=offsets)
+        # Recover single-channel efficiency dropouts ("option (0)"): when the
+        # other two planes resolve, project the track onto the third and
+        # synthesize the missing fiber/ribbon half off the prediction.  Runs
+        # after disambiguation so two-plane recoveries can serve as references.
+        tel_hits = recover_efficiency_hits(tel_hits, self.tel_z, offsets=offsets)
+        if any(h.quality not in GOOD_QUALITIES for h in tel_hits):
             return None
 
         # Apply alignment correction — DESIGN.md §7.2 preamble
@@ -522,7 +527,7 @@ class PoseFitter:
             tot_weights=self.tot_weights,
         )
         prb_hit = prb_hits[0]
-        if prb_hit.quality not in ("golden", "cluster"):
+        if prb_hit.quality not in GOOD_QUALITIES:
             return None
 
         return Coincidence(

@@ -16,7 +16,12 @@ from monrad.stage1 import (
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage3 import decode_position, disambiguate_telescope_hits, Hit
+from monrad.stage3 import (
+    decode_position,
+    disambiguate_telescope_hits,
+    recover_efficiency_hits,
+    Hit,
+)
 from monrad.synth import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
@@ -407,6 +412,50 @@ class TestDisambiguateHits:
         assert result[1].quality == "cluster"
         assert abs(result[1].x_mm - 295.0) < 1e-6
         assert abs(result[1].y_mm - 300.0) < 1e-6
+
+
+class TestRecoverEfficiencyHits:
+    """Verify recover_efficiency_hits() synthesizes single-channel dropouts."""
+
+    def _unresolved(self, x_or, y_or, cy):
+        # Plane with raw masks attached, as decode_position() emits.
+        return Hit(0.0, 0.0, 0.0, 0.0, "unresolved", None, cy, x_or, y_or)
+
+    def test_ribbon_only_axis_recovered(self):
+        """
+        Plane 1 X axis fired a ribbon bit but no fiber bit (efficiency dropout).
+        Planes 0 and 2 are golden; track x0=100, x2=490 → x_pred at z=400 = 295
+        mm (channel 29).  The fired ribbon (decade 20–29) plus the projection
+        synthesize channel 29 → recovered as 'efficiency' at 295 mm.  The Y axis
+        is golden (channel 5 → 55 mm) and carries through unchanged.
+        """
+        h0 = _h(100.0, 100.0)
+        h2 = _h(490.0, 100.0)
+        x_or = 1 << 2  # ribbon bit 2 (decade 20-29), no fiber bit
+        y_or = (1 << 0) | (1 << (10 + 5))  # ribbon ch0 + fiber bit5 → channel 5
+        h1 = self._unresolved(x_or, y_or, cy=[(5.0, 1)])
+
+        result = recover_efficiency_hits([h0, h1, h2], _Z3)
+        assert result[0] == h0
+        assert result[2] == h2
+        assert result[1].quality == "efficiency"
+        assert abs(result[1].x_mm - 295.0) < 1e-6  # channel 29
+        assert abs(result[1].y_mm - 55.0) < 1e-6  # channel 5
+
+    def test_out_of_decade_ribbon_not_recovered(self):
+        """
+        Same geometry, but the only fired ribbon is in decade 0–9, far from the
+        predicted channel 29.  The synthesized candidate (channel 9 → 95 mm) is
+        > 1.5 strips from the 295 mm prediction → the plane stays 'unresolved'.
+        """
+        h0 = _h(100.0, 100.0)
+        h2 = _h(490.0, 100.0)
+        x_or = 1 << 0  # ribbon bit 0 (decade 0-9), no fiber bit
+        y_or = (1 << 0) | (1 << (10 + 5))
+        h1 = self._unresolved(x_or, y_or, cy=[(5.0, 1)])
+
+        result = recover_efficiency_hits([h0, h1, h2], _Z3)
+        assert result[1].quality == "unresolved"
 
 
 class TestCandidatesPopulated:

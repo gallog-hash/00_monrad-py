@@ -24,8 +24,10 @@ from monrad.stage1 import (  # noqa: E402
 )
 from monrad.stage2 import coincidence_stream  # noqa: E402
 from monrad.stage3 import (  # noqa: E402
+    GOOD_QUALITIES,
     decode_position,
     disambiguate_telescope_hits,
+    recover_efficiency_hits,
 )
 from monrad.stage4 import AlignmentAccumulator  # noqa: E402
 from monrad.stage5 import _CHI2_TRACK, PoseFitter, _tel_line_fit  # noqa: E402
@@ -57,19 +59,21 @@ class CountingPoseFitter(PoseFitter):
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
         )
-        fail_before = any(h.quality not in ("golden", "cluster") for h in tel_hits)
+        fail_before = any(h.quality not in GOOD_QUALITIES for h in tel_hits)
         align = self.alignment
-        tel_hits = disambiguate_telescope_hits(
-            tel_hits,
-            self.tel_z,
-            offsets=[
-                (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
-            ],
-        )
-        fail_after = any(h.quality not in ("golden", "cluster") for h in tel_hits)
-        if fail_before and not fail_after:
+        offsets = [(align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)]
+        tel_hits = disambiguate_telescope_hits(tel_hits, self.tel_z, offsets=offsets)
+        fail_after_disambig = any(h.quality not in GOOD_QUALITIES for h in tel_hits)
+        if fail_before and not fail_after_disambig:
             self.reasons["recovered_by_disambiguation"] += 1
-        if fail_after:
+
+        # Option (0): synthesize a missing fiber/ribbon half from the track
+        # projection.  Marginal contribution beyond two-plane disambiguation.
+        tel_hits = recover_efficiency_hits(tel_hits, self.tel_z, offsets=offsets)
+        fail_after_eff = any(h.quality not in GOOD_QUALITIES for h in tel_hits)
+        if fail_after_disambig and not fail_after_eff:
+            self.reasons["recovered_by_efficiency"] += 1
+        if fail_after_eff:
             self.reasons["gate2_tel_hit_quality"] += 1
             return None
 
@@ -168,6 +172,10 @@ def main() -> None:
     print(
         f"\n  (of which recovered by two-plane disambiguation at gate2: "
         f"{r['recovered_by_disambiguation']})"
+    )
+    print(
+        f"  (of which recovered by efficiency fill at gate2 [option 0]: "
+        f"{r['recovered_by_efficiency']})"
     )
     if n_coinc:
         print(
