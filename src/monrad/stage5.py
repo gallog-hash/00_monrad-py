@@ -66,8 +66,13 @@ class DecodeReport(NamedTuple):
 
     reason is one of: "ambiguous_cluster", "zero_candidate_plane",
     "no_anchor_plane", "chi2_track_cut", "probe_quality", "accepted".
-    cand_counts/chi2/prb_quality are None when the cluster was rejected
-    before that quantity was computed.
+    cand_counts/chi2/prb_quality/winning_quality/winning_tot are None when
+    the cluster was rejected before that quantity was computed.
+
+    winning_quality/winning_tot describe the per-plane PlaneCandidate the
+    χ² search actually picked (stage3.PlaneCandidate.quality/tot_x/tot_y) —
+    available whenever a best triple was found, i.e. from "chi2_track_cut"
+    onward, even if that triple was then rejected by a later gate.
     """
 
     accepted: bool
@@ -75,6 +80,8 @@ class DecodeReport(NamedTuple):
     cand_counts: tuple[int, int, int] | None
     chi2: float | None
     prb_quality: str | None
+    winning_quality: tuple[str, str, str] | None
+    winning_tot: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None
 
 
 # ── Result bundle ─────────────────────────────────────────────────────────
@@ -519,6 +526,9 @@ class PoseFitter:
             cand_counts: tuple[int, int, int] | None = None,
             chi2: float | None = None,
             prb_quality: str | None = None,
+            winning_quality: tuple[str, str, str] | None = None,
+            winning_tot: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            | None = None,
         ) -> None:
             if self.on_decode is not None:
                 self.on_decode(
@@ -528,6 +538,8 @@ class PoseFitter:
                         cand_counts=cand_counts,
                         chi2=chi2,
                         prb_quality=prb_quality,
+                        winning_quality=winning_quality,
+                        winning_tot=winning_tot,
                     )
                 )
 
@@ -588,6 +600,7 @@ class PoseFitter:
 
         best_chi2 = math.inf
         best_fit = None
+        best_triple = None
         for c0, c1, c2 in itertools.product(*cands):
             x_raw = np.array([c0.x_mm, c1.x_mm, c2.x_mm])
             y_raw = np.array([c0.y_mm, c1.y_mm, c2.y_mm])
@@ -599,12 +612,30 @@ class PoseFitter:
             if fit[-1] < best_chi2:
                 best_chi2 = fit[-1]
                 best_fit = fit
+                best_triple = (c0, c1, c2)
+
+        if best_triple is not None:
+            winning_quality = (
+                best_triple[0].quality,
+                best_triple[1].quality,
+                best_triple[2].quality,
+            )
+            winning_tot = (
+                (best_triple[0].tot_x, best_triple[0].tot_y),
+                (best_triple[1].tot_x, best_triple[1].tot_y),
+                (best_triple[2].tot_x, best_triple[2].tot_y),
+            )
+        else:
+            winning_quality = None
+            winning_tot = None
 
         if best_fit is None or best_chi2 >= _CHI2_TRACK:
             _report(
                 "chi2_track_cut",
                 cand_counts=cand_counts,
                 chi2=(best_chi2 if best_fit is not None else None),
+                winning_quality=winning_quality,
+                winning_tot=winning_tot,
             )
             return None
         a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
@@ -624,6 +655,8 @@ class PoseFitter:
                 cand_counts=cand_counts,
                 chi2=best_chi2,
                 prb_quality=prb_hit.quality,
+                winning_quality=winning_quality,
+                winning_tot=winning_tot,
             )
             return None
 
@@ -632,6 +665,8 @@ class PoseFitter:
             cand_counts=cand_counts,
             chi2=best_chi2,
             prb_quality=prb_hit.quality,
+            winning_quality=winning_quality,
+            winning_tot=winning_tot,
         )
         return Coincidence(
             a_x=a_x,

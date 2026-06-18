@@ -570,6 +570,12 @@ class TestPlaneCandidates:
             assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
             assert c.sigma_x == pytest.approx(_SIGMA_GOLD)
             assert c.sigma_y == pytest.approx(_SIGMA_GOLD)
+            # Every bit fires in all 16 rows (the word is repeated unchanged),
+            # so every candidate's TOT score is 16*16 regardless of which
+            # mirror-pair channel it picks, and width-1 axes are "golden".
+            assert c.quality == "golden"
+            assert c.tot_x == 16 * 16
+            assert c.tot_y == 16 * 16
 
     def test_cap_limits_candidate_count(self, tmp_path):
         """
@@ -627,3 +633,58 @@ class TestPlaneCandidates:
         c = planes[0][0]
         assert c.x_mm == pytest.approx((23 + 0.5) * STRIP_MM)
         assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+        assert c.quality == "golden"
+        assert c.tot_x == 16 * 16
+        assert c.tot_y == 16 * 16
+
+    def test_tot_reflects_per_bit_row_counts_and_cluster_quality(self, tmp_path):
+        """
+        X is a 2-wide cluster (fiber bits 3 and 4, ribbon bit 2 fixed) where
+        fiber bit 3 fires in all 16 rows but fiber bit 4 only fires in 4 —
+        mirrors test_tot_weighted_centroid_shifts_cluster's row pattern.
+        The single resulting X candidate must report tot_x as the *sum* of
+        each contributing (ribbon, fiber) pair's TOT product, and its width
+        (2 on X) must downgrade quality from "golden" to "cluster" even
+        though Y stays golden.
+        """
+        import struct
+
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        gen = 0
+
+        word_full = (
+            y_rib
+            | (y_fib << 10)
+            | (x_rib << 32)
+            | ((x_fib_3 | x_fib_4) << 42)
+            | (gen << 52)
+        )
+        word_f3_only = (
+            y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42) | (gen << 52)
+        )
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+
+        bin_path = tmp_path / "tot_cluster.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(planes[0]) == 1
+        c = planes[0][0]
+
+        # ribbon bit 2: TOT=16 throughout.  fiber bit 3: TOT=16.  fiber bit 4: TOT=4.
+        # tot_x = ribbon[2]*fiber[3] + ribbon[2]*fiber[4] = 16*16 + 16*4 = 320.
+        assert c.tot_x == 16 * 16 + 16 * 4
+        assert c.tot_y == 16 * 16
+        assert c.quality == "cluster"

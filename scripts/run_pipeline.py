@@ -57,6 +57,14 @@ Expected console output (example values):
       Probe hit quality (coincidences that reached probe decode):
         golden 410   cluster 91
       Winning-triple χ² (accepted + probe_quality-rejected): mean=0.421  std=0.612  n=500
+      Winning-triple per-plane quality (candidate the χ² search picked):
+        Plane 0    golden 460   cluster 40
+        Plane 1    golden 455   cluster 45
+        Plane 2    golden 462   cluster 38
+      Winning-triple per-plane TOT score (tot_x + tot_y, ribbon×fiber):
+        Plane 0    mean=412.3  std=58.1  n=500
+        Plane 1    mean=405.7  std=61.4  n=500
+        Plane 2    mean=409.0  std=59.9  n=500
 
     === Stage 5: Probe pose fit ===
       t_x   =  +51.3 ±  1.2 mm
@@ -331,6 +339,10 @@ def main() -> None:
     gate_counts: Counter = Counter()
     cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
     prb_q_at_decode: Counter = Counter()
+    win_quality: list[Counter] = [Counter(), Counter(), Counter()]
+    tot_n = [0, 0, 0]
+    tot_sum = [0.0, 0.0, 0.0]
+    tot_sumsq = [0.0, 0.0, 0.0]
     chi2_n = 0
     chi2_sum = 0.0
     chi2_sumsq = 0.0
@@ -343,6 +355,15 @@ def main() -> None:
                 cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
         if r.prb_quality is not None:
             prb_q_at_decode[r.prb_quality] += 1
+        if r.winning_quality is not None:
+            for k in range(3):
+                win_quality[k][r.winning_quality[k]] += 1
+        if r.winning_tot is not None:
+            for k in range(3):
+                tot = r.winning_tot[k][0] + r.winning_tot[k][1]
+                tot_n[k] += 1
+                tot_sum[k] += tot
+                tot_sumsq[k] += tot * tot
         if r.chi2 is not None:
             chi2_n += 1
             chi2_sum += r.chi2
@@ -412,6 +433,20 @@ def main() -> None:
             f"  Winning-triple χ² (accepted + probe_quality-rejected): "
             f"mean={mean:.3f}  std={math.sqrt(var):.3f}  n={chi2_n}",
         )
+    _emit(lines, "  Winning-triple per-plane quality (candidate the χ² search picked):")
+    for k in range(3):
+        parts = "   ".join(f"{q} {win_quality[k][q]}" for q in ("golden", "cluster"))
+        _emit(lines, f"    Plane {k}    {parts}")
+    _emit(lines, "  Winning-triple per-plane TOT score (tot_x + tot_y, ribbon×fiber):")
+    for k in range(3):
+        if tot_n[k]:
+            mean_t = tot_sum[k] / tot_n[k]
+            var_t = max(tot_sumsq[k] / tot_n[k] - mean_t * mean_t, 0.0)
+            _emit(
+                lines,
+                f"    Plane {k}    mean={mean_t:.1f}  std={math.sqrt(var_t):.1f}  "
+                f"n={tot_n[k]}",
+            )
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────

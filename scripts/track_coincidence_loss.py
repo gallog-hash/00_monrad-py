@@ -62,12 +62,28 @@ def main() -> None:
 
     reasons: Counter = Counter()
     cand_ambiguous_planes: Counter = Counter()  # per cluster: 0/1/2/3 planes len>1
+    win_quality: list[Counter] = [Counter(), Counter(), Counter()]
+    tot_n = [0, 0, 0]
+    tot_sum = [0.0, 0.0, 0.0]
+    chi2_n = 0
+    chi2_sum = 0.0
 
     def _on_decode(r: DecodeReport) -> None:
+        nonlocal chi2_n, chi2_sum
         reasons[r.reason] += 1
         if r.cand_counts is not None:
             n_ambiguous = sum(1 for n in r.cand_counts if n > 1)
             cand_ambiguous_planes[n_ambiguous] += 1
+        if r.winning_quality is not None:
+            for k in range(3):
+                win_quality[k][r.winning_quality[k]] += 1
+        if r.winning_tot is not None:
+            for k in range(3):
+                tot_n[k] += 1
+                tot_sum[k] += r.winning_tot[k][0] + r.winning_tot[k][1]
+        if r.chi2 is not None:
+            chi2_n += 1
+            chi2_sum += r.chi2
 
     fitter = PoseFitter(
         tel_z=Z_TEL,
@@ -107,6 +123,16 @@ def main() -> None:
     print("\n  Telescope ambiguous-plane count per cluster (candidates>1):")
     for n_amb in sorted(cand_ambiguous_planes):
         print(f"    {n_amb} plane(s) ambiguous: {cand_ambiguous_planes[n_amb]:>8}")
+    if chi2_n:
+        print(f"\n  Winning-triple chi2: mean={chi2_sum / chi2_n:.3f}  n={chi2_n}")
+    print("  Winning-triple per-plane quality (candidate the chi2 search picked):")
+    for k in range(3):
+        parts = "   ".join(f"{q} {win_quality[k][q]}" for q in ("golden", "cluster"))
+        print(f"    Plane {k}: {parts}")
+    print("  Winning-triple per-plane TOT score (tot_x + tot_y, ribbon x fiber):")
+    for k in range(3):
+        if tot_n[k]:
+            print(f"    Plane {k}: mean={tot_sum[k] / tot_n[k]:.1f}  n={tot_n[k]}")
     if n_coinc:
         print(
             f"\n  Overall survival: {n_inliers}/{n_coinc} = "

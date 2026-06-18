@@ -89,6 +89,27 @@ def _read_block(
     return head + tail
 
 
+def _bit_counts(words: list[int], col: int, n_cols: int) -> tuple[list[int], list[int]]:
+    """
+    Per-bit row counts (0..16) for one column's X/Y 20-bit fields across the
+    16-row block.  bits 0-9 = ribbon, bits 10-19 = fiber.  Shared by
+    _or_masks's tot_thresh>1 path, decode_position's tot_weights path, and
+    reconstruct_plane_candidates's TOT scoring.
+    """
+    x_counts = [0] * 20
+    y_counts = [0] * 20
+    for row in range(16):
+        w = words[row * n_cols + col]
+        y_bits = w & 0xFFFFF
+        x_bits = (w >> 32) & 0xFFFFF
+        for bit in range(20):
+            if (x_bits >> bit) & 1:
+                x_counts[bit] += 1
+            if (y_bits >> bit) & 1:
+                y_counts[bit] += 1
+    return x_counts, y_counts
+
+
 def _or_masks(
     words: list[int],
     col: int,
@@ -112,17 +133,7 @@ def _or_masks(
             x_or |= (w >> 32) & 0xFFFFF
         return x_or, y_or
 
-    x_counts = [0] * 20
-    y_counts = [0] * 20
-    for row in range(16):
-        w = words[row * n_cols + col]
-        y_bits = w & 0xFFFFF
-        x_bits = (w >> 32) & 0xFFFFF
-        for bit in range(20):
-            if (x_bits >> bit) & 1:
-                x_counts[bit] += 1
-            if (y_bits >> bit) & 1:
-                y_counts[bit] += 1
+    x_counts, y_counts = _bit_counts(words, col, n_cols)
     x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
     y_or = sum((1 << bit) for bit in range(20) if y_counts[bit] >= tot_thresh)
     return x_or, y_or
@@ -163,6 +174,35 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
         for fc in fcs:
             chs = [_N * r + f for r in rc for f in fc]
             candidates.append((sum(chs) / len(chs), len(chs)))
+    return candidates
+
+
+def _axis_candidates_with_tot(
+    field_or: int, counts: list[int]
+) -> list[tuple[float, int, int]]:
+    """
+    Like _axis_candidates, but also returns each candidate's TOT score:
+    sum of ribbon_count * fiber_count (the _tot_weighted_centroid weighting
+    convention) over its contributing (ribbon, fiber) pairs — a measure of
+    how solidly each fired bit was seen across the 16-row block.
+
+    counts is the 20-element per-bit row count for this field (ribbon 0-9,
+    fiber 10-19), as returned by _bit_counts.
+    """
+    fiber_half = (field_or >> _N) & 0x3FF
+    ribbon_half = field_or & 0x3FF
+    ribbon_counts = counts[:_N]
+    fiber_counts = counts[_N:]
+
+    fcs = BinDecoder._find_clusters(fiber_half)
+    rcs = BinDecoder._find_clusters(ribbon_half)
+
+    candidates: list[tuple[float, int, int]] = []
+    for rc in rcs:
+        for fc in fcs:
+            chs = [_N * r + f for r in rc for f in fc]
+            tot = sum(ribbon_counts[r] * fiber_counts[f] for r in rc for f in fc)
+            candidates.append((sum(chs) / len(chs), len(chs), tot))
     return candidates
 
 
@@ -254,17 +294,7 @@ def decode_position(
         else:
             # Count-path: accumulate per-bit TOT counts across 16 rows, needed
             # for weighted centroids (_tot_weighted_centroid below).
-            x_counts_col = [0] * 20
-            y_counts_col = [0] * 20
-            for row in range(16):
-                w = words[row * n_cols + col]
-                y_bits = w & 0xFFFFF
-                x_bits = (w >> 32) & 0xFFFFF
-                for bit in range(20):
-                    if (x_bits >> bit) & 1:
-                        x_counts_col[bit] += 1
-                    if (y_bits >> bit) & 1:
-                        y_counts_col[bit] += 1
+            x_counts_col, y_counts_col = _bit_counts(words, col, n_cols)
             # Apply threshold: keep bit only if count >= tot_thresh.
             x_or = sum(
                 (1 << bit) for bit in range(20) if x_counts_col[bit] >= tot_thresh
@@ -331,6 +361,9 @@ class PlaneCandidate(NamedTuple):
     y_mm: float
     sigma_x: float
     sigma_y: float
+    quality: Literal["golden", "cluster"]
+    tot_x: int  # ribbon_count * fiber_count summed over the X axis's bits
+    tot_y: int  # same, for the Y axis
 
 
 def reconstruct_plane_candidates(
@@ -345,33 +378,47 @@ def reconstruct_plane_candidates(
     instead of collapsing each plane to a single resolved Hit.
 
     Each plane's candidate list is the Cartesian product of its X-axis and
-    Y-axis candidates (`_axis_candidates`): one candidate for a golden/
-    cluster axis, the full ribbon×fiber mirror-fold cross-product for an
-    ambiguous one.  An invalid plane (saturated half, or zero ribbon
+    Y-axis candidates (`_axis_candidates_with_tot`): one candidate for a
+    golden/cluster axis, the full ribbon×fiber mirror-fold cross-product for
+    an ambiguous one.  An invalid plane (saturated half, or zero ribbon
     channel) yields an empty list.  The product is capped at
     `max_per_plane`, keeping the most compact candidates first (smallest
     width_x + width_y, ties broken by channel) — used by the Stage 5
     combinatorial track finder in place of a single resolved Hit per plane.
 
+    Each candidate carries `quality` ("golden" if both axes are width 1,
+    else "cluster") and `tot_x`/`tot_y` (per-axis TOT score, see
+    _axis_candidates_with_tot) so callers can report the signal strength
+    and resolved-vs-cluster status of whichever candidate the Stage 5
+    combinatorial search ultimately picks.
+
     tot_thresh mirrors decode_position's OR-mask threshold so the masks fed
-    to candidate enumeration match the resolved decode path exactly.
-    TOT-weighting (tot_weights) is deferred — not supported here.
+    to candidate enumeration match the resolved decode path exactly. Per-bit
+    counts are always computed (regardless of tot_thresh) to produce the TOT
+    scores above; this is the same count-path decode_position's tot_weights
+    uses, just unconditional here.
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
 
     planes: list[list[PlaneCandidate]] = []
     for col in range(n_cols):
-        x_or, y_or = _or_masks(words, col, n_cols, tot_thresh)
+        x_counts, y_counts = _bit_counts(words, col, n_cols)
+        x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
+        y_or = sum((1 << bit) for bit in range(20) if y_counts[bit] >= tot_thresh)
 
         valid, _ = BinDecoder._is_valid(x_or, y_or)
         if not valid:
             planes.append([])
             continue
 
-        cands_x = _axis_candidates(x_or)
-        cands_y = _axis_candidates(y_or)
+        cands_x = _axis_candidates_with_tot(x_or, x_counts)
+        cands_y = _axis_candidates_with_tot(y_or, y_counts)
 
-        points = [(wx + wy, cx, cy, wx, wy) for cx, wx in cands_x for cy, wy in cands_y]
+        points = [
+            (wx + wy, cx, cy, wx, wy, tx, ty)
+            for cx, wx, tx in cands_x
+            for cy, wy, ty in cands_y
+        ]
         points.sort(key=lambda p: p[:3])
 
         planes.append(
@@ -381,8 +428,11 @@ def reconstruct_plane_candidates(
                     y_mm=(cy + 0.5) * _STRIP_MM,
                     sigma_x=(_STRIP_MM * wx) / math.sqrt(12),
                     sigma_y=(_STRIP_MM * wy) / math.sqrt(12),
+                    quality="golden" if wx == 1 and wy == 1 else "cluster",
+                    tot_x=tx,
+                    tot_y=ty,
                 )
-                for _, cx, cy, wx, wy in points[:max_per_plane]
+                for _, cx, cy, wx, wy, tx, ty in points[:max_per_plane]
             ]
         )
 
