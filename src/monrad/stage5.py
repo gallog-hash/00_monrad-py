@@ -84,6 +84,21 @@ class DecodeReport(NamedTuple):
     winning_tot: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None
 
 
+# The rejection gates _decode_cluster applies, in the order it checks them
+# (the "accepted" terminal is the success path, not a gate).  This is the
+# single source of truth for the funnel ordering: diagnostics import it
+# instead of hard-coding their own copy, so they can't drift from
+# _decode_cluster.  A DecodeReport.reason outside this tuple and not
+# "accepted" should be caught by callers as a catch-all, not silently lost.
+GATE_ORDER = (
+    "ambiguous_cluster",
+    "zero_candidate_plane",
+    "no_anchor_plane",
+    "chi2_track_cut",
+    "probe_quality",
+)
+
+
 # ── Result bundle ─────────────────────────────────────────────────────────
 
 

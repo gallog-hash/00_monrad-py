@@ -27,20 +27,11 @@ from monrad.stage1 import (  # noqa: E402
 from monrad.stage2 import coincidence_stream  # noqa: E402
 from monrad.stage3 import decode_position  # noqa: E402
 from monrad.stage4 import AlignmentAccumulator  # noqa: E402
-from monrad.stage5 import DecodeReport, PoseFitter  # noqa: E402
+from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter  # noqa: E402
 
 Z_TEL = np.array([0.0, -1340.0, -670.0])
 TEL_DIR = Path("data/0_testLab_20210723/Base")
 PRB_DIR = Path("data/0_testLab_20210723/Probe_0")
-
-# DecodeReport.reason values, in the order _decode_cluster checks them.
-_GATE_ORDER = (
-    "ambiguous_cluster",
-    "zero_candidate_plane",
-    "no_anchor_plane",
-    "chi2_track_cut",
-    "probe_quality",
-)
 
 
 def _load(d: Path) -> tuple[datetime, int, list[Path], list[Path]]:
@@ -121,11 +112,23 @@ def main() -> None:
     print("\n=== Coincidence loss funnel (Stage 2 -> Stage 5) ===")
     print(f"  Stage 2 coincidences found            : {n_coinc:>8}")
     running = n_coinc
-    for reason in _GATE_ORDER:
+    for reason in GATE_ORDER:
         n = reasons[reason]
         pct = 100.0 * n / n_coinc if n_coinc else 0.0
         running -= n
         print(f"  - {reason:<28}: {n:>8}  ({pct:5.2f}%)   survivors -> {running}")
+    # Catch-all for any reason that is neither a known gate nor "accepted"
+    # (e.g. a gate added to _decode_cluster but not to GATE_ORDER), so the
+    # funnel never silently loses counts and survivors stay reconciled.
+    other = sum(
+        n for r, n in reasons.items() if r not in GATE_ORDER and r != "accepted"
+    )
+    if other:
+        pct = 100.0 * other / n_coinc if n_coinc else 0.0
+        running -= other
+        print(
+            f"  - {'gate_other':<28}: {other:>8}  ({pct:5.2f}%)   survivors -> {running}"
+        )
     print(f"  Clean coincidences fed to fit         : {clean:>8}")
     print(f"  - RANSAC Mahalanobis outliers          : {ransac:>8}")
     print(f"  Stage 5 inliers (final)               : {n_inliers:>8}")

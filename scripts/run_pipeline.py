@@ -98,17 +98,14 @@ from monrad.stage1 import (
 from monrad.stage2 import coincidence_stream
 from monrad.stage3 import decode_position
 from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import DecodeReport, PoseFitter
+from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter
 
-# _decode_cluster's rejection gates, in the order they're checked.
-_GATE_ORDER = (
-    "ambiguous_cluster",
-    "zero_candidate_plane",
-    "no_anchor_plane",
-    "chi2_track_cut",
-    "probe_quality",
-)
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
+# Probe Hit.quality values (stage3.Hit), in canonical order, for the probe
+# hit-quality table.  decode_position can yield any of these for the probe
+# plane, so the table must list them all — printing only golden/cluster
+# silently drops the unresolved/invalid rejections.
+_PRB_QUALITY_ORDER = ("golden", "cluster", "efficiency", "unresolved", "invalid")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -419,10 +416,22 @@ def main() -> None:
         "not a separate re-derivation)",
     )
     running = n_coinc
-    for reason in _GATE_ORDER:
+    for reason in GATE_ORDER:
         n = gate_counts[reason]
         running -= n
         _emit(lines, f"  rejected: {reason:<22} {n:>7}   survivors -> {running}")
+    # Catch-all: any reason _decode_cluster emits that is neither a known gate
+    # nor "accepted" (e.g. a gate added to _decode_cluster but not to
+    # GATE_ORDER).  Without this the funnel would silently drop those counts
+    # and the survivor arithmetic would no longer reconcile.
+    other = sum(
+        n for r, n in gate_counts.items() if r not in GATE_ORDER and r != "accepted"
+    )
+    if other:
+        running -= other
+        _emit(
+            lines, f"  rejected: {'gate_other':<22} {other:>7}   survivors -> {running}"
+        )
     _emit(
         lines,
         f"  accepted (fed to pose optimizer)         {gate_counts['accepted']:>7}",
@@ -433,8 +442,13 @@ def main() -> None:
         parts = "   ".join(f"{label} {cand_dist[k][label]}" for label in _CAND_BUCKETS)
         _emit(lines, f"    Plane {k}    {parts}")
     _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
-    prb_parts = "   ".join(f"{q} {prb_q_at_decode[q]}" for q in ("golden", "cluster"))
-    _emit(lines, f"    {prb_parts}")
+    # List every quality that actually occurred, in canonical order, so the
+    # rejected buckets (unresolved / invalid) aren't hidden and the counts
+    # reconcile with the number of probe decodes.
+    prb_parts = "   ".join(
+        f"{q} {prb_q_at_decode[q]}" for q in _PRB_QUALITY_ORDER if prb_q_at_decode[q]
+    )
+    _emit(lines, f"    {prb_parts or '(none)'}")
     for bucket, label in (
         ("pass", "passed cut (accepted + probe_quality-rejected)"),
         ("fail", "failed cut (chi2_track_cut, best of a noisy search)"),
