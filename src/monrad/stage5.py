@@ -572,7 +572,7 @@ class PoseFitter:
             tel_ref,
             self.tel_pos_paths,
             n_cols=3,
-            max_per_plane=8,
+            max_per_plane=16,
             tot_thresh=self.tot_thresh,
         )
         cand_counts = (len(cands[0]), len(cands[1]), len(cands[2]))

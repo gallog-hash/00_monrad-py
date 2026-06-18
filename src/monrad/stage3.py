@@ -172,8 +172,20 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
     candidates: list[tuple[float, int]] = []
     for rc in rcs:
         for fc in fcs:
-            chs = [_N * r + f for r in rc for f in fc]
-            candidates.append((sum(chs) / len(chs), len(chs)))
+            # Split the (ribbon × fiber) cross-product into maximal contiguous
+            # channel runs — see _axis_candidates_with_tot for the rationale.
+            # Adjacent ribbons are N apart, so e.g. fiber {3,4} × ribbon {2,3}
+            # yields two candidates [23,24] and [33,34], not one width-4 blob
+            # straddling the 25..32 gap.
+            chs = sorted(_N * r + f for r in rc for f in fc)
+            run = [chs[0]]
+            for ch in chs[1:]:
+                if ch == run[-1] + 1:
+                    run.append(ch)
+                else:
+                    candidates.append((sum(run) / len(run), len(run)))
+                    run = [ch]
+            candidates.append((sum(run) / len(run), len(run)))
     return candidates
 
 
@@ -198,11 +210,31 @@ def _axis_candidates_with_tot(
     rcs = BinDecoder._find_clusters(ribbon_half)
 
     candidates: list[tuple[float, int, int]] = []
+
+    def _emit(run: list[int]) -> None:
+        tot = sum(ribbon_counts[c // _N] * fiber_counts[c % _N] for c in run)
+        candidates.append((sum(run) / len(run), len(run), tot))
+
     for rc in rcs:
         for fc in fcs:
-            chs = [_N * r + f for r in rc for f in fc]
-            tot = sum(ribbon_counts[r] * fiber_counts[f] for r in rc for f in fc)
-            candidates.append((sum(chs) / len(chs), len(chs), tot))
+            # The (ribbon × fiber) cross-product is not necessarily a single
+            # hit: adjacent ribbons are N apart, so a multi-ribbon cluster only
+            # forms one contiguous channel run when the fiber cluster spans the
+            # full decade.  Otherwise the combined N*r+f channels break into
+            # several gap-free runs, each a distinct candidate — e.g. fiber
+            # {3,4} × ribbon {2,3} yields [23,24] and [33,34], not one width-4
+            # blob straddling the 25..32 gap.  Split into maximal contiguous
+            # runs (mirroring _reconstruct_coord's contiguity rule, but
+            # enumerating each run instead of rejecting the whole pair).
+            chs = sorted(_N * r + f for r in rc for f in fc)
+            run = [chs[0]]
+            for ch in chs[1:]:
+                if ch == run[-1] + 1:
+                    run.append(ch)
+                else:
+                    _emit(run)
+                    run = [ch]
+            _emit(run)
     return candidates
 
 
@@ -370,7 +402,7 @@ def reconstruct_plane_candidates(
     pos_ref: PosRef,
     pos_paths: list[Path],
     n_cols: int,
-    max_per_plane: int = 8,
+    max_per_plane: int = 16,
     tot_thresh: int = 1,
 ) -> list[list[PlaneCandidate]]:
     """
@@ -385,6 +417,11 @@ def reconstruct_plane_candidates(
     `max_per_plane`, keeping the most compact candidates first (smallest
     width_x + width_y, ties broken by channel) — used by the Stage 5
     combinatorial track finder in place of a single resolved Hit per plane.
+
+    The default cap of 16 is the worst-case mirror-fold count: each axis can
+    fold into at most 2 ribbon × 2 fiber = 4 candidates, so a plane folded on
+    both axes yields 4 × 4 = 16 (DESIGN.md §10).  A smaller cap can silently
+    drop the true candidate when every candidate is equally compact.
 
     Each candidate carries `quality` ("golden" if both axes are width 1,
     else "cluster") and `tot_x`/`tot_y` (per-axis TOT score, see

@@ -688,3 +688,35 @@ class TestPlaneCandidates:
         assert c.tot_x == 16 * 16 + 16 * 4
         assert c.tot_y == 16 * 16
         assert c.quality == "cluster"
+
+    def test_adjacent_ribbons_split_into_separate_runs(self, tmp_path):
+        """
+        A single contiguous ribbon cluster {2,3} crossed with fiber cluster
+        {3,4} gives combined channels {23,24,33,34}.  These are NOT one
+        width-4 hit straddling the 25..32 gap — adjacent ribbons are 10
+        channels apart, so the cross-product splits into two gap-free runs,
+        each a distinct 2-wide cluster candidate: [23,24] and [33,34].
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 3)  # adjacent ribbons → one cluster [2,3]
+        x_fib = (1 << 3) | (1 << 4)  # adjacent fibers  → one cluster [3,4]
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "adjacent_ribbons.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        cands = planes[0]
+        # Two X-runs × one Y-candidate = 2 points, each a 2-wide X cluster.
+        assert len(cands) == 2
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        assert x_mm_set == {
+            round((23.5 + 0.5) * STRIP_MM, 6),  # centroid of [23,24] = 23.5
+            round((33.5 + 0.5) * STRIP_MM, 6),  # centroid of [33,34] = 33.5
+        }
+        for c in cands:
+            assert c.quality == "cluster"  # width 2 on X
+            assert c.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))
