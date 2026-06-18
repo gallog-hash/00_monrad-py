@@ -190,7 +190,7 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
 
 
 def _axis_candidates_with_tot(
-    field_or: int, counts: list[int]
+    field_or: int, counts: list[int], tot_weights: bool = False
 ) -> list[tuple[float, int, int]]:
     """
     Like _axis_candidates, but also returns each candidate's TOT score:
@@ -200,6 +200,12 @@ def _axis_candidates_with_tot(
 
     counts is the 20-element per-bit row count for this field (ribbon 0-9,
     fiber 10-19), as returned by _bit_counts.
+
+    tot_weights : when True, each candidate's centroid is TOT-weighted by its
+                  per-channel ribbon_count * fiber_count (same convention as
+                  _tot_weighted_centroid / decode_position's tot_weights path),
+                  falling back to the unweighted mean when all weights are
+                  zero.  Width-1 candidates are unaffected.
     """
     fiber_half = (field_or >> _N) & 0x3FF
     ribbon_half = field_or & 0x3FF
@@ -212,8 +218,13 @@ def _axis_candidates_with_tot(
     candidates: list[tuple[float, int, int]] = []
 
     def _emit(run: list[int]) -> None:
-        tot = sum(ribbon_counts[c // _N] * fiber_counts[c % _N] for c in run)
-        candidates.append((sum(run) / len(run), len(run), tot))
+        weights = [ribbon_counts[c // _N] * fiber_counts[c % _N] for c in run]
+        tot = sum(weights)
+        if tot_weights and tot > 0:
+            centroid = sum(w * c for w, c in zip(weights, run)) / tot
+        else:
+            centroid = sum(run) / len(run)
+        candidates.append((centroid, len(run), tot))
 
     for rc in rcs:
         for fc in fcs:
@@ -404,6 +415,7 @@ def reconstruct_plane_candidates(
     n_cols: int,
     max_per_plane: int = 16,
     tot_thresh: int = 1,
+    tot_weights: bool = False,
 ) -> list[list[PlaneCandidate]]:
     """
     Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
@@ -434,6 +446,11 @@ def reconstruct_plane_candidates(
     counts are always computed (regardless of tot_thresh) to produce the TOT
     scores above; this is the same count-path decode_position's tot_weights
     uses, just unconditional here.
+
+    tot_weights mirrors decode_position's tot_weights: when True each
+    candidate centroid is TOT-weighted by its per-bit row counts (no effect
+    on width-1 candidates).  Without it the telescope path would silently
+    ignore the pipeline's --tot-weights flag that the probe decode honours.
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
 
@@ -448,8 +465,8 @@ def reconstruct_plane_candidates(
             planes.append([])
             continue
 
-        cands_x = _axis_candidates_with_tot(x_or, x_counts)
-        cands_y = _axis_candidates_with_tot(y_or, y_counts)
+        cands_x = _axis_candidates_with_tot(x_or, x_counts, tot_weights)
+        cands_y = _axis_candidates_with_tot(y_or, y_counts, tot_weights)
 
         points = [
             (wx + wy, cx, cy, wx, wy, tx, ty)

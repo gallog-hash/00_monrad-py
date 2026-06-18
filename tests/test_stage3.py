@@ -720,3 +720,56 @@ class TestPlaneCandidates:
         for c in cands:
             assert c.quality == "cluster"  # width 2 on X
             assert c.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))
+
+    def test_tot_weights_shifts_cluster_centroid(self, tmp_path):
+        """
+        With tot_weights=True the X cluster centroid is TOT-weighted toward the
+        stronger fiber bit, exactly as decode_position's tot_weights path does —
+        otherwise the telescope candidates silently ignore the pipeline's
+        --tot-weights flag (the probe decode honours it).
+
+        X cluster = fiber bits 3,4 (ribbon 2) → channels 23,24.  Fiber bit 3
+        fires in all 16 rows, fiber bit 4 in only 4.  Weights: ch23 = 16*16,
+        ch24 = 16*4.  Weighted centroid = (256*23 + 64*24)/320 = 23.2, vs the
+        unweighted 23.5.
+        """
+        import struct
+
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        gen = 0
+        word_full = (
+            y_rib
+            | (y_fib << 10)
+            | (x_rib << 32)
+            | ((x_fib_3 | x_fib_4) << 42)
+            | (gen << 52)
+        )
+        word_f3_only = (
+            y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42) | (gen << 52)
+        )
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+        bin_path = tmp_path / "tot_weighted.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        unweighted = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)[0][0]
+        assert unweighted.x_mm == pytest.approx((23.5 + 0.5) * STRIP_MM)
+
+        weighted = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, tot_weights=True
+        )[0][0]
+        assert weighted.x_mm == pytest.approx((23.2 + 0.5) * STRIP_MM)
+        # Width/quality unchanged — tot_weights only moves the centroid.
+        assert weighted.quality == "cluster"
+        assert weighted.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))

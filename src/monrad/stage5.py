@@ -198,7 +198,7 @@ def _fit_triple(
     sigma_x: np.ndarray,
     sigma_y: np.ndarray,
     alignment: AlignmentCorrection,
-    tel_z: np.ndarray,
+    z_corr: np.ndarray,
 ) -> tuple[
     float,
     float,
@@ -218,14 +218,17 @@ def _fit_triple(
     z-frame, shifted by tilt_y·x / tilt_x·y (DESIGN.md §7.3/§10) so an
     out-of-plane tilt is removed exactly. Returns the same tuple as
     _tel_line_fit: (a_x, b_x, a_y, b_y, cov_x, cov_y, chi2).
+
+    z_corr is the alignment-corrected plane z (alignment.corrected_z_tel(tel_z));
+    it is constant across every triple of one event, so the caller computes it
+    once and passes it in rather than re-deriving it per triple.
     """
     corr = alignment
     x_arr = x_raw - np.array([corr.planes[k].delta_x for k in range(3)])
     y_arr = y_raw - np.array([corr.planes[k].delta_y for k in range(3)])
 
-    z_arr = alignment.corrected_z_tel(tel_z)
-    z_x_arr = z_arr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
-    z_y_arr = z_arr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
+    z_x_arr = z_corr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
+    z_y_arr = z_corr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
 
     return _tel_line_fit(x_arr, y_arr, z_x_arr, sigma_x, sigma_y, z_y_arr=z_y_arr)
 
@@ -574,6 +577,7 @@ class PoseFitter:
             n_cols=3,
             max_per_plane=16,
             tot_thresh=self.tot_thresh,
+            tot_weights=self.tot_weights,
         )
         cand_counts = (len(cands[0]), len(cands[1]), len(cands[2]))
         if any(len(c) == 0 for c in cands):
@@ -598,6 +602,10 @@ class PoseFitter:
             _report("no_anchor_plane", cand_counts=cand_counts)
             return None
 
+        # The alignment-corrected plane z is constant across every triple of
+        # this event, so compute it once instead of per-triple in _fit_triple.
+        z_corr = self.alignment.corrected_z_tel(self.tel_z)
+
         best_chi2 = math.inf
         best_fit = None
         best_triple = None
@@ -607,7 +615,7 @@ class PoseFitter:
             sigma_x_arr = np.array([c0.sigma_x, c1.sigma_x, c2.sigma_x])
             sigma_y_arr = np.array([c0.sigma_y, c1.sigma_y, c2.sigma_y])
             fit = _fit_triple(
-                x_raw, y_raw, sigma_x_arr, sigma_y_arr, self.alignment, self.tel_z
+                x_raw, y_raw, sigma_x_arr, sigma_y_arr, self.alignment, z_corr
             )
             if fit[-1] < best_chi2:
                 best_chi2 = fit[-1]
