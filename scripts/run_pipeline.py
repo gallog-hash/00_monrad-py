@@ -339,35 +339,45 @@ def main() -> None:
     gate_counts: Counter = Counter()
     cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
     prb_q_at_decode: Counter = Counter()
-    win_quality: list[Counter] = [Counter(), Counter(), Counter()]
-    tot_n = [0, 0, 0]
-    tot_sum = [0.0, 0.0, 0.0]
-    tot_sumsq = [0.0, 0.0, 0.0]
-    chi2_n = 0
-    chi2_sum = 0.0
-    chi2_sumsq = 0.0
+    # The winning triple is reported for every cluster that reached the χ²
+    # search, both ones that then passed the <_CHI2_TRACK cut ("accepted"/
+    # "probe_quality") and ones that didn't ("chi2_track_cut" — the best of
+    # a noisy candidate search, can be huge/low-quality). Track pass/fail
+    # separately throughout: conflating them buries the post-cut population
+    # (which should look like genuine tracks) under the much larger,
+    # much noisier rejected pool.
+    win_quality = {
+        "pass": [Counter(), Counter(), Counter()],
+        "fail": [Counter(), Counter(), Counter()],
+    }
+    tot_n = {"pass": [0, 0, 0], "fail": [0, 0, 0]}
+    tot_sum = {"pass": [0.0, 0.0, 0.0], "fail": [0.0, 0.0, 0.0]}
+    tot_sumsq = {"pass": [0.0, 0.0, 0.0], "fail": [0.0, 0.0, 0.0]}
+    chi2_n = {"pass": 0, "fail": 0}
+    chi2_sum = {"pass": 0.0, "fail": 0.0}
+    chi2_sumsq = {"pass": 0.0, "fail": 0.0}
 
     def _on_decode(r: DecodeReport) -> None:
-        nonlocal chi2_n, chi2_sum, chi2_sumsq
         gate_counts[r.reason] += 1
         if r.cand_counts is not None:
             for k in range(3):
                 cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
         if r.prb_quality is not None:
             prb_q_at_decode[r.prb_quality] += 1
+        bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
         if r.winning_quality is not None:
             for k in range(3):
-                win_quality[k][r.winning_quality[k]] += 1
+                win_quality[bucket][k][r.winning_quality[k]] += 1
         if r.winning_tot is not None:
             for k in range(3):
                 tot = r.winning_tot[k][0] + r.winning_tot[k][1]
-                tot_n[k] += 1
-                tot_sum[k] += tot
-                tot_sumsq[k] += tot * tot
+                tot_n[bucket][k] += 1
+                tot_sum[bucket][k] += tot
+                tot_sumsq[bucket][k] += tot * tot
         if r.chi2 is not None:
-            chi2_n += 1
-            chi2_sum += r.chi2
-            chi2_sumsq += r.chi2 * r.chi2
+            chi2_n[bucket] += 1
+            chi2_sum[bucket] += r.chi2
+            chi2_sumsq[bucket] += r.chi2 * r.chi2
 
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -425,28 +435,40 @@ def main() -> None:
     _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
     prb_parts = "   ".join(f"{q} {prb_q_at_decode[q]}" for q in ("golden", "cluster"))
     _emit(lines, f"    {prb_parts}")
-    if chi2_n:
-        mean = chi2_sum / chi2_n
-        var = max(chi2_sumsq / chi2_n - mean * mean, 0.0)
-        _emit(
-            lines,
-            f"  Winning-triple χ² (accepted + probe_quality-rejected): "
-            f"mean={mean:.3f}  std={math.sqrt(var):.3f}  n={chi2_n}",
-        )
-    _emit(lines, "  Winning-triple per-plane quality (candidate the χ² search picked):")
-    for k in range(3):
-        parts = "   ".join(f"{q} {win_quality[k][q]}" for q in ("golden", "cluster"))
-        _emit(lines, f"    Plane {k}    {parts}")
-    _emit(lines, "  Winning-triple per-plane TOT score (tot_x + tot_y, ribbon×fiber):")
-    for k in range(3):
-        if tot_n[k]:
-            mean_t = tot_sum[k] / tot_n[k]
-            var_t = max(tot_sumsq[k] / tot_n[k] - mean_t * mean_t, 0.0)
+    for bucket, label in (
+        ("pass", "passed cut (accepted + probe_quality-rejected)"),
+        ("fail", "failed cut (chi2_track_cut, best of a noisy search)"),
+    ):
+        n = chi2_n[bucket]
+        if n:
+            mean = chi2_sum[bucket] / n
+            var = max(chi2_sumsq[bucket] / n - mean * mean, 0.0)
             _emit(
                 lines,
-                f"    Plane {k}    mean={mean_t:.1f}  std={math.sqrt(var_t):.1f}  "
-                f"n={tot_n[k]}",
+                f"  Winning-triple χ², {label}: "
+                f"mean={mean:.3f}  std={math.sqrt(var):.3f}  n={n}",
             )
+    for bucket, label in (
+        ("pass", "passed cut"),
+        ("fail", "failed cut"),
+    ):
+        _emit(lines, f"  Winning-triple per-plane quality, {label}:")
+        for k in range(3):
+            parts = "   ".join(
+                f"{q} {win_quality[bucket][k][q]}" for q in ("golden", "cluster")
+            )
+            _emit(lines, f"    Plane {k}    {parts}")
+        _emit(lines, f"  Winning-triple per-plane TOT score, {label} (tot_x + tot_y):")
+        for k in range(3):
+            n = tot_n[bucket][k]
+            if n:
+                mean_t = tot_sum[bucket][k] / n
+                var_t = max(tot_sumsq[bucket][k] / n - mean_t * mean_t, 0.0)
+                _emit(
+                    lines,
+                    f"    Plane {k}    mean={mean_t:.1f}  std={math.sqrt(var_t):.1f}  "
+                    f"n={n}",
+                )
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────
