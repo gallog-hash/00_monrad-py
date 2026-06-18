@@ -81,6 +81,7 @@ If stage 5 has too few coincidences:
 """
 
 import argparse
+import csv
 import math
 import sys
 from collections import Counter
@@ -150,10 +151,21 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tot-weights",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Weight cluster centroids by per-bit TOT counts "
-        "(ribbon_count × fiber_count). No effect on golden hits.",
+        "(ribbon_count × fiber_count). No effect on golden hits. On by "
+        "default for the combinatorial path; pass --no-tot-weights to disable.",
+    )
+    p.add_argument(
+        "--decode-csv",
+        default=None,
+        type=Path,
+        metavar="PATH",
+        help="Write one row per coincidence that reached the χ² triple search "
+        "(both passed and failed the χ² cut) with per-plane cluster count, "
+        "size, TOT weight and the winning-triple χ² — for offline study of "
+        "how cluster characteristics correlate with track quality.",
     )
     return p.parse_args()
 
@@ -193,6 +205,17 @@ def _cand_bucket(n: int) -> str:
     return "ambiguous(2+)"
 
 
+def _pearson(
+    n: float, sx: float, sy: float, sxx: float, syy: float, sxy: float
+) -> float:
+    """Pearson r from streaming sums; NaN when either variable has no spread."""
+    cov = n * sxy - sx * sy
+    vx = n * sxx - sx * sx
+    vy = n * syy - sy * sy
+    denom = math.sqrt(vx * vy)
+    return cov / denom if denom > 0 else math.nan
+
+
 def main() -> None:
     args = _parse_args()
     tel_dir: Path = args.telescope
@@ -201,6 +224,7 @@ def main() -> None:
     z_tel = np.array(args.z_tel)
     tot_thresh: int = args.tot_thresh
     tot_weights: bool = args.tot_weights
+    decode_csv: Path | None = args.decode_csv
 
     lines: list[str] = []
 
@@ -353,12 +377,50 @@ def main() -> None:
     chi2_n = {"pass": 0, "fail": 0}
     chi2_sum = {"pass": 0.0, "fail": 0.0}
     chi2_sumsq = {"pass": 0.0, "fail": 0.0}
+    # Per-plane distribution of the number of contiguous fired-channel runs
+    # ("clusters") on each axis — independent of which candidate the search
+    # picked, so reported for every cluster that reached candidate enumeration.
+    clu_dist_x: list[Counter] = [Counter(), Counter(), Counter()]
+    clu_dist_y: list[Counter] = [Counter(), Counter(), Counter()]
+    # Streaming sums for Pearson r between the winning triple's χ² and its
+    # aggregate cluster size (Σ widths) / weight (Σ TOT), for the passed-cut
+    # population and for all χ²-searched coincidences (pass + fail).
+    corr = {
+        grp: dict.fromkeys(
+            ("n", "sc", "scc", "ss", "sss", "scs", "sw", "sww", "scw"), 0.0
+        )
+        for grp in ("pass", "all")
+    }
+
+    # Per-coincidence CSV dump for offline cluster/χ² correlation studies.
+    csv_file = None
+    csv_writer = None
+    if decode_csv is not None:
+        decode_csv.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = decode_csv.open("w", newline="")
+        csv_writer = csv.writer(csv_file)
+        header = ["reason", "passed_cut", "chi2", "prb_quality"]
+        for k in range(3):
+            header += [
+                f"n_clu_x_{k}",
+                f"n_clu_y_{k}",
+                f"width_x_{k}",
+                f"width_y_{k}",
+                f"tot_x_{k}",
+                f"tot_y_{k}",
+                f"quality_{k}",
+            ]
+        csv_writer.writerow(header)
 
     def _on_decode(r: DecodeReport) -> None:
         gate_counts[r.reason] += 1
         if r.cand_counts is not None:
             for k in range(3):
                 cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
+        if r.cluster_counts is not None:
+            for k in range(3):
+                clu_dist_x[k][_cand_bucket(r.cluster_counts[k][0])] += 1
+                clu_dist_y[k][_cand_bucket(r.cluster_counts[k][1])] += 1
         if r.prb_quality is not None:
             prb_q_at_decode[r.prb_quality] += 1
         bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
@@ -375,6 +437,46 @@ def main() -> None:
             chi2_n[bucket] += 1
             chi2_sum[bucket] += r.chi2
             chi2_sumsq[bucket] += r.chi2 * r.chi2
+        if (
+            r.chi2 is not None
+            and r.winning_width is not None
+            and r.winning_tot is not None
+        ):
+            size = float(sum(wx + wy for wx, wy in r.winning_width))
+            weight = float(sum(tx + ty for tx, ty in r.winning_tot))
+            groups = ("all", "pass") if bucket == "pass" else ("all",)
+            for grp in groups:
+                acc = corr[grp]
+                acc["n"] += 1
+                acc["sc"] += r.chi2
+                acc["scc"] += r.chi2 * r.chi2
+                acc["ss"] += size
+                acc["sss"] += size * size
+                acc["scs"] += r.chi2 * size
+                acc["sw"] += weight
+                acc["sww"] += weight * weight
+                acc["scw"] += r.chi2 * weight
+        if csv_writer is not None and r.winning_width is not None:
+            cc = r.cluster_counts or ((0, 0), (0, 0), (0, 0))
+            wt = r.winning_tot or ((0, 0), (0, 0), (0, 0))
+            wq = r.winning_quality or ("", "", "")
+            row: list = [
+                r.reason,
+                int(r.reason != "chi2_track_cut"),
+                f"{r.chi2:.6g}" if r.chi2 is not None else "",
+                r.prb_quality or "",
+            ]
+            for k in range(3):
+                row += [
+                    cc[k][0],
+                    cc[k][1],
+                    r.winning_width[k][0],
+                    r.winning_width[k][1],
+                    wt[k][0],
+                    wt[k][1],
+                    wq[k],
+                ]
+            csv_writer.writerow(row)
 
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -400,6 +502,9 @@ def main() -> None:
         fitter.add(cluster)
 
     pose = fitter.flush()
+
+    if csv_file is not None:
+        csv_file.close()
 
     # ── Print stage 2 ────────────────────────────────────────────────────
     mean_sz = (total_cluster_size / n_coinc) if n_coinc else 0.0
@@ -441,6 +546,16 @@ def main() -> None:
     for k in range(3):
         parts = "   ".join(f"{label} {cand_dist[k][label]}" for label in _CAND_BUCKETS)
         _emit(lines, f"    Plane {k}    {parts}")
+    _emit(
+        lines,
+        "  Telescope per-plane cluster-count distribution "
+        "(contiguous fired-channel runs per axis):",
+    )
+    for k in range(3):
+        px = "   ".join(f"{label} {clu_dist_x[k][label]}" for label in _CAND_BUCKETS)
+        py = "   ".join(f"{label} {clu_dist_y[k][label]}" for label in _CAND_BUCKETS)
+        _emit(lines, f"    Plane {k}  x: {px}")
+        _emit(lines, f"    Plane {k}  y: {py}")
     _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
     # List every quality that actually occurred, in canonical order, so the
     # rejected buckets (unresolved / invalid) aren't hidden and the counts
@@ -483,6 +598,31 @@ def main() -> None:
                     f"    Plane {k}    mean={mean_t:.1f}  std={math.sqrt(var_t):.1f}  "
                     f"n={n}",
                 )
+    _emit(
+        lines,
+        "  Winning-triple χ² vs cluster characteristics (Pearson r; "
+        "size=Σ widths, weight=Σ TOT over the 3 planes):",
+    )
+    for grp, label in (
+        ("pass", "passed cut"),
+        ("all", "all χ²-searched (pass + fail)"),
+    ):
+        acc = corr[grp]
+        n = int(acc["n"])
+        if n < 2:
+            continue
+        r_size = _pearson(
+            acc["n"], acc["sc"], acc["ss"], acc["scc"], acc["sss"], acc["scs"]
+        )
+        r_wt = _pearson(
+            acc["n"], acc["sc"], acc["sw"], acc["scc"], acc["sww"], acc["scw"]
+        )
+        _emit(
+            lines,
+            f"    {label}: r(χ²,size)={r_size:+.3f}  r(χ²,weight)={r_wt:+.3f}  n={n}",
+        )
+    if decode_csv is not None:
+        _emit(lines, f"  Per-coincidence decode CSV written to {decode_csv}")
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────

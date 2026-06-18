@@ -28,6 +28,7 @@ from monrad.stage3 import Hit, disambiguate_telescope_hits
 from monrad.stage4 import AlignmentCorrection, PlaneCorrection
 from monrad.stage5 import (
     Coincidence,
+    DecodeReport,
     PoseResult,
     PoseFitter,
     fit_probe_pose,
@@ -763,3 +764,88 @@ class TestDisambiguateOffsetSelection:
         )
         assert corrected[1].quality == "cluster"
         assert corrected[1].x_mm == pytest.approx(110.0)  # corrected → right one
+
+
+class TestDecodeReportClusterMetrics:
+    """
+    DecodeReport carries per-plane cluster diagnostics (cluster_counts) and the
+    winning triple's per-plane cluster size (winning_width) on top of the
+    existing quality/TOT, so run_pipeline.py can study how cluster
+    characteristics correlate with the best-triple χ².
+    """
+
+    def test_accepted_report_carries_cluster_metrics(self, tmp_path):
+        out = tmp_path / "synth"
+        generate(
+            out_dir=out,
+            t_x=_TRUE_TX,
+            t_y=_TRUE_TY,
+            theta=_TRUE_THETA,
+            z_p=_TRUE_ZP,
+            n_tracks=_N_TRACKS,
+            seed=42,
+            start_utc=_START_UTC,
+            f0=F0,
+        )
+        tel_dir, prb_dir = out / "telescope", out / "probe"
+        tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+        prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header.txt")))
+        tel_gps, tel_pos = find_file_pairs(tel_dir)
+        prb_gps, prb_pos = find_file_pairs(prb_dir)
+        tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
+        prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
+
+        reports: list[DecodeReport] = []
+        fitter = PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=tel_pos,
+            prb_pos_paths=prb_pos,
+            refit_every=_N_TRACKS + 1,
+            on_decode=reports.append,
+        )
+        for cluster in coincidence_stream(
+            [tel_stream, prb_stream], detector_ids=[0, 1]
+        ):
+            fitter.add(cluster)
+        fitter.flush()
+
+        accepted = [r for r in reports if r.accepted]
+        assert accepted, "no coincidence was accepted"
+        for r in accepted:
+            assert r.chi2 is not None
+            assert r.cluster_counts is not None and len(r.cluster_counts) == 3
+            assert r.winning_width is not None and len(r.winning_width) == 3
+            assert r.winning_tot is not None and len(r.winning_tot) == 3
+            for k in range(3):
+                # Clean synthetic telescope hits are golden: one width-1
+                # cluster on each axis.
+                assert r.cluster_counts[k] == (1, 1)
+                assert r.winning_width[k] == (1, 1)
+                assert r.winning_tot[k][0] > 0 and r.winning_tot[k][1] > 0
+
+    def test_metrics_absent_before_candidate_enumeration(self):
+        """An ambiguous cluster is rejected before any candidate is enumerated,
+        so the per-plane cluster metrics are reported as None."""
+        reports: list[DecodeReport] = []
+        fitter = PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=[],
+            prb_pos_paths=[],
+            on_decode=reports.append,
+        )
+        # Two telescope events in one cluster → "ambiguous_cluster" gate.
+        assert (
+            fitter._decode_cluster([_entry(0, 0), _entry(0, 1), _entry(1, 2)]) is None
+        )
+        assert len(reports) == 1
+        r = reports[0]
+        assert r.reason == "ambiguous_cluster"
+        assert r.cluster_counts is None
+        assert r.winning_width is None
+        assert r.winning_tot is None

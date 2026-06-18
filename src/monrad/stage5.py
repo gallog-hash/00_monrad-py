@@ -69,10 +69,16 @@ class DecodeReport(NamedTuple):
     cand_counts/chi2/prb_quality/winning_quality/winning_tot are None when
     the cluster was rejected before that quantity was computed.
 
-    winning_quality/winning_tot describe the per-plane PlaneCandidate the
-    χ² search actually picked (stage3.PlaneCandidate.quality/tot_x/tot_y) —
-    available whenever a best triple was found, i.e. from "chi2_track_cut"
-    onward, even if that triple was then rejected by a later gate.
+    winning_quality/winning_tot/winning_width describe the per-plane
+    PlaneCandidate the χ² search actually picked
+    (stage3.PlaneCandidate.quality/tot_x,tot_y/width_x,width_y) — available
+    whenever a best triple was found, i.e. from "chi2_track_cut" onward, even
+    if that triple was then rejected by a later gate.
+
+    cluster_counts is the per-plane (n_clusters_x, n_clusters_y) contiguous
+    fired-channel run count (stage3.reconstruct_plane_candidates), available
+    from candidate enumeration onward (same gates as cand_counts); (0, 0) for
+    an invalid plane.
     """
 
     accepted: bool
@@ -82,6 +88,8 @@ class DecodeReport(NamedTuple):
     prb_quality: str | None
     winning_quality: tuple[str, str, str] | None
     winning_tot: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None
+    cluster_counts: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None
+    winning_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None
 
 
 # The rejection gates _decode_cluster applies, in the order it checks them
@@ -547,6 +555,10 @@ class PoseFitter:
             winning_quality: tuple[str, str, str] | None = None,
             winning_tot: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
             | None = None,
+            cluster_counts: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            | None = None,
+            winning_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            | None = None,
         ) -> None:
             if self.on_decode is not None:
                 self.on_decode(
@@ -558,6 +570,8 @@ class PoseFitter:
                         prb_quality=prb_quality,
                         winning_quality=winning_quality,
                         winning_tot=winning_tot,
+                        cluster_counts=cluster_counts,
+                        winning_width=winning_width,
                     )
                 )
 
@@ -586,7 +600,7 @@ class PoseFitter:
         # bootstrap a third (replaces disambiguate_telescope_hits +
         # recover_efficiency_hits in this path; see DESIGN.md §10
         # Deduction #4 and the combinatorial-track-finder plan).
-        cands = reconstruct_plane_candidates(
+        cands, plane_cluster_counts = reconstruct_plane_candidates(
             tel_ref,
             self.tel_pos_paths,
             n_cols=3,
@@ -595,10 +609,19 @@ class PoseFitter:
             tot_weights=self.tot_weights,
         )
         cand_counts = (len(cands[0]), len(cands[1]), len(cands[2]))
+        cluster_counts = (
+            plane_cluster_counts[0],
+            plane_cluster_counts[1],
+            plane_cluster_counts[2],
+        )
         if any(len(c) == 0 for c in cands):
             # A triple needs all 3 planes; single-half dropouts are out of
             # scope for this phase-1 combinatorial search.
-            _report("zero_candidate_plane", cand_counts=cand_counts)
+            _report(
+                "zero_candidate_plane",
+                cand_counts=cand_counts,
+                cluster_counts=cluster_counts,
+            )
             return None
         if all(len(c) > 1 for c in cands):
             # No plane decoded as a single, already-resolved candidate: the
@@ -614,7 +637,11 @@ class PoseFitter:
             # ≥2 clean planes to bootstrap a third (here relaxed to ≥1,
             # since the combinatorial search needs only one true reference
             # rather than two independent ones).
-            _report("no_anchor_plane", cand_counts=cand_counts)
+            _report(
+                "no_anchor_plane",
+                cand_counts=cand_counts,
+                cluster_counts=cluster_counts,
+            )
             return None
 
         # The alignment-corrected plane z is constant across every triple of
@@ -648,9 +675,15 @@ class PoseFitter:
                 (best_triple[1].tot_x, best_triple[1].tot_y),
                 (best_triple[2].tot_x, best_triple[2].tot_y),
             )
+            winning_width = (
+                (best_triple[0].width_x, best_triple[0].width_y),
+                (best_triple[1].width_x, best_triple[1].width_y),
+                (best_triple[2].width_x, best_triple[2].width_y),
+            )
         else:
             winning_quality = None
             winning_tot = None
+            winning_width = None
 
         if best_fit is None or best_chi2 >= _CHI2_TRACK:
             _report(
@@ -659,6 +692,8 @@ class PoseFitter:
                 chi2=(best_chi2 if best_fit is not None else None),
                 winning_quality=winning_quality,
                 winning_tot=winning_tot,
+                cluster_counts=cluster_counts,
+                winning_width=winning_width,
             )
             return None
         a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
@@ -680,6 +715,8 @@ class PoseFitter:
                 prb_quality=prb_hit.quality,
                 winning_quality=winning_quality,
                 winning_tot=winning_tot,
+                cluster_counts=cluster_counts,
+                winning_width=winning_width,
             )
             return None
 
@@ -690,6 +727,8 @@ class PoseFitter:
             prb_quality=prb_hit.quality,
             winning_quality=winning_quality,
             winning_tot=winning_tot,
+            cluster_counts=cluster_counts,
+            winning_width=winning_width,
         )
         return Coincidence(
             a_x=a_x,

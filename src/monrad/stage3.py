@@ -407,6 +407,25 @@ class PlaneCandidate(NamedTuple):
     quality: Literal["golden", "cluster"]
     tot_x: int  # ribbon_count * fiber_count summed over the X axis's bits
     tot_y: int  # same, for the Y axis
+    width_x: int  # number of contiguous combined channels on the X axis
+    width_y: int  # same, for the Y axis
+
+
+class PlaneCandidates(NamedTuple):
+    """
+    Return bundle of reconstruct_plane_candidates.
+
+    candidates : per-plane list of PlaneCandidate (the Cartesian product of
+                 each plane's X/Y axis candidates, capped at max_per_plane).
+    cluster_counts : per-plane (n_clusters_x, n_clusters_y) — the number of
+                 contiguous fired-channel runs on each axis *before* the
+                 cross-product and the cap, so a count that survives the cap
+                 (used by Stage 5 diagnostics to study clustering per plane).
+                 (0, 0) for an invalid plane.
+    """
+
+    candidates: list[list[PlaneCandidate]]
+    cluster_counts: list[tuple[int, int]]
 
 
 def reconstruct_plane_candidates(
@@ -416,7 +435,7 @@ def reconstruct_plane_candidates(
     max_per_plane: int = 16,
     tot_thresh: int = 1,
     tot_weights: bool = False,
-) -> list[list[PlaneCandidate]]:
+) -> PlaneCandidates:
     """
     Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
     instead of collapsing each plane to a single resolved Hit.
@@ -436,10 +455,14 @@ def reconstruct_plane_candidates(
     drop the true candidate when every candidate is equally compact.
 
     Each candidate carries `quality` ("golden" if both axes are width 1,
-    else "cluster") and `tot_x`/`tot_y` (per-axis TOT score, see
-    _axis_candidates_with_tot) so callers can report the signal strength
-    and resolved-vs-cluster status of whichever candidate the Stage 5
+    else "cluster"), `tot_x`/`tot_y` (per-axis TOT score, see
+    _axis_candidates_with_tot) and `width_x`/`width_y` (per-axis channel
+    width) so callers can report the signal strength, cluster size and
+    resolved-vs-cluster status of whichever candidate the Stage 5
     combinatorial search ultimately picks.
+
+    Returns a PlaneCandidates bundle: the per-plane candidate lists plus the
+    per-plane (n_clusters_x, n_clusters_y) contiguous-run counts.
 
     tot_thresh mirrors decode_position's OR-mask threshold so the masks fed
     to candidate enumeration match the resolved decode path exactly. Per-bit
@@ -455,6 +478,7 @@ def reconstruct_plane_candidates(
     words = _read_block(pos_paths, pos_ref, n_cols)
 
     planes: list[list[PlaneCandidate]] = []
+    cluster_counts: list[tuple[int, int]] = []
     for col in range(n_cols):
         x_counts, y_counts = _bit_counts(words, col, n_cols)
         x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
@@ -463,10 +487,15 @@ def reconstruct_plane_candidates(
         valid, _ = BinDecoder._is_valid(x_or, y_or)
         if not valid:
             planes.append([])
+            cluster_counts.append((0, 0))
             continue
 
         cands_x = _axis_candidates_with_tot(x_or, x_counts, tot_weights)
         cands_y = _axis_candidates_with_tot(y_or, y_counts, tot_weights)
+        # Number of contiguous channel runs per axis, captured before the
+        # cross-product and the max_per_plane cap so the count is exact even
+        # for events that saturate the candidate cap.
+        cluster_counts.append((len(cands_x), len(cands_y)))
 
         points = [
             (wx + wy, cx, cy, wx, wy, tx, ty)
@@ -485,12 +514,14 @@ def reconstruct_plane_candidates(
                     quality="golden" if wx == 1 and wy == 1 else "cluster",
                     tot_x=tx,
                     tot_y=ty,
+                    width_x=wx,
+                    width_y=wy,
                 )
                 for _, cx, cy, wx, wy, tx, ty in points[:max_per_plane]
             ]
         )
 
-    return planes
+    return PlaneCandidates(candidates=planes, cluster_counts=cluster_counts)
 
 
 def disambiguate_telescope_hits(
