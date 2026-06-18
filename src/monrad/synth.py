@@ -251,6 +251,7 @@ def generate(
     f0: int = F0,
     plane_offsets: dict[int, tuple[float, float]] | None = None,
     fold: bool = False,
+    fold_planes: set[int] | None = None,
     z_tel_offsets: dict[int, float] | None = None,
     z_tel_tilts: dict[int, tuple[float, float]] | None = None,
     tel_cluster_widths: dict[int, tuple[int, int]] | None = None,
@@ -268,6 +269,12 @@ def generate(
                      bits set (k and 9-k) in each mask half, mimicking
                      folded-fiber MAROC wiring.  fold-pair decoding should
                      recover the original channels.
+    fold_planes    : optional set of plane indices to fold-encode, leaving
+                     the other planes golden/cluster — overrides `fold`
+                     per-plane.  Lets a test ambiguate only 1–2 of the 3
+                     telescope planes per event instead of all 3 at once
+                     (DESIGN.md §10 Deduction #4).  Ignored (falls back to
+                     `fold` for every plane) when None.
     z_tel_offsets  : optional dict {plane_idx: dz_mm} — the telescope
                      *.bin file is written with hits computed at
                      Z_TEL[k] + dz, but the header still records the
@@ -369,7 +376,10 @@ def generate(
                 cx = _quantize_clamp(x_coord, N_TEL)
                 cy = _quantize_clamp(y_coord, N_TEL)
             wx, wy = tel_cluster_widths.get(k, (1, 1))
-            words.append(_ch_to_u64(cx, cy, gen, fold=fold, width_x=wx, width_y=wy))
+            plane_fold = fold if fold_planes is None else (k in fold_planes)
+            words.append(
+                _ch_to_u64(cx, cy, gen, fold=plane_fold, width_x=wx, width_y=wy)
+            )
         tel_blocks.append(words)
         gen = (gen + 1) % 2048
 

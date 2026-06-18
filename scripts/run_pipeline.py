@@ -40,13 +40,23 @@ Expected console output (example values):
       Coincidences     :    523
       Mean cluster size:   2.00
 
-    === Stage 3: Hit quality (coincidence survivors) ===
-      523 coincidences x 3 telescope planes = 1569 readings
-      Plane 0    golden 314   cluster 32   unresolved 4   invalid 2   missing 1
-      Plane 1    golden 315   cluster 30   unresolved 5   invalid 1   missing 1
-      Plane 2    golden 312   cluster 32   unresolved 3   invalid 2   missing 0
-      523 coincidences x 1 probe plane = 523 readings
-      Probe      golden 410   cluster 80   unresolved 20   invalid 13   missing 0
+    === Stage 3: Pose-fit gate funnel (combinatorial path) ===
+      (counts come from PoseFitter._decode_cluster's own DecodeReport, not a
+      separate re-derivation)
+      rejected: ambiguous_cluster            12   survivors -> 511
+      rejected: zero_candidate_plane          8   survivors -> 503
+      rejected: no_anchor_plane               3   survivors -> 500
+      rejected: chi2_track_cut                9   survivors -> 491
+      rejected: probe_quality                 4   survivors -> 487
+      accepted (fed to pose optimizer)         487
+
+      Telescope per-plane candidate-count distribution:
+        Plane 0    invalid(0) 8   resolved(1) 460   ambiguous(2+) 55
+        Plane 1    invalid(0) 6   resolved(1) 455   ambiguous(2+) 62
+        Plane 2    invalid(0) 9   resolved(1) 462   ambiguous(2+) 52
+      Probe hit quality (coincidences that reached probe decode):
+        golden 410   cluster 91
+      Winning-triple χ² (accepted + probe_quality-rejected): mean=0.421  std=0.612  n=500
 
     === Stage 5: Probe pose fit ===
       t_x   =  +51.3 ±  1.2 mm
@@ -78,11 +88,19 @@ from monrad.stage1 import (
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position, disambiguate_telescope_hits
+from monrad.stage3 import decode_position
 from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import PoseFitter
+from monrad.stage5 import DecodeReport, PoseFitter
 
-_HIT_QUALITIES = ("golden", "cluster", "unresolved", "invalid", "missing")
+# _decode_cluster's rejection gates, in the order they're checked.
+_GATE_ORDER = (
+    "ambiguous_cluster",
+    "zero_candidate_plane",
+    "no_anchor_plane",
+    "chi2_track_cut",
+    "probe_quality",
+)
+_CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -160,6 +178,14 @@ def _fmt_q(q: Counter) -> str:
 def _emit(lines: list[str], msg: str = "") -> None:
     print(msg)
     lines.append(msg)
+
+
+def _cand_bucket(n: int) -> str:
+    if n == 0:
+        return "invalid(0)"
+    if n == 1:
+        return "resolved(1)"
+    return "ambiguous(2+)"
 
 
 def main() -> None:
@@ -299,6 +325,29 @@ def main() -> None:
     tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
     prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
 
+    # Gate-funnel and per-plane candidate-count stats, collected straight
+    # from PoseFitter._decode_cluster's own DecodeReport — not a separate
+    # re-derivation of its logic (see DecodeReport's docstring in stage5.py).
+    gate_counts: Counter = Counter()
+    cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
+    prb_q_at_decode: Counter = Counter()
+    chi2_n = 0
+    chi2_sum = 0.0
+    chi2_sumsq = 0.0
+
+    def _on_decode(r: DecodeReport) -> None:
+        nonlocal chi2_n, chi2_sum, chi2_sumsq
+        gate_counts[r.reason] += 1
+        if r.cand_counts is not None:
+            for k in range(3):
+                cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
+        if r.prb_quality is not None:
+            prb_q_at_decode[r.prb_quality] += 1
+        if r.chi2 is not None:
+            chi2_n += 1
+            chi2_sum += r.chi2
+            chi2_sumsq += r.chi2 * r.chi2
+
     fitter = PoseFitter(
         tel_z=z_tel,
         alignment=alignment,
@@ -308,14 +357,11 @@ def main() -> None:
         prb_pos_paths=prb_pos,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        on_decode=_on_decode,
     )
 
     n_coinc = 0
     total_cluster_size = 0
-    tel_hit_q: list[Counter] = [Counter(), Counter(), Counter()]
-    prb_hit_q: Counter = Counter()
-    _pos_paths = {0: tel_pos, 1: prb_pos}
-    _n_cols = {0: 3, 1: 1}
 
     for cluster in coincidence_stream(
         [tel_stream, prb_stream],
@@ -323,31 +369,6 @@ def main() -> None:
     ):
         n_coinc += 1
         total_cluster_size += len(cluster)
-        for det_id, _ev, ref in cluster:
-            hits = decode_position(
-                ref,
-                _pos_paths[det_id],
-                n_cols=_n_cols[det_id],
-                tot_thresh=tot_thresh,
-                tot_weights=tot_weights,
-            )
-            if det_id == 0:
-                # Reflect the two-plane recovery the pose fit applies, so the
-                # quality table is not artificially dominated by 'unresolved'
-                # (corrected-frame offsets, matching PoseFitter._decode_cluster).
-                hits = disambiguate_telescope_hits(
-                    hits,
-                    z_tel,
-                    offsets=[
-                        (alignment.planes[k].delta_x, alignment.planes[k].delta_y)
-                        for k in range(3)
-                    ],
-                )
-                for plane_idx, h in enumerate(hits):
-                    tel_hit_q[plane_idx][h.quality if h is not None else "missing"] += 1
-            else:
-                for h in hits:
-                    prb_hit_q[h.quality if h is not None else "missing"] += 1
         fitter.add(cluster)
 
     pose = fitter.flush()
@@ -360,21 +381,37 @@ def main() -> None:
     _emit(lines)
 
     # ── Print stage 3 ────────────────────────────────────────────────────
-    _emit(lines, "=== Stage 3: Hit quality (coincidence survivors) ===")
+    _emit(lines, "=== Stage 3: Pose-fit gate funnel (combinatorial path) ===")
     _emit(
         lines,
-        "  (telescope quality is after two-plane recovery, as used by the pose "
-        "fit; probe is raw)",
+        "  (counts come from PoseFitter._decode_cluster's own DecodeReport, "
+        "not a separate re-derivation)",
     )
+    running = n_coinc
+    for reason in _GATE_ORDER:
+        n = gate_counts[reason]
+        running -= n
+        _emit(lines, f"  rejected: {reason:<22} {n:>7}   survivors -> {running}")
     _emit(
-        lines, f"  {n_coinc} coincidences x 3 telescope planes = {n_coinc * 3} readings"
+        lines,
+        f"  accepted (fed to pose optimizer)         {gate_counts['accepted']:>7}",
     )
-    for k, q in enumerate(tel_hit_q):
-        parts = "   ".join(f"{qn} {q[qn]}" for qn in _HIT_QUALITIES)
-        _emit(lines, f"  Plane {k}    {parts}")
-    _emit(lines, f"  {n_coinc} coincidences x 1 probe plane = {n_coinc} readings")
-    prb_parts = "   ".join(f"{q} {prb_hit_q[q]}" for q in _HIT_QUALITIES)
-    _emit(lines, f"  Probe      {prb_parts}")
+    _emit(lines)
+    _emit(lines, "  Telescope per-plane candidate-count distribution:")
+    for k in range(3):
+        parts = "   ".join(f"{label} {cand_dist[k][label]}" for label in _CAND_BUCKETS)
+        _emit(lines, f"    Plane {k}    {parts}")
+    _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
+    prb_parts = "   ".join(f"{q} {prb_q_at_decode[q]}" for q in ("golden", "cluster"))
+    _emit(lines, f"    {prb_parts}")
+    if chi2_n:
+        mean = chi2_sum / chi2_n
+        var = max(chi2_sumsq / chi2_n - mean * mean, 0.0)
+        _emit(
+            lines,
+            f"  Winning-triple χ² (accepted + probe_quality-rejected): "
+            f"mean={mean:.3f}  std={math.sqrt(var):.3f}  n={chi2_n}",
+        )
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ from monrad.stage3 import (
     decode_position,
     disambiguate_telescope_hits,
     recover_efficiency_hits,
+    reconstruct_plane_candidates,
     Hit,
 )
 from monrad.synth import generate, F0, Z_TEL, STRIP_MM
@@ -517,3 +518,112 @@ class TestCandidatesPopulated:
         assert h.candidates_x is not None and len(h.candidates_x) > 0
         # Resolved axis: kept as one golden candidate at channel 11, width 1.
         assert h.candidates_y == [(11.0, 1)]
+
+
+# ── Tests for reconstruct_plane_candidates ─────────────────────────────────
+
+
+class TestPlaneCandidates:
+    """
+    reconstruct_plane_candidates() enumerates per-plane candidate (x, y)
+    positions instead of collapsing each plane to a single resolved Hit —
+    the basis of the Stage 5 combinatorial track finder.
+    """
+
+    def _write_block(self, tmp_path, name, word, n_cols=1):
+        import struct
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / name
+        bin_path.write_bytes(raw)
+        return bin_path
+
+    def test_mirror_fold_axis_yields_multiple_candidates(self, tmp_path):
+        """
+        X is mirror-fold ambiguous: ribbon bits {2, 7} and fiber bits {3, 6}
+        both fire (the folded-fiber MAROC wiring, DESIGN.md §10), giving 4
+        ribbon×fiber combinations.  Y is golden (ribbon=1, fiber=1 → ch=11).
+        Expect exactly the 4 X-candidates × 1 Y-candidate = 4 points.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(planes) == 1
+        cands = planes[0]
+        assert len(cands) == 4
+
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        expected_chs = [10 * r + f for r in (2, 7) for f in (3, 6)]
+        assert x_mm_set == {(ch + 0.5) * STRIP_MM for ch in expected_chs}
+        for c in cands:
+            assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+            assert c.sigma_x == pytest.approx(_SIGMA_GOLD)
+            assert c.sigma_y == pytest.approx(_SIGMA_GOLD)
+
+    def test_cap_limits_candidate_count(self, tmp_path):
+        """
+        Both axes mirror-fold ambiguous → 4×4 = 16 candidate points, all of
+        equal compactness (width 1 on each axis), so the cap keeps exactly
+        max_per_plane of them.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = (1 << 1) | (1 << 8)
+        y_fib = (1 << 1) | (1 << 8)
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold_both.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, max_per_plane=8
+        )
+        assert len(planes[0]) == 8
+
+    def test_invalid_plane_returns_empty_list(self, tmp_path):
+        """X_ribbon=0 (no ribbon channel fired) → invalid → empty list."""
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 0
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "invalid.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert planes == [[]]
+
+    def test_golden_plane_yields_one_candidate(self, tmp_path):
+        """A clean golden hit on both axes yields exactly one candidate."""
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "golden.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        planes = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(planes[0]) == 1
+        c = planes[0][0]
+        assert c.x_mm == pytest.approx((23 + 0.5) * STRIP_MM)
+        assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)

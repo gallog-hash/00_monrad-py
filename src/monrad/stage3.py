@@ -89,6 +89,45 @@ def _read_block(
     return head + tail
 
 
+def _or_masks(
+    words: list[int],
+    col: int,
+    n_cols: int,
+    tot_thresh: int = 1,
+) -> tuple[int, int]:
+    """
+    OR the X/Y 20-bit fields for one column across the 16-row block,
+    keeping only bits that fired in >= tot_thresh of the 16 rows.
+
+    tot_thresh=1 is a plain bitwise OR (DESIGN.md §5.1); tot_thresh>1 filters
+    single-row noise spikes via a per-bit TOT count, identical to the
+    count-path in decode_position().
+    """
+    if tot_thresh <= 1:
+        x_or = 0
+        y_or = 0
+        for row in range(16):
+            w = words[row * n_cols + col]
+            y_or |= w & 0xFFFFF
+            x_or |= (w >> 32) & 0xFFFFF
+        return x_or, y_or
+
+    x_counts = [0] * 20
+    y_counts = [0] * 20
+    for row in range(16):
+        w = words[row * n_cols + col]
+        y_bits = w & 0xFFFFF
+        x_bits = (w >> 32) & 0xFFFFF
+        for bit in range(20):
+            if (x_bits >> bit) & 1:
+                x_counts[bit] += 1
+            if (y_bits >> bit) & 1:
+                y_counts[bit] += 1
+    x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
+    y_or = sum((1 << bit) for bit in range(20) if y_counts[bit] >= tot_thresh)
+    return x_or, y_or
+
+
 def _tot_weighted_centroid(
     candidates: list[int],
     ribbon_counts: list[int],
@@ -204,22 +243,17 @@ def decode_position(
     rather than checking for None.
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
-    use_counts = tot_thresh > 1 or tot_weights
 
     hits: list[Hit | None] = []
     for col in range(n_cols):
-        if not use_counts:
-            # Fast path: simple OR (original behaviour) — DESIGN.md §5.1
-            x_or = 0
-            y_or = 0
-            for row in range(16):
-                w = words[row * n_cols + col]
-                y_or |= w & 0xFFFFF
-                x_or |= (w >> 32) & 0xFFFFF
+        if not tot_weights:
+            # Fast path: OR (with threshold if requested) — DESIGN.md §5.1
+            x_or, y_or = _or_masks(words, col, n_cols, tot_thresh)
             x_counts_col = None
             y_counts_col = None
         else:
-            # Count-path: accumulate per-bit TOT counts across 16 rows.
+            # Count-path: accumulate per-bit TOT counts across 16 rows, needed
+            # for weighted centroids (_tot_weighted_centroid below).
             x_counts_col = [0] * 20
             y_counts_col = [0] * 20
             for row in range(16):
@@ -238,9 +272,6 @@ def decode_position(
             y_or = sum(
                 (1 << bit) for bit in range(20) if y_counts_col[bit] >= tot_thresh
             )
-            if not tot_weights:
-                x_counts_col = None
-                y_counts_col = None
 
         # Validity prefilter — DESIGN.md §5.2
         valid, _ = BinDecoder._is_valid(x_or, y_or)
@@ -293,6 +324,69 @@ def decode_position(
         hits.append(Hit(x_mm, y_mm, sx, sy, quality))
 
     return hits
+
+
+class PlaneCandidate(NamedTuple):
+    x_mm: float
+    y_mm: float
+    sigma_x: float
+    sigma_y: float
+
+
+def reconstruct_plane_candidates(
+    pos_ref: PosRef,
+    pos_paths: list[Path],
+    n_cols: int,
+    max_per_plane: int = 8,
+    tot_thresh: int = 1,
+) -> list[list[PlaneCandidate]]:
+    """
+    Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
+    instead of collapsing each plane to a single resolved Hit.
+
+    Each plane's candidate list is the Cartesian product of its X-axis and
+    Y-axis candidates (`_axis_candidates`): one candidate for a golden/
+    cluster axis, the full ribbon×fiber mirror-fold cross-product for an
+    ambiguous one.  An invalid plane (saturated half, or zero ribbon
+    channel) yields an empty list.  The product is capped at
+    `max_per_plane`, keeping the most compact candidates first (smallest
+    width_x + width_y, ties broken by channel) — used by the Stage 5
+    combinatorial track finder in place of a single resolved Hit per plane.
+
+    tot_thresh mirrors decode_position's OR-mask threshold so the masks fed
+    to candidate enumeration match the resolved decode path exactly.
+    TOT-weighting (tot_weights) is deferred — not supported here.
+    """
+    words = _read_block(pos_paths, pos_ref, n_cols)
+
+    planes: list[list[PlaneCandidate]] = []
+    for col in range(n_cols):
+        x_or, y_or = _or_masks(words, col, n_cols, tot_thresh)
+
+        valid, _ = BinDecoder._is_valid(x_or, y_or)
+        if not valid:
+            planes.append([])
+            continue
+
+        cands_x = _axis_candidates(x_or)
+        cands_y = _axis_candidates(y_or)
+
+        points = [(wx + wy, cx, cy, wx, wy) for cx, wx in cands_x for cy, wy in cands_y]
+        points.sort(key=lambda p: p[:3])
+
+        planes.append(
+            [
+                PlaneCandidate(
+                    x_mm=(cx + 0.5) * _STRIP_MM,
+                    y_mm=(cy + 0.5) * _STRIP_MM,
+                    sigma_x=(_STRIP_MM * wx) / math.sqrt(12),
+                    sigma_y=(_STRIP_MM * wy) / math.sqrt(12),
+                )
+                for _, cx, cy, wx, wy in points[:max_per_plane]
+            ]
+        )
+
+    return planes
 
 
 def disambiguate_telescope_hits(
