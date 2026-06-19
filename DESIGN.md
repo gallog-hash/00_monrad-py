@@ -12,9 +12,9 @@ against real data before code is finalised. Each section includes both the
 the algorithm can be made with full context.
 
 The reference decoders for the on-disk formats are
-`decode_header.py`, `decode_gps.py`, and `decode_bin.py`. This document treats
-their bit-level behaviour as authoritative; if anything stated here disagrees
-with the scripts, the scripts win.
+`decoders/header.py`, `decoders/gps.py`, and `decoders/position.py`. This
+document treats their bit-level behaviour as authoritative; if anything
+stated here disagrees with the scripts, the scripts win.
 
 > **Note.** This document incorporates the streaming redesign previously
 > described in `DESIGN_UPDATE.md`. The algorithms are unchanged; the
@@ -65,7 +65,7 @@ A small INI-like text file with bracketed module sections (`[J11]`, `[GPS]`,
   all detectors.
 - The **GPS string** in the `[GPS]` section, written as latin-1 with `\XX` hex
   escapes for non-printable bytes. This is a UBX-TIM-TM2 binary frame from
-  the receiver, decoded by `decode_ubx_tm2()` in `decode_header.py`. There is
+  the receiver, decoded by `decode_ubx_tm2()` in `decoders/header.py`. There is
   exactly **one such GPS string per acquisition**, capturing the absolute UTC
   time of one TIMEPULSE rising edge near the start of the run, plus an
   accuracy estimate `accEst` (in ns). Typical `accEst` is 20–50 ns.
@@ -399,7 +399,7 @@ wrong; halt and report.
 A column is **invalid** if any of the four 10-bit halves of the OR equals
 1023 (all bits set, indicating channel saturation), or if either ribbon half
 is zero (no ribbon channel fired, so no coordinate can be recovered). This
-matches the existing logic in `decode_bin.py::_is_valid`.
+matches the existing logic in `decoders/position.py::BinDecoder._is_valid`.
 
 ### 6.4 Hit reconstruction
 
