@@ -56,15 +56,8 @@ Expected console output (example values):
         Plane 2    invalid(0) 9   resolved(1) 462   ambiguous(2+) 52
       Probe hit quality (coincidences that reached probe decode):
         golden 410   cluster 91
-      Winning-triple χ² (accepted + probe_quality-rejected): mean=0.421  std=0.612  n=500
-      Winning-triple per-plane quality (candidate the χ² search picked):
-        Plane 0    golden 460   cluster 40
-        Plane 1    golden 455   cluster 45
-        Plane 2    golden 462   cluster 38
-      Winning-triple per-plane TOT score (tot_x + tot_y, ribbon×fiber):
-        Plane 0    mean=412.3  std=58.1  n=500
-        Plane 1    mean=405.7  std=61.4  n=500
-        Plane 2    mean=409.0  std=59.9  n=500
+      Winning-triple χ², passed cut (accepted + probe_quality-rejected): mean=0.42  std=0.61  n=491
+      Winning-triple χ², failed cut (chi2_track_cut, best of a noisy search): mean=182.0  std=210.4  n=20
 
     === Stage 5: Probe pose fit ===
       t_x   =  +51.3 ±  1.2 mm
@@ -81,7 +74,6 @@ If stage 5 has too few coincidences:
 """
 
 import argparse
-import csv
 import math
 import sys
 from collections import Counter
@@ -98,8 +90,8 @@ from monrad.stage1 import (
 )
 from monrad.stage2 import coincidence_stream
 from monrad.stage3 import decode_position
-from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter
+from monrad.stage4 import AlignmentAccumulator, AlignmentCorrection
+from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
 
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # Probe Hit.quality values (stage3.Hit), in canonical order, for the probe
@@ -107,6 +99,10 @@ _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # plane, so the table must list them all — printing only golden/cluster
 # silently drops the unresolved/invalid rejections.
 _PRB_QUALITY_ORDER = ("golden", "cluster", "efficiency", "unresolved", "invalid")
+# Telescope active area (monrad.synth.N_TEL * monrad.synth.STRIP_MM), used
+# only to draw plane footprints in the 3D plot — not a pipeline parameter.
+_TEL_SIZE_MM = 99 * 10.0
+_PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe footprint
 
 
 def _parse_args() -> argparse.Namespace:
@@ -158,14 +154,12 @@ def _parse_args() -> argparse.Namespace:
         "default for the combinatorial path; pass --no-tot-weights to disable.",
     )
     p.add_argument(
-        "--decode-csv",
-        default=None,
-        type=Path,
-        metavar="PATH",
-        help="Write one row per coincidence that reached the χ² triple search "
-        "(both passed and failed the χ² cut) with per-plane cluster count, "
-        "size, TOT weight and the winning-triple χ² — for offline study of "
-        "how cluster characteristics correlate with track quality.",
+        "--plot",
+        action="store_true",
+        default=False,
+        help="Save an interactive 3D plot of the telescope planes, the fitted "
+        "probe plane, and the inlier tracks to <out>/pose_3d.html "
+        "(requires plotly; no-op if stage 5 is skipped).",
     )
     return p.parse_args()
 
@@ -205,15 +199,126 @@ def _cand_bucket(n: int) -> str:
     return "ambiguous(2+)"
 
 
-def _pearson(
-    n: float, sx: float, sy: float, sxx: float, syy: float, sxy: float
-) -> float:
-    """Pearson r from streaming sums; NaN when either variable has no spread."""
-    cov = n * sxy - sx * sy
-    vx = n * sxx - sx * sx
-    vy = n * syy - sy * sy
-    denom = math.sqrt(vx * vy)
-    return cov / denom if denom > 0 else math.nan
+def _plot_pose_3d(
+    pose: PoseResult,
+    alignment: AlignmentCorrection,
+    z_tel: np.ndarray,
+    out_path: Path,
+    show: bool = False,
+) -> None:
+    """
+    Save a self-contained, interactive 3D plot (rotate/zoom/pan/hover) of the
+    telescope planes, the fitted probe plane, and the inlier tracks
+    connecting them, as an HTML file viewable in any browser without
+    matplotlib/Python installed. If show is True, also open it in a browser
+    tab — Plotly's fig.show() spawns the tab and returns immediately, so it
+    never blocks the rest of the pipeline.
+
+    Telescope planes are drawn at the nominal [0, _TEL_SIZE_MM]^2 footprint
+    in the alignment-corrected common frame — the same frame the pose fit
+    itself works in (PoseFitter._decode_cluster subtracts each plane's
+    delta_x/delta_y before fitting), so no per-plane offset is drawn. The
+    probe footprint is inferred from the inlier hit spread since its true
+    channel count is not known a priori (DESIGN.md "Probe active area
+    inference").
+    """
+    import plotly.graph_objects as go
+
+    inliers = pose.inliers
+    z_corr = alignment.corrected_z_tel(z_tel)
+
+    traces = []
+
+    # ── Telescope planes ────────────────────────────────────────────────
+    square_x = [0.0, _TEL_SIZE_MM, _TEL_SIZE_MM, 0.0, 0.0]
+    square_y = [0.0, 0.0, _TEL_SIZE_MM, _TEL_SIZE_MM, 0.0]
+    for k, z in enumerate(z_corr):
+        traces.append(
+            go.Scatter3d(
+                x=square_x,
+                y=square_y,
+                z=[float(z)] * 5,
+                mode="lines",
+                line=dict(color="steelblue", width=4),
+                name=f"Plane {k}",
+            )
+        )
+
+    # ── Probe plane (footprint from the inlier hit spread, plus margin) ──
+    c, s = math.cos(pose.theta), math.sin(pose.theta)
+    u_arr = np.array([co.u for co in inliers])
+    v_arr = np.array([co.v for co in inliers])
+    u_lo, u_hi = u_arr.min() - _PLOT_PAD_MM, u_arr.max() + _PLOT_PAD_MM
+    v_lo, v_hi = v_arr.min() - _PLOT_PAD_MM, v_arr.max() + _PLOT_PAD_MM
+    local_u = [u_lo, u_hi, u_hi, u_lo, u_lo]
+    local_v = [v_lo, v_lo, v_hi, v_hi, v_lo]
+    probe_x = [pose.t_x + u * c - v * s for u, v in zip(local_u, local_v)]
+    probe_y = [pose.t_y + u * s + v * c for u, v in zip(local_u, local_v)]
+    traces.append(
+        go.Scatter3d(
+            x=probe_x,
+            y=probe_y,
+            z=[pose.z_p] * 5,
+            mode="lines",
+            line=dict(color="crimson", width=4),
+            name="Probe",
+        )
+    )
+
+    # ── Inlier tracks, passing through each telescope plane and the probe ─
+    # Pack all disconnected segments into one trace, separated by None.
+    z_pts = np.sort(np.append(z_corr, pose.z_p))  # (4,)
+    a_x = np.array([co.a_x for co in inliers])
+    b_x = np.array([co.b_x for co in inliers])
+    a_y = np.array([co.a_y for co in inliers])
+    b_y = np.array([co.b_y for co in inliers])
+    xs_all = a_x[:, None] + b_x[:, None] * z_pts[None, :]  # (n_inliers, 4)
+    ys_all = a_y[:, None] + b_y[:, None] * z_pts[None, :]
+
+    track_x: list[float | None] = []
+    track_y: list[float | None] = []
+    track_z: list[float | None] = []
+    for xs, ys in zip(xs_all, ys_all):
+        track_x.extend([*xs.tolist(), None])
+        track_y.extend([*ys.tolist(), None])
+        track_z.extend([*z_pts.tolist(), None])
+    traces.append(
+        go.Scatter3d(
+            x=track_x,
+            y=track_y,
+            z=track_z,
+            mode="lines",
+            line=dict(color="gray", width=1),
+            opacity=0.4,
+            name="Inlier tracks",
+            hoverinfo="skip",
+        )
+    )
+    traces.append(
+        go.Scatter3d(
+            x=xs_all.ravel(),
+            y=ys_all.ravel(),
+            z=np.tile(z_pts, len(inliers)),
+            mode="markers",
+            marker=dict(color="darkorange", size=2, opacity=0.5),
+            name="Track hits",
+        )
+    )
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="x  [mm]",
+            yaxis_title="y  [mm]",
+            zaxis_title="z  [mm]",
+            aspectmode="data",
+        ),
+        title=f"Probe pose fit — {len(inliers)} inlier tracks",
+    )
+    fig.write_html(out_path)
+
+    if show:
+        fig.show()
 
 
 def main() -> None:
@@ -224,7 +329,6 @@ def main() -> None:
     z_tel = np.array(args.z_tel)
     tot_thresh: int = args.tot_thresh
     tot_weights: bool = args.tot_weights
-    decode_csv: Path | None = args.decode_csv
 
     lines: list[str] = []
 
@@ -360,123 +464,28 @@ def main() -> None:
     gate_counts: Counter = Counter()
     cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
     prb_q_at_decode: Counter = Counter()
-    # The winning triple is reported for every cluster that reached the χ²
-    # search, both ones that then passed the <_CHI2_TRACK cut ("accepted"/
+    # The winning triple's χ² is reported for every cluster that reached the
+    # χ² search, both ones that then passed the <_CHI2_TRACK cut ("accepted"/
     # "probe_quality") and ones that didn't ("chi2_track_cut" — the best of
-    # a noisy candidate search, can be huge/low-quality). Track pass/fail
-    # separately throughout: conflating them buries the post-cut population
-    # (which should look like genuine tracks) under the much larger,
-    # much noisier rejected pool.
-    win_quality = {
-        "pass": [Counter(), Counter(), Counter()],
-        "fail": [Counter(), Counter(), Counter()],
-    }
-    tot_n = {"pass": [0, 0, 0], "fail": [0, 0, 0]}
-    tot_sum = {"pass": [0.0, 0.0, 0.0], "fail": [0.0, 0.0, 0.0]}
-    tot_sumsq = {"pass": [0.0, 0.0, 0.0], "fail": [0.0, 0.0, 0.0]}
+    # a noisy candidate search, can be huge). Track pass/fail separately:
+    # conflating them buries the post-cut population (which should look like
+    # genuine tracks) under the much larger, much noisier rejected pool.
     chi2_n = {"pass": 0, "fail": 0}
     chi2_sum = {"pass": 0.0, "fail": 0.0}
     chi2_sumsq = {"pass": 0.0, "fail": 0.0}
-    # Per-plane distribution of the number of contiguous fired-channel runs
-    # ("clusters") on each axis — independent of which candidate the search
-    # picked, so reported for every cluster that reached candidate enumeration.
-    clu_dist_x: list[Counter] = [Counter(), Counter(), Counter()]
-    clu_dist_y: list[Counter] = [Counter(), Counter(), Counter()]
-    # Streaming sums for Pearson r between the winning triple's χ² and its
-    # aggregate cluster size (Σ widths) / weight (Σ TOT), for the passed-cut
-    # population and for all χ²-searched coincidences (pass + fail).
-    corr = {
-        grp: dict.fromkeys(
-            ("n", "sc", "scc", "ss", "sss", "scs", "sw", "sww", "scw"), 0.0
-        )
-        for grp in ("pass", "all")
-    }
-
-    # Per-coincidence CSV dump for offline cluster/χ² correlation studies.
-    csv_file = None
-    csv_writer = None
-    if decode_csv is not None:
-        decode_csv.parent.mkdir(parents=True, exist_ok=True)
-        csv_file = decode_csv.open("w", newline="")
-        csv_writer = csv.writer(csv_file)
-        header = ["reason", "passed_cut", "chi2", "prb_quality"]
-        for k in range(3):
-            header += [
-                f"n_clu_x_{k}",
-                f"n_clu_y_{k}",
-                f"width_x_{k}",
-                f"width_y_{k}",
-                f"tot_x_{k}",
-                f"tot_y_{k}",
-                f"quality_{k}",
-            ]
-        csv_writer.writerow(header)
 
     def _on_decode(r: DecodeReport) -> None:
         gate_counts[r.reason] += 1
         if r.cand_counts is not None:
             for k in range(3):
                 cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
-        if r.cluster_counts is not None:
-            for k in range(3):
-                clu_dist_x[k][_cand_bucket(r.cluster_counts[k][0])] += 1
-                clu_dist_y[k][_cand_bucket(r.cluster_counts[k][1])] += 1
         if r.prb_quality is not None:
             prb_q_at_decode[r.prb_quality] += 1
         bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
-        if r.winning_quality is not None:
-            for k in range(3):
-                win_quality[bucket][k][r.winning_quality[k]] += 1
-        if r.winning_tot is not None:
-            for k in range(3):
-                tot = r.winning_tot[k][0] + r.winning_tot[k][1]
-                tot_n[bucket][k] += 1
-                tot_sum[bucket][k] += tot
-                tot_sumsq[bucket][k] += tot * tot
         if r.chi2 is not None:
             chi2_n[bucket] += 1
             chi2_sum[bucket] += r.chi2
             chi2_sumsq[bucket] += r.chi2 * r.chi2
-        if (
-            r.chi2 is not None
-            and r.winning_width is not None
-            and r.winning_tot is not None
-        ):
-            size = float(sum(wx + wy for wx, wy in r.winning_width))
-            weight = float(sum(tx + ty for tx, ty in r.winning_tot))
-            groups = ("all", "pass") if bucket == "pass" else ("all",)
-            for grp in groups:
-                acc = corr[grp]
-                acc["n"] += 1
-                acc["sc"] += r.chi2
-                acc["scc"] += r.chi2 * r.chi2
-                acc["ss"] += size
-                acc["sss"] += size * size
-                acc["scs"] += r.chi2 * size
-                acc["sw"] += weight
-                acc["sww"] += weight * weight
-                acc["scw"] += r.chi2 * weight
-        if csv_writer is not None and r.winning_width is not None:
-            cc = r.cluster_counts or ((0, 0), (0, 0), (0, 0))
-            wt = r.winning_tot or ((0, 0), (0, 0), (0, 0))
-            wq = r.winning_quality or ("", "", "")
-            row: list = [
-                r.reason,
-                int(r.reason != "chi2_track_cut"),
-                f"{r.chi2:.6g}" if r.chi2 is not None else "",
-                r.prb_quality or "",
-            ]
-            for k in range(3):
-                row += [
-                    cc[k][0],
-                    cc[k][1],
-                    r.winning_width[k][0],
-                    r.winning_width[k][1],
-                    wt[k][0],
-                    wt[k][1],
-                    wq[k],
-                ]
-            csv_writer.writerow(row)
 
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -502,9 +511,6 @@ def main() -> None:
         fitter.add(cluster)
 
     pose = fitter.flush()
-
-    if csv_file is not None:
-        csv_file.close()
 
     # ── Print stage 2 ────────────────────────────────────────────────────
     mean_sz = (total_cluster_size / n_coinc) if n_coinc else 0.0
@@ -546,16 +552,6 @@ def main() -> None:
     for k in range(3):
         parts = "   ".join(f"{label} {cand_dist[k][label]}" for label in _CAND_BUCKETS)
         _emit(lines, f"    Plane {k}    {parts}")
-    _emit(
-        lines,
-        "  Telescope per-plane cluster-count distribution "
-        "(contiguous fired-channel runs per axis):",
-    )
-    for k in range(3):
-        px = "   ".join(f"{label} {clu_dist_x[k][label]}" for label in _CAND_BUCKETS)
-        py = "   ".join(f"{label} {clu_dist_y[k][label]}" for label in _CAND_BUCKETS)
-        _emit(lines, f"    Plane {k}  x: {px}")
-        _emit(lines, f"    Plane {k}  y: {py}")
     _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
     # List every quality that actually occurred, in canonical order, so the
     # rejected buckets (unresolved / invalid) aren't hidden and the counts
@@ -577,52 +573,6 @@ def main() -> None:
                 f"  Winning-triple χ², {label}: "
                 f"mean={mean:.3f}  std={math.sqrt(var):.3f}  n={n}",
             )
-    for bucket, label in (
-        ("pass", "passed cut"),
-        ("fail", "failed cut"),
-    ):
-        _emit(lines, f"  Winning-triple per-plane quality, {label}:")
-        for k in range(3):
-            parts = "   ".join(
-                f"{q} {win_quality[bucket][k][q]}" for q in ("golden", "cluster")
-            )
-            _emit(lines, f"    Plane {k}    {parts}")
-        _emit(lines, f"  Winning-triple per-plane TOT score, {label} (tot_x + tot_y):")
-        for k in range(3):
-            n = tot_n[bucket][k]
-            if n:
-                mean_t = tot_sum[bucket][k] / n
-                var_t = max(tot_sumsq[bucket][k] / n - mean_t * mean_t, 0.0)
-                _emit(
-                    lines,
-                    f"    Plane {k}    mean={mean_t:.1f}  std={math.sqrt(var_t):.1f}  "
-                    f"n={n}",
-                )
-    _emit(
-        lines,
-        "  Winning-triple χ² vs cluster characteristics (Pearson r; "
-        "size=Σ widths, weight=Σ TOT over the 3 planes):",
-    )
-    for grp, label in (
-        ("pass", "passed cut"),
-        ("all", "all χ²-searched (pass + fail)"),
-    ):
-        acc = corr[grp]
-        n = int(acc["n"])
-        if n < 2:
-            continue
-        r_size = _pearson(
-            acc["n"], acc["sc"], acc["ss"], acc["scc"], acc["sss"], acc["scs"]
-        )
-        r_wt = _pearson(
-            acc["n"], acc["sc"], acc["sw"], acc["scc"], acc["sww"], acc["scw"]
-        )
-        _emit(
-            lines,
-            f"    {label}: r(χ²,size)={r_size:+.3f}  r(χ²,weight)={r_wt:+.3f}  n={n}",
-        )
-    if decode_csv is not None:
-        _emit(lines, f"  Per-coincidence decode CSV written to {decode_csv}")
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────
@@ -647,8 +597,17 @@ def main() -> None:
         _emit(lines, f"  z_p   = {pose.z_p:+7.1f} ± {sigma_zp:.1f} mm")
         _emit(lines, f"  n_inliers = {pose.n_inliers}")
 
-    # ── Write summary.txt ─────────────────────────────────────────────────
+    # ── Optional 3D plot ─────────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.plot:
+        if pose is None:
+            _emit(lines, "  (--plot skipped: no pose fit available)")
+        else:
+            plot_path = out_dir / "pose_3d.html"
+            _plot_pose_3d(pose, alignment, z_tel, plot_path, show=True)
+            _emit(lines, f"  3D plot written to {plot_path}")
+
+    # ── Write summary.txt ─────────────────────────────────────────────────
     summary = out_dir / "summary.txt"
     summary.write_text("\n".join(lines) + "\n")
     print(f"\nSummary written to {summary}")

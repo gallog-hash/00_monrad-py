@@ -27,5 +27,6 @@ dev = [
     "pytest>=8",
     "scipy>=1.11",
     "matplotlib>=3.7",
+    "plotly>=5.18",
     "ruff>=0.15.14",
 ]

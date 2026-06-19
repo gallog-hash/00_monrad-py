@@ -559,12 +559,9 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
-        assert len(res.candidates) == 1
-        cands = res.candidates[0]
+        assert len(res) == 1
+        cands = res[0]
         assert len(cands) == 4
-        # X mirror-folds into 2 ribbon × 2 fiber = 4 single-channel runs;
-        # Y is a single golden run.
-        assert res.cluster_counts[0] == (4, 1)
 
         x_mm_set = {round(c.x_mm, 6) for c in cands}
         expected_chs = [10 * r + f for r in (2, 7) for f in (3, 6)]
@@ -598,11 +595,7 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1, max_per_plane=8)
-        assert len(res.candidates[0]) == 8
-        # The cluster count is captured before the cap, so it stays exact
-        # (2 ribbon × 2 fiber = 4 runs per axis) even though only 8 of the
-        # 16 candidate points survive.
-        assert res.cluster_counts[0] == (4, 4)
+        assert len(res[0]) == 8
 
     def test_invalid_plane_returns_empty_list(self, tmp_path):
         """X_ribbon=0 (no ribbon channel fired) → invalid → empty list."""
@@ -618,8 +611,7 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
-        assert res.candidates == [[]]
-        assert res.cluster_counts == [(0, 0)]
+        assert res == [[]]
 
     def test_golden_plane_yields_one_candidate(self, tmp_path):
         """A clean golden hit on both axes yields exactly one candidate."""
@@ -635,17 +627,13 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
-        assert len(res.candidates[0]) == 1
-        c = res.candidates[0][0]
+        assert len(res[0]) == 1
+        c = res[0][0]
         assert c.x_mm == pytest.approx((23 + 0.5) * STRIP_MM)
         assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
         assert c.quality == "golden"
         assert c.tot_x == 16 * 16
         assert c.tot_y == 16 * 16
-        # A clean golden hit is one width-1 cluster on each axis.
-        assert c.width_x == 1
-        assert c.width_y == 1
-        assert res.cluster_counts[0] == (1, 1)
 
     def test_tot_reflects_per_bit_row_counts_and_cluster_quality(self, tmp_path):
         """
@@ -690,18 +678,14 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
-        assert len(res.candidates[0]) == 1
-        c = res.candidates[0][0]
+        assert len(res[0]) == 1
+        c = res[0][0]
 
         # ribbon bit 2: TOT=16 throughout.  fiber bit 3: TOT=16.  fiber bit 4: TOT=4.
         # tot_x = ribbon[2]*fiber[3] + ribbon[2]*fiber[4] = 16*16 + 16*4 = 320.
         assert c.tot_x == 16 * 16 + 16 * 4
         assert c.tot_y == 16 * 16
         assert c.quality == "cluster"
-        # A single 2-wide X cluster, golden (width-1) on Y.
-        assert c.width_x == 2
-        assert c.width_y == 1
-        assert res.cluster_counts[0] == (1, 1)
 
     def test_adjacent_ribbons_split_into_separate_runs(self, tmp_path):
         """
@@ -723,11 +707,9 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
-        cands = res.candidates[0]
+        cands = res[0]
         # Two X-runs × one Y-candidate = 2 points, each a 2-wide X cluster.
         assert len(cands) == 2
-        # The two gap-separated X runs count as 2 X clusters; Y is one cluster.
-        assert res.cluster_counts[0] == (2, 1)
         x_mm_set = {round(c.x_mm, 6) for c in cands}
         assert x_mm_set == {
             round((23.5 + 0.5) * STRIP_MM, 6),  # centroid of [23,24] = 23.5
@@ -735,8 +717,6 @@ class TestPlaneCandidates:
         }
         for c in cands:
             assert c.quality == "cluster"  # width 2 on X
-            assert c.width_x == 2
-            assert c.width_y == 1
             assert c.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))
 
     def test_tot_weights_shifts_cluster_centroid(self, tmp_path):
@@ -781,14 +761,12 @@ class TestPlaneCandidates:
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
-        unweighted = reconstruct_plane_candidates(ref, [bin_path], n_cols=1).candidates[
-            0
-        ][0]
+        unweighted = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)[0][0]
         assert unweighted.x_mm == pytest.approx((23.5 + 0.5) * STRIP_MM)
 
         weighted = reconstruct_plane_candidates(
             ref, [bin_path], n_cols=1, tot_weights=True
-        ).candidates[0][0]
+        )[0][0]
         assert weighted.x_mm == pytest.approx((23.2 + 0.5) * STRIP_MM)
         # Width/quality unchanged — tot_weights only moves the centroid.
         assert weighted.quality == "cluster"

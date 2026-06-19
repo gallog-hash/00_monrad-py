@@ -766,15 +766,15 @@ class TestDisambiguateOffsetSelection:
         assert corrected[1].x_mm == pytest.approx(110.0)  # corrected → right one
 
 
-class TestDecodeReportClusterMetrics:
+class TestDecodeReport:
     """
-    DecodeReport carries per-plane cluster diagnostics (cluster_counts) and the
-    winning triple's per-plane cluster size (winning_width) on top of the
-    existing quality/TOT, so run_pipeline.py can study how cluster
-    characteristics correlate with the best-triple χ².
+    DecodeReport surfaces the gate outcome (reason), the winning triple's χ²
+    and the per-plane candidate counts that PoseFitter._decode_cluster
+    actually computed, so run_pipeline.py reads the gates instead of
+    re-deriving them.
     """
 
-    def test_accepted_report_carries_cluster_metrics(self, tmp_path):
+    def test_accepted_report_carries_chi2_and_cand_counts(self, tmp_path):
         out = tmp_path / "synth"
         generate(
             out_dir=out,
@@ -815,20 +815,17 @@ class TestDecodeReportClusterMetrics:
         accepted = [r for r in reports if r.accepted]
         assert accepted, "no coincidence was accepted"
         for r in accepted:
+            assert r.reason == "accepted"
             assert r.chi2 is not None
-            assert r.cluster_counts is not None and len(r.cluster_counts) == 3
-            assert r.winning_width is not None and len(r.winning_width) == 3
-            assert r.winning_tot is not None and len(r.winning_tot) == 3
-            for k in range(3):
-                # Clean synthetic telescope hits are golden: one width-1
-                # cluster on each axis.
-                assert r.cluster_counts[k] == (1, 1)
-                assert r.winning_width[k] == (1, 1)
-                assert r.winning_tot[k][0] > 0 and r.winning_tot[k][1] > 0
+            assert r.prb_quality in ("golden", "cluster")
+            assert r.cand_counts is not None and len(r.cand_counts) == 3
+            # Clean synthetic telescope hits are golden: exactly one candidate
+            # per plane.
+            assert r.cand_counts == (1, 1, 1)
 
-    def test_metrics_absent_before_candidate_enumeration(self):
+    def test_cand_counts_absent_before_candidate_enumeration(self):
         """An ambiguous cluster is rejected before any candidate is enumerated,
-        so the per-plane cluster metrics are reported as None."""
+        so the per-plane candidate counts are reported as None."""
         reports: list[DecodeReport] = []
         fitter = PoseFitter(
             tel_z=Z_TEL,
@@ -846,6 +843,5 @@ class TestDecodeReportClusterMetrics:
         assert len(reports) == 1
         r = reports[0]
         assert r.reason == "ambiguous_cluster"
-        assert r.cluster_counts is None
-        assert r.winning_width is None
-        assert r.winning_tot is None
+        assert r.cand_counts is None
+        assert r.chi2 is None

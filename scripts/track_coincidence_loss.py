@@ -53,18 +53,12 @@ def main() -> None:
 
     reasons: Counter = Counter()
     cand_ambiguous_planes: Counter = Counter()  # per cluster: 0/1/2/3 planes len>1
-    # The winning triple is reported both for clusters that passed the
+    # The winning triple's chi2 is reported both for clusters that passed the
     # <_CHI2_TRACK cut ("accepted"/"probe_quality") and ones that didn't
     # ("chi2_track_cut" — the best of a noisy candidate search). Keep the
     # two separate throughout, or the much larger/noisier rejected pool
     # buries the post-cut stats (e.g. chi2 should sit near 0 post-cut, but
     # averaged with the rejected pool it looks like it's mean=147).
-    win_quality = {
-        "pass": [Counter(), Counter(), Counter()],
-        "fail": [Counter(), Counter(), Counter()],
-    }
-    tot_n = {"pass": [0, 0, 0], "fail": [0, 0, 0]}
-    tot_sum = {"pass": [0.0, 0.0, 0.0], "fail": [0.0, 0.0, 0.0]}
     chi2_n = {"pass": 0, "fail": 0}
     chi2_sum = {"pass": 0.0, "fail": 0.0}
 
@@ -74,13 +68,6 @@ def main() -> None:
             n_ambiguous = sum(1 for n in r.cand_counts if n > 1)
             cand_ambiguous_planes[n_ambiguous] += 1
         bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
-        if r.winning_quality is not None:
-            for k in range(3):
-                win_quality[bucket][k][r.winning_quality[k]] += 1
-        if r.winning_tot is not None:
-            for k in range(3):
-                tot_n[bucket][k] += 1
-                tot_sum[bucket][k] += r.winning_tot[k][0] + r.winning_tot[k][1]
         if r.chi2 is not None:
             chi2_n[bucket] += 1
             chi2_sum[bucket] += r.chi2
@@ -144,18 +131,6 @@ def main() -> None:
             print(
                 f"\n  Winning-triple chi2, {label}: mean={chi2_sum[bucket] / n:.3f}  n={n}"
             )
-    for bucket, label in (("pass", "passed cut"), ("fail", "failed cut")):
-        print(f"  Winning-triple per-plane quality, {label}:")
-        for k in range(3):
-            parts = "   ".join(
-                f"{q} {win_quality[bucket][k][q]}" for q in ("golden", "cluster")
-            )
-            print(f"    Plane {k}: {parts}")
-        print(f"  Winning-triple per-plane TOT score, {label} (tot_x + tot_y):")
-        for k in range(3):
-            n = tot_n[bucket][k]
-            if n:
-                print(f"    Plane {k}: mean={tot_sum[bucket][k] / n:.1f}  n={n}")
     if n_coinc:
         print(
             f"\n  Overall survival: {n_inliers}/{n_coinc} = "
