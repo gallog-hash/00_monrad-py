@@ -98,7 +98,7 @@ _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # hit-quality table.  decode_position can yield any of these for the probe
 # plane, so the table must list them all — printing only golden/cluster
 # silently drops the unresolved/invalid rejections.
-_PRB_QUALITY_ORDER = ("golden", "cluster", "efficiency", "unresolved", "invalid")
+_PRB_QUALITY_ORDER = ("golden", "cluster", "unresolved", "invalid")
 # Telescope active area (monrad.synth.N_TEL * monrad.synth.STRIP_MM), used
 # only to draw plane footprints in the 3D plot — not a pipeline parameter.
 _TEL_SIZE_MM = 99 * 10.0

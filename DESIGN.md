@@ -376,11 +376,22 @@ def decode_position(
     pos_ref: PosRef,
     pos_paths: list[Path],
     n_cols: int,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
 ) -> list[Hit | None]:
 ```
 
 `pos_ref` is received directly from the stream — no `pos_map` lookup is
-needed. Returns one `Hit | None` per plane (`n_cols` elements).
+needed. Returns one entry per plane (`n_cols` elements). In practice every
+entry is a real `Hit`: when reconstruction fails the plane is returned with
+quality `'invalid'` or `'unresolved'` rather than `None`, so callers test on
+`quality` instead of null-checking (the `Hit | None` return type is kept for
+backward compatibility).
+
+`tot_thresh` keeps only bits that fired in ≥ `tot_thresh` of the 16 block
+rows (1 = plain bitwise OR; 2–4 filters single-row noise). `tot_weights`
+weights cluster centroids by each bit's per-row TOT count (no effect on
+golden hits). Both back the `--tot-thresh` / `--tot-weights` pipeline flags.
 
 ### 6.2 Random access into `*.bin`
 
@@ -612,18 +623,39 @@ For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
 
-Before the fit, a single `unresolved` plane is recovered by the two-plane
-projection of §6.3b (the same step Stage 4 applies before its alignment
-fit): if the other two planes are `golden`/`cluster`, the line they define
-predicts plane `k`, and the nearest candidate within 1.5 strips is promoted
-to `cluster`. On real data this is the single largest source of recovered
-coincidences — most events with all three planes resolved are otherwise lost
-at the telescope-quality cut. Unlike Stage 4, the alignment is already known
-here, so the prediction and the candidate-distance test are evaluated in the
-alignment-corrected frame (`coord − δ`): the sharper prediction admits fewer
-but cleaner candidates than the raw frame, which would otherwise pass wrong
-matches that the §8.2 track-χ² cut then rejects. A coincidence is fit only if
-all three planes resolve after this step.
+**Resolving plane ambiguity — combinatorial candidate search.** A telescope
+plane is frequently *ambiguous*: the mirror-fold fiber/ribbon readout
+(§10 Deduction #4) leaves several plausible channels per axis, and the raw
+bit pattern of a true folded hit is indistinguishable from that of two
+overlapping particles. Rather than recover one plane from the other two,
+Stage 5 enumerates candidates on **all** planes and lets the geometry choose:
+
+- `reconstruct_plane_candidates()` (stage 3) returns, per plane, the list of
+  plausible `(x, y)` positions — a single candidate when both axes resolve
+  cleanly (`golden`/`cluster`), or the full ribbon × fiber cross-product
+  (capped at 16/plane) when an axis is fold-ambiguous.
+- `PoseFitter._decode_cluster` then searches the Cartesian product
+  `cands₀ × cands₁ × cands₂` of the three planes' candidate lists, evaluates
+  the weighted line fit above for **every** candidate triple, and keeps the
+  triple with the minimum line-fit χ². Discrete fold disambiguation is thus
+  folded into the same χ² the continuous track fit minimises.
+
+Two guards protect this search:
+
+- **zero-candidate plane** — if any plane yields no candidate (e.g. a
+  single-half dropout), the triple cannot be formed and the coincidence is
+  rejected.
+- **anchor plane required** (`no_anchor_plane`) — if *all three* planes are
+  multi-candidate, the search is refused. With no already-resolved plane to
+  anchor it, a genuine pile-up (two particles in one window) can minimise χ²
+  by coincidence just as a single fold-mirrored track does; the bit patterns
+  are identical, so the search cannot tell them apart. Requiring ≥ 1 resolved
+  anchor plane relaxes the old two-plane-recovery requirement of two clean
+  planes to one, while still rejecting unanchored pile-up.
+
+The winning triple is fit in the alignment-corrected frame (`coord − δ`), so
+the line fit and the χ² cut below use the corrected plane positions. A
+coincidence is fit only if a valid anchored triple survives this step.
 
 When a middle-plane tilt has been fitted, the X and Y fits use *different*
 plane `z` values: a tilted plane reports its hit at an effective
@@ -809,10 +841,12 @@ src/monrad/
     stage1.py        # reconstruct_stream(), load_header_params(),
                      # find_file_pairs(), reconstruct() [deprecated]
     stage2.py        # coincidence_stream()
-    stage3.py        # Hit, decode_position()
+    stage3.py        # Hit, GOOD_QUALITIES, decode_position(),
+                     # reconstruct_plane_candidates(), PlaneCandidate,
+                     # disambiguate_telescope_hits()
     stage4.py        # PlaneCorrection, AlignmentCorrection,
                      # AlignmentAccumulator, fit_telescope_alignment()
-    stage5.py        # Coincidence, PoseResult,
+    stage5.py        # Coincidence, DecodeReport, GATE_ORDER, PoseResult,
                      # PoseFitter, fit_probe_pose()
 ```
 
@@ -823,10 +857,12 @@ Key types:
 | `Quality` | `stage1` | GOOD / DEGRADED / UNTRUSTED |
 | `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
 | `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
-| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality)` |
+| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits |
+| `PlaneCandidate` | `stage3` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
 | `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
 | `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
 | `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
+| `DecodeReport` | `stage5` | per-cluster decode outcome (`accepted`, `reason`, …); `GATE_ORDER` is the rejection-funnel order |
 | `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
 
 
@@ -884,7 +920,7 @@ real data on first inspection:
   curve (stage 5), and the alignment drift log.  These are the primary
   human-readable outputs for deciding whether to trust the fitted parameters.
 - **Alignment curvature degeneracy.** `fit_telescope_alignment` uses the
-  two-plane predictor (§6.3b).  For z = [0, 400, 800] mm the interpolation
+  two-plane predictor (§7.3b).  For z = [0, 400, 800] mm the interpolation
   fractions are t₀ = −1, t₁ = 0.5, t₂ = 2, so the residuals satisfy
   r₀ = r₂ = x₀ − 2·x₁ + x₂ and r₁ = −r₀/2 for any dataset.  The predictor
   therefore measures only the second difference (curvature) of hit positions

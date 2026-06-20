@@ -14,7 +14,7 @@ AlignmentAccumulator
     .flush()    -> AlignmentCorrection
 
 fit_telescope_alignment(hits) -> AlignmentCorrection
-    Implements DESIGN.md §6.3 two-diagnostic approach.
+    Implements DESIGN.md §7.3 two-diagnostic approach.
 """
 
 from typing import NamedTuple
@@ -24,8 +24,8 @@ import numpy as np
 from .stage3 import Hit, disambiguate_telescope_hits
 
 _Z_TEL = np.array([0.0, 400.0, 800.0])  # mm
-_OFFSET_THRESH = 1.0  # mm  — DESIGN.md §6.4
-_ROTATION_THRESH = 1e-3  # rad — DESIGN.md §6.4
+_OFFSET_THRESH = 1.0  # mm  — DESIGN.md §7.4
+_ROTATION_THRESH = 1e-3  # rad — DESIGN.md §7.4
 _Z_THRESH = 5.0  # mm  — middle-plane Z-offset significance cut
 # Middle-plane tilt significance cut.  Set above the ~3 mrad statistical
 # floor of the b·coord regression at ~1000 tracks so oscillator/strip noise
@@ -112,7 +112,7 @@ def fit_telescope_alignment(
     """
     Fit telescope internal alignment from a batch of 3-plane hits.
 
-    Implements DESIGN.md §6.3 using two complementary diagnostics:
+    Implements DESIGN.md §7.3 using two complementary diagnostics:
 
     (a) Three-plane straight-line fit — fit x(z) and y(z) through all
         three planes and compute per-plane residuals.
@@ -220,7 +220,7 @@ class AlignmentAccumulator:
     Collects decoded 3-plane telescope hits into a buffer and fits an
     AlignmentCorrection every flush_every valid events.
 
-    Implements DESIGN_UPDATE.md §5.1.
+    Implements DESIGN.md §7.5.
     """
 
     def __init__(

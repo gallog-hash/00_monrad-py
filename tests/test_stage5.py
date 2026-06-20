@@ -501,7 +501,7 @@ class TestFoldedPoseRecovery2Plane:
     Headline win for the combinatorial track finder (DESIGN.md §10
     Deduction #4): recover the probe pose with two of three telescope
     planes mirror-fold ambiguous on every event, which the old
-    disambiguate_telescope_hits + recover_efficiency_hits path cannot do.
+    two-plane disambiguate_telescope_hits path cannot do.
     """
 
     def test_zp_within_3sigma(self, pose_result_fold_2plane):

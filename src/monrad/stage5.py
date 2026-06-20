@@ -14,7 +14,7 @@ PoseFitter
     .update_alignment(corr)     -> None
 
 fit_probe_pose(coincidences, tel_z, alignment) -> PoseResult
-    Implements DESIGN.md §7.4 four-step optimizer.
+    Implements DESIGN.md §8.4 four-step optimizer.
 """
 
 import itertools
@@ -33,8 +33,8 @@ from .stage3 import (
 )
 from .stage4 import AlignmentCorrection
 
-_MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §7.4
-_CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §7.2
+_MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §8.4
+_CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §8.2
 
 
 # ── Internal data structure ───────────────────────────────────────────────
@@ -99,7 +99,7 @@ GATE_ORDER = (
 @dataclass
 class PoseResult:
     """
-    Full output of fit_probe_pose().  Implements DESIGN.md §7.7.
+    Full output of fit_probe_pose().  Implements DESIGN.md §8.7.
 
     Parameter order in `cov`: [t_x, t_y, theta, z_p].
     """
@@ -114,7 +114,7 @@ class PoseResult:
     residuals_y: np.ndarray  # (n_inliers,) final y residuals (mm)
     n_inliers: int
     # half_params[0] = [tx, ty, theta, zp] for even-index inliers,
-    # half_params[1] = same for odd-index inliers (stratified consistency §7.7)
+    # half_params[1] = same for odd-index inliers (stratified consistency §8.7)
     half_params: np.ndarray  # (2, 4)
     inliers: list[Coincidence]  # the n_inliers Coincidences kept after the
     # Mahalanobis cut (used for the final refit) — exposed for diagnostics
@@ -322,7 +322,7 @@ def fit_probe_pose(
     alignment: AlignmentCorrection,
 ) -> PoseResult:
     """
-    Four-step probe pose optimizer.  Implements DESIGN.md §7.4.
+    Four-step probe pose optimizer.  Implements DESIGN.md §8.4.
 
     Step 1 — coarse θ scan at 1° over [−180°, 180°).
     Step 2 — diagnostic χ²(θ) curve stored in PoseResult.
@@ -468,7 +468,7 @@ def fit_probe_pose(
 class PoseFitter:
     """
     Accumulates telescope-probe coincidences and refits the probe pose
-    every refit_every new coincidences.  Implements DESIGN_UPDATE.md §6.1.
+    every refit_every new coincidences.  Implements DESIGN.md §8.8.
     """
 
     MIN_FIT = 30
@@ -576,9 +576,8 @@ class PoseFitter:
         # plane triple for the lowest-χ² straight line.  This resolves the
         # mirror-fold ambiguity globally from which combination actually
         # lies on a track, instead of needing two already-clean planes to
-        # bootstrap a third (replaces disambiguate_telescope_hits +
-        # recover_efficiency_hits in this path; see DESIGN.md §10
-        # Deduction #4 and the combinatorial-track-finder plan).
+        # bootstrap a third (replaces the two-plane disambiguate_telescope_hits
+        # recovery in this path; see DESIGN.md §8.2 and §10 Deduction #4).
         cands = reconstruct_plane_candidates(
             tel_ref,
             self.tel_pos_paths,
