@@ -65,6 +65,9 @@ Expected console output (example values):
       theta =  +17.1 ±  0.3 deg
       z_p   = +301.4 ±  4.7 mm
       n_inliers = 487
+      Probe footprint (inferred from inlier hit spread, ±15 mm margin; not a measured detector size):
+        u:  -132.4 to  +128.9 mm  (width  261.3 mm)
+        v:   -95.1 to   +99.7 mm  (height 194.8 mm)
 
 If stage 5 has too few coincidences:
 
@@ -199,6 +202,21 @@ def _cand_bucket(n: int) -> str:
     return "ambiguous(2+)"
 
 
+def _probe_footprint(pose: PoseResult) -> tuple[float, float, float, float]:
+    """
+    Padded bounding box (u_lo, u_hi, v_lo, v_hi) of the inlier hits in the
+    probe's local (u, v) frame, used as a stand-in for its true active area
+    — the probe's real channel count/extent is not known a priori (DESIGN.md
+    "Probe active area inference"), so this is a data-driven estimate, not a
+    measured detector dimension.
+    """
+    u_arr = np.array([co.u for co in pose.inliers])
+    v_arr = np.array([co.v for co in pose.inliers])
+    u_lo, u_hi = u_arr.min() - _PLOT_PAD_MM, u_arr.max() + _PLOT_PAD_MM
+    v_lo, v_hi = v_arr.min() - _PLOT_PAD_MM, v_arr.max() + _PLOT_PAD_MM
+    return float(u_lo), float(u_hi), float(v_lo), float(v_hi)
+
+
 def _plot_pose_3d(
     pose: PoseResult,
     alignment: AlignmentCorrection,
@@ -246,10 +264,7 @@ def _plot_pose_3d(
 
     # ── Probe plane (footprint from the inlier hit spread, plus margin) ──
     c, s = math.cos(pose.theta), math.sin(pose.theta)
-    u_arr = np.array([co.u for co in inliers])
-    v_arr = np.array([co.v for co in inliers])
-    u_lo, u_hi = u_arr.min() - _PLOT_PAD_MM, u_arr.max() + _PLOT_PAD_MM
-    v_lo, v_hi = v_arr.min() - _PLOT_PAD_MM, v_arr.max() + _PLOT_PAD_MM
+    u_lo, u_hi, v_lo, v_hi = _probe_footprint(pose)
     local_u = [u_lo, u_hi, u_hi, u_lo, u_lo]
     local_v = [v_lo, v_lo, v_hi, v_hi, v_lo]
     probe_x = [pose.t_x + u * c - v * s for u, v in zip(local_u, local_v)]
@@ -261,7 +276,9 @@ def _plot_pose_3d(
             z=[pose.z_p] * 5,
             mode="lines",
             line=dict(color="crimson", width=4),
-            name="Probe",
+            name="Probe (footprint inferred from inlier spread)",
+            hovertemplate="Probe footprint<br>inferred from inlier hit spread"
+            " — not a measured detector size<extra></extra>",
         )
     )
 
@@ -305,6 +322,20 @@ def _plot_pose_3d(
         )
     )
 
+    # Caption flagging the probe footprint as inferred rather than measured —
+    # placed at one corner of the drawn square so it doesn't overlap the
+    # track cloud in the middle.
+    footprint_note = dict(
+        x=probe_x[0],
+        y=probe_y[0],
+        z=pose.z_p,
+        text="Probe footprint: inferred from inlier spread, not a measured size",
+        showarrow=False,
+        font=dict(size=10, color="crimson"),
+        xanchor="left",
+        yanchor="top",
+    )
+
     fig = go.Figure(data=traces)
     fig.update_layout(
         scene=dict(
@@ -312,6 +343,7 @@ def _plot_pose_3d(
             yaxis_title="y  [mm]",
             zaxis_title="z  [mm]",
             aspectmode="data",
+            annotations=[footprint_note],
         ),
         title=f"Probe pose fit — {len(inliers)} inlier tracks",
     )
@@ -596,6 +628,20 @@ def main() -> None:
         )
         _emit(lines, f"  z_p   = {pose.z_p:+7.1f} ± {sigma_zp:.1f} mm")
         _emit(lines, f"  n_inliers = {pose.n_inliers}")
+        u_lo, u_hi, v_lo, v_hi = _probe_footprint(pose)
+        _emit(
+            lines,
+            f"  Probe footprint (inferred from inlier hit spread, "
+            f"±{_PLOT_PAD_MM:.0f} mm margin; not a measured detector size):",
+        )
+        _emit(
+            lines,
+            f"    u: {u_lo:+7.1f} to {u_hi:+7.1f} mm  (width  {u_hi - u_lo:6.1f} mm)",
+        )
+        _emit(
+            lines,
+            f"    v: {v_lo:+7.1f} to {v_hi:+7.1f} mm  (height {v_hi - v_lo:6.1f} mm)",
+        )
 
     # ── Optional 3D plot ─────────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
