@@ -17,11 +17,18 @@ from pathlib import Path
 from typing import Literal, NamedTuple, Sequence
 
 from .stage1 import PosRef
-from .decoders.position import BinDecoder
+from .decoders.position import (
+    BinDecoder,
+    POS_COORD_MASK,
+    POS_X_SHIFT,
+    POS_HALF_BITS,
+    split_half,
+    combine_channel,
+    split_channel,
+)
 
 _STRIP_MM = 10.0  # mm per channel strip — DESIGN.md §6.5
-_N = 10  # fiber × ribbon encoding multiplier
-_FULL_HALF = 0x3FF  # 10-bit all-ones — a saturated fiber/ribbon half
+_N = POS_HALF_BITS  # fiber × ribbon encoding multiplier
 
 # Qualities that count as a usable hit for the pose fit.
 GOOD_QUALITIES = ("golden", "cluster")
@@ -93,8 +100,8 @@ def _bit_counts(words: list[int], col: int, n_cols: int) -> tuple[list[int], lis
     y_counts = [0] * 20
     for row in range(16):
         w = words[row * n_cols + col]
-        y_bits = w & 0xFFFFF
-        x_bits = (w >> 32) & 0xFFFFF
+        y_bits = w & POS_COORD_MASK
+        x_bits = (w >> POS_X_SHIFT) & POS_COORD_MASK
         for bit in range(20):
             if (x_bits >> bit) & 1:
                 x_counts[bit] += 1
@@ -122,8 +129,8 @@ def _or_masks(
         y_or = 0
         for row in range(16):
             w = words[row * n_cols + col]
-            y_or |= w & 0xFFFFF
-            x_or |= (w >> 32) & 0xFFFFF
+            y_or |= w & POS_COORD_MASK
+            x_or |= (w >> POS_X_SHIFT) & POS_COORD_MASK
         return x_or, y_or
 
     x_counts, y_counts = _bit_counts(words, col, n_cols)
@@ -143,7 +150,8 @@ def _tot_weighted_centroid(
     Each candidate ch = 10*r + f gets weight = ribbon_counts[r] * fiber_counts[f].
     Falls back to the unweighted mean if all weights are zero.
     """
-    weights = [ribbon_counts[ch // _N] * fiber_counts[ch % _N] for ch in candidates]
+    rf = [split_channel(ch, _N) for ch in candidates]
+    weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
     total = sum(weights)
     if total == 0:
         return sum(candidates) / len(candidates)
@@ -156,8 +164,7 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
     'unresolved'.  centroid_ch is in channel units; width is the number of
     combined channels in the hypothesis, used to compute sigma on selection.
     """
-    fiber_half = (field_or >> _N) & 0x3FF
-    ribbon_half = field_or & 0x3FF
+    fiber_half, ribbon_half = split_half(field_or)
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
@@ -170,7 +177,7 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
             # Adjacent ribbons are N apart, so e.g. fiber {3,4} × ribbon {2,3}
             # yields two candidates [23,24] and [33,34], not one width-4 blob
             # straddling the 25..32 gap.
-            chs = sorted(_N * r + f for r in rc for f in fc)
+            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
             run = [chs[0]]
             for ch in chs[1:]:
                 if ch == run[-1] + 1:
@@ -200,8 +207,7 @@ def _axis_candidates_with_tot(
                   falling back to the unweighted mean when all weights are
                   zero.  Width-1 candidates are unaffected.
     """
-    fiber_half = (field_or >> _N) & 0x3FF
-    ribbon_half = field_or & 0x3FF
+    fiber_half, ribbon_half = split_half(field_or)
     ribbon_counts = counts[:_N]
     fiber_counts = counts[_N:]
 
@@ -211,7 +217,8 @@ def _axis_candidates_with_tot(
     candidates: list[tuple[float, int, int]] = []
 
     def _emit(run: list[int]) -> None:
-        weights = [ribbon_counts[c // _N] * fiber_counts[c % _N] for c in run]
+        rf = [split_channel(c, _N) for c in run]
+        weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
         tot = sum(weights)
         if tot_weights and tot > 0:
             centroid = sum(w * c for w, c in zip(weights, run)) / tot
@@ -230,7 +237,7 @@ def _axis_candidates_with_tot(
             # blob straddling the 25..32 gap.  Split into maximal contiguous
             # runs (mirroring _reconstruct_coord's contiguity rule, but
             # enumerating each run instead of rejecting the whole pair).
-            chs = sorted(_N * r + f for r in rc for f in fc)
+            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
             run = [chs[0]]
             for ch in chs[1:]:
                 if ch == run[-1] + 1:
@@ -259,8 +266,7 @@ def _decode_axis(
                  (bit_counts[0..9] = ribbon, bit_counts[10..19] = fiber).
                  When provided, cluster centroids are TOT-weighted.
     """
-    fiber_half = (field_or >> _N) & 0x3FF
-    ribbon_half = field_or & 0x3FF
+    fiber_half, ribbon_half = split_half(field_or)
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)

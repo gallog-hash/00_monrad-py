@@ -22,6 +22,37 @@ import struct
 import numpy as np
 import sys
 
+POS_COORD_BITS = 20
+POS_COORD_MASK = (1 << POS_COORD_BITS) - 1  # 0xFFFFF
+POS_X_SHIFT = 32
+POS_GEN_SHIFT = 52
+POS_GEN_MASK = 0x7FF
+POS_HALF_BITS = 10
+POS_HALF_MASK = (1 << POS_HALF_BITS) - 1  # 0x3FF
+
+
+def unpack_position_word(value: int) -> tuple[int, int, int]:
+    """Return (x, y, gen) extracted from one position u64 word."""
+    y = value & POS_COORD_MASK
+    x = (value >> POS_X_SHIFT) & POS_COORD_MASK
+    gen = (value >> POS_GEN_SHIFT) & POS_GEN_MASK
+    return x, y, gen
+
+
+def split_half(field: int) -> tuple[int, int]:
+    """Return (fiber, ribbon) 10-bit halves of a 20-bit X or Y field."""
+    return (field >> POS_HALF_BITS) & POS_HALF_MASK, field & POS_HALF_MASK
+
+
+def combine_channel(ribbon: int, fiber: int, n: int = POS_HALF_BITS) -> int:
+    """Combine a (ribbon, fiber) pair into one channel index."""
+    return n * ribbon + fiber
+
+
+def split_channel(channel: int, n: int = POS_HALF_BITS) -> tuple[int, int]:
+    """Return (ribbon, fiber) from a combined channel index."""
+    return divmod(channel, n)
+
 
 class BinDecoder:
     """Decoder for .bin event data files."""
@@ -57,11 +88,8 @@ class BinDecoder:
 
     @staticmethod
     def _parse_u64(value: int) -> dict:
-        return {
-            "Y": value & 0xFFFFF,  # bits  0-19  (20 bits)
-            "X": (value >> 32) & 0xFFFFF,  # bits 32-51  (20 bits)
-            "GEN": (value >> 52) & 0x7FF,  # bits 52-62  (11 bits; bit 63 unused)
-        }
+        x, y, gen = unpack_position_word(value)
+        return {"Y": y, "X": x, "GEN": gen}
 
     def analyze(self):
         n_cols, n_rows, data = self.read()
@@ -125,7 +153,7 @@ class BinDecoder:
         if len(fiber_clusters) != 1 or len(ribbon_clusters) != 1:
             return None
         fc, rc = fiber_clusters[0], ribbon_clusters[0]
-        candidates = sorted(N * r + f for r in rc for f in fc)
+        candidates = sorted(combine_channel(r, f, N) for r in rc for f in fc)
         if candidates != list(range(candidates[0], candidates[0] + len(candidates))):
             return None
         return sum(candidates) / len(candidates), candidates
@@ -136,17 +164,16 @@ class BinDecoder:
         Invalid if any fiber/ribbon half of OR equals 1023 (all bits set),
         or if the ribbon half of OR is 0 (no ribbon channel fired).
         """
-        FULL = 0x3FF
-        x_fiber, x_ribbon = (x_or >> 10) & FULL, x_or & FULL
-        y_fiber, y_ribbon = (y_or >> 10) & FULL, y_or & FULL
+        x_fiber, x_ribbon = split_half(x_or)
+        y_fiber, y_ribbon = split_half(y_or)
         reasons = []
-        if x_fiber == FULL:
+        if x_fiber == POS_HALF_MASK:
             reasons.append("X_fiber=1023")
-        if x_ribbon == FULL:
+        if x_ribbon == POS_HALF_MASK:
             reasons.append("X_ribbon=1023")
-        if y_fiber == FULL:
+        if y_fiber == POS_HALF_MASK:
             reasons.append("Y_fiber=1023")
-        if y_ribbon == FULL:
+        if y_ribbon == POS_HALF_MASK:
             reasons.append("Y_ribbon=1023")
         if x_ribbon == 0:
             reasons.append("X_ribbon=0")
@@ -248,11 +275,13 @@ class BinDecoder:
                         if ((half >> k) & 1) and ((half >> (n - 1 - k)) & 1)
                     ]
 
+                x_fib, x_rib = split_half(x_or)
+                y_fib, y_rib = split_half(y_or)
                 mp = {
-                    "X_fib": _mirror_pairs((x_or >> 10) & 0x3FF),
-                    "X_rib": _mirror_pairs(x_or & 0x3FF),
-                    "Y_fib": _mirror_pairs((y_or >> 10) & 0x3FF),
-                    "Y_rib": _mirror_pairs(y_or & 0x3FF),
+                    "X_fib": _mirror_pairs(x_fib),
+                    "X_rib": _mirror_pairs(x_rib),
+                    "Y_fib": _mirror_pairs(y_fib),
+                    "Y_rib": _mirror_pairs(y_rib),
                 }
                 if any(mp.values()):
                     parts = [f"{k}:{v}" for k, v in mp.items() if v]
@@ -262,11 +291,11 @@ class BinDecoder:
                     stats["invalid"] += 1
                     continue
 
-                N = 10
-                xfc = self._find_clusters((x_or >> N) & 0x3FF)
-                xrc = self._find_clusters(x_or & 0x3FF)
-                yfc = self._find_clusters((y_or >> N) & 0x3FF)
-                yrc = self._find_clusters(y_or & 0x3FF)
+                N = POS_HALF_BITS
+                xfc = self._find_clusters(x_fib)
+                xrc = self._find_clusters(x_rib)
+                yfc = self._find_clusters(y_fib)
+                yrc = self._find_clusters(y_rib)
 
                 res_x = self._reconstruct_coord(xfc, xrc, N)
                 res_y = self._reconstruct_coord(yfc, yrc, N)

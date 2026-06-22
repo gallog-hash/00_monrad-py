@@ -21,8 +21,9 @@ from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
 
-from .decoders.gps import GPSDecoder
+from .decoders.gps import GPSDecoder, unpack_gps_word
 from .decoders.header import parse_header, decode_ubx_tm2
+from .decoders.position import unpack_position_word
 
 log = logging.getLogger(__name__)
 
@@ -97,10 +98,7 @@ def _iter_gps_records(
     """Yield (tick, gen, is_pps) from one *_GPS.bin in order."""
     _, data = GPSDecoder(str(path)).read()
     for raw in data:
-        v = int(raw)
-        tick = v & 0xFFFFFFFFFFFFF
-        gen = (v >> 52) & 0x7FF
-        flag = bool((v >> 63) & 1)
+        tick, gen, flag = unpack_gps_word(int(raw))
         yield tick, gen, flag
 
 
@@ -138,10 +136,10 @@ def _pos_file_meta(
         if n_rows == 0 or n_cols == 0:
             return n_rows, n_cols, -1, -1
         first_word = struct.unpack("<Q", fh.read(8))[0]
-        first_gen = (first_word >> 52) & 0x7FF
+        _, _, first_gen = unpack_position_word(first_word)
         fh.seek(8 + (n_rows - 1) * n_cols * 8)
         last_word = struct.unpack("<Q", fh.read(8))[0]
-        last_gen = (last_word >> 52) & 0x7FF
+        _, _, last_gen = unpack_position_word(last_word)
     return n_rows, n_cols, first_gen, last_gen
 
 
