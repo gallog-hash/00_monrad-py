@@ -380,9 +380,22 @@ class TestPoseParameterRecovery:
 # ── combinatorial track finder: recovery from fold-ambiguous data ──────────
 
 
-def _run_fold_pipeline(out, fold=False, fold_planes=None, n_tracks=_N_TRACKS):
+def _run_fold_pipeline(
+    out,
+    fold=False,
+    fold_planes=None,
+    n_tracks=_N_TRACKS,
+    fold_symmetry=1.0,
+    fold_crosstalk_rate=0.0,
+    on_decode=None,
+):
     """Generate fold-ambiguous synthetic data and run the streaming
-    pipeline through PoseFitter.flush(); return the PoseResult (or None)."""
+    pipeline through PoseFitter.flush(); return the PoseResult (or None).
+
+    fold_symmetry / fold_crosstalk_rate: forwarded to synth.generate() to
+    inject realistic (non-idealised) fold-mirror and fiber cross-talk noise
+    (DESIGN.md §10) instead of the default perfectly periodic fold pattern.
+    """
     generate(
         out_dir=out,
         t_x=_TRUE_TX,
@@ -395,6 +408,8 @@ def _run_fold_pipeline(out, fold=False, fold_planes=None, n_tracks=_N_TRACKS):
         f0=F0,
         fold=fold,
         fold_planes=fold_planes,
+        fold_symmetry=fold_symmetry,
+        fold_crosstalk_rate=fold_crosstalk_rate,
     )
     tel_dir = out / "telescope"
     prb_dir = out / "probe"
@@ -416,6 +431,7 @@ def _run_fold_pipeline(out, fold=False, fold_planes=None, n_tracks=_N_TRACKS):
         tel_pos_paths=tel_pos,
         prb_pos_paths=prb_pos,
         refit_every=n_tracks + 1,  # no auto-flush; use explicit flush()
+        on_decode=on_decode,
     )
 
     for cluster in coincidence_stream(
@@ -489,6 +505,28 @@ def pose_result_fold_2plane(tmp_path_factory):
     return pr
 
 
+@pytest.fixture(scope="module")
+def pose_result_fold_2plane_realistic(tmp_path_factory):
+    """
+    Same 2-ambiguous-plane scenario as pose_result_fold_2plane, but with
+    realistic (non-idealised) fold statistics from DESIGN.md §10 instead of
+    a perfectly periodic mirror pattern: fold_symmetry=0.85 (within the
+    documented 0.71-0.95 range) and fold_crosstalk_rate=0.02 (within the
+    documented 1.7-2.6% fiber cross-talk range).  This is the combinatorial
+    finder's real payoff per the architectural audit: messy fold data, not
+    the idealised always-both-bits pattern the other fold fixtures use.
+    """
+    out = tmp_path_factory.mktemp("synth_stage5_fold2_realistic")
+    pr = _run_fold_pipeline(
+        out,
+        fold_planes={0, 1},
+        fold_symmetry=0.85,
+        fold_crosstalk_rate=0.02,
+    )
+    assert pr is not None, "PoseFitter.flush() returned None (too few coincidences)"
+    return pr
+
+
 class TestFoldedPoseRecovery1Plane:
     """3σ recovery with one mirror-fold-ambiguous telescope plane."""
 
@@ -506,6 +544,45 @@ class TestFoldedPoseRecovery2Plane:
 
     def test_zp_within_3sigma(self, pose_result_fold_2plane):
         _assert_pose_within_3sigma(pose_result_fold_2plane)
+
+
+class TestFoldedPoseRecovery2PlaneRealisticNoise:
+    """
+    Closes the architectural-audit gap: recovers the probe pose from
+    fold-ambiguous data with realistic (DESIGN.md §10) fold-symmetry and
+    fiber cross-talk noise, not the idealised perfectly-periodic fold
+    pattern every other fold test in this module uses.
+    """
+
+    def test_zp_within_3sigma(self, pose_result_fold_2plane_realistic):
+        _assert_pose_within_3sigma(pose_result_fold_2plane_realistic)
+
+    def test_noise_model_engages(self, tmp_path_factory):
+        """
+        Guard against a silent no-op: with fold_symmetry < 1.0 and
+        fold_crosstalk_rate > 0.0, the per-plane candidate counts seen
+        across accepted coincidences must vary, unlike the idealised fold
+        pattern's fixed shape (planes 0 and 1 folded, plane 2 golden ->
+        always (4, 4, 1) candidates).  Dropped mirror partner bits shrink
+        a candidate list toward 1; cross-talk bits grow one past 4 — either
+        way, count variety is the noise model's observable fingerprint.
+        """
+        out = tmp_path_factory.mktemp("synth_stage5_fold2_realistic_report")
+        reports: list[DecodeReport] = []
+        _run_fold_pipeline(
+            out,
+            fold_planes={0, 1},
+            fold_symmetry=0.85,
+            fold_crosstalk_rate=0.02,
+            on_decode=reports.append,
+        )
+        accepted = [r for r in reports if r.accepted]
+        assert accepted, "no coincidence was accepted under realistic fold noise"
+        cand_counts_seen = {r.cand_counts for r in accepted}
+        assert len(cand_counts_seen) > 1, (
+            "candidate counts are constant across every accepted coincidence "
+            "— fold_symmetry/fold_crosstalk_rate do not appear to be engaging"
+        )
 
 
 class TestFoldedPoseRecoveryAllPlanesFails:

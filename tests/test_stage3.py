@@ -532,6 +532,51 @@ class TestPlaneCandidates:
             assert c.tot_x == 16 * 16
             assert c.tot_y == 16 * 16
 
+    def test_mirror_fold_axis_with_crosstalk_bit_degrades_gracefully(self, tmp_path):
+        """
+        X mirror-fold pair (ribbon {2, 7}, fiber {3, 6}) plus one stray
+        cross-talk fiber bit (bit 8, distinct from both 3 and 6) injected
+        into the same block — mimicking the fiber-only cross-talk DESIGN.md
+        §10 documents (1.7-2.6% on real data) landing on top of an
+        otherwise-clean fold pattern.  Y stays golden (ribbon=1, fiber=1).
+
+        The extra fiber bit turns the fiber half from 2 clusters ({3}, {6})
+        into 3 ({3}, {6}, {8}), so the ribbon×fiber cross-product grows from
+        2×2=4 to 2×3=6 candidates.  reconstruct_plane_candidates must
+        enumerate all 6 without crashing or dropping the true channels —
+        graceful degradation (more candidates), not lost data.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6) | (1 << 8)  # stray cross-talk bit
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold_crosstalk.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(res) == 1
+        cands = res[0]
+        assert len(cands) == 6
+
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        true_chs = [10 * r + f for r in (2, 7) for f in (3, 6)]
+        true_x_mm = {(ch + 0.5) * STRIP_MM for ch in true_chs}
+        crosstalk_chs = [10 * r + 8 for r in (2, 7)]
+        crosstalk_x_mm = {(ch + 0.5) * STRIP_MM for ch in crosstalk_chs}
+        # The 4 legitimate mirror-pair candidates must still be present...
+        assert true_x_mm <= x_mm_set
+        # ...alongside the 2 spurious cross-talk candidates.
+        assert crosstalk_x_mm <= x_mm_set
+        assert x_mm_set == true_x_mm | crosstalk_x_mm
+
+        for c in cands:
+            assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+            assert c.quality == "golden"  # every candidate is still width-1×1
+
     def test_cap_limits_candidate_count(self, tmp_path):
         """
         Both axes mirror-fold ambiguous → 4×4 = 16 candidate points, all of

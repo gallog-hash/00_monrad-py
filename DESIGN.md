@@ -990,6 +990,20 @@ real data on first inspection:
      addresses this directly by recognising (k, 9−k) patterns and remapping
      to a single position before clustering.
 
+  5. *Synthetic test coverage.*  `monrad.synth.generate()`'s `fold=True` /
+     `fold_planes` path defaults to an idealised, perfectly periodic fold
+     pattern (every mirror pair co-fires, no cross-talk) for backward
+     compatibility with the existing fold-recovery tests.  Two additional
+     parameters, `fold_symmetry` (probability the mirror partner bit also
+     fires; default 1.0) and `fold_crosstalk_rate` (probability an extra,
+     unrelated fiber bit also fires; default 0.0, fiber-only per the ~0 %
+     ribbon cross-talk finding below), let a test inject the realistic
+     0.71–0.95 fold-symmetry / 1.7–2.6 % fiber cross-talk statistics
+     measured above instead of the idealised pattern.
+     `tests/test_stage5.py::TestFoldedPoseRecovery2PlaneRealisticNoise`
+     exercises the combinatorial track finder (§8.2) against this messier,
+     non-idealised data on the two-ambiguous-plane case.
+
 - **MAROC cross-talk — per-run severity and 2023 plane-1 failure.**
   The all-bits-set popcount (= 10) rate is the primary cross-talk proxy.
   All-bits-set events are already rejected by `BinDecoder._is_valid` and
