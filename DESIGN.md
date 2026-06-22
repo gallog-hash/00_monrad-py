@@ -670,6 +670,48 @@ of residual on each plane) is applied here to remove ghost tracks before
 they corrupt the alignment fit. Loose cuts are preferred over tight ones at
 this stage.
 
+**`combo` provenance flag and subset check.** The combinatorial search above
+replaces the older two-plane recovery
+(`stage3.disambiguate_telescope_hits`), which could only resolve an ambiguous
+plane when the *other two* were already clean. To verify and report that the
+new search is a strict superset of the old behaviour, each accepted triple is
+classified per plane by **replaying** the old path
+(`decode_position` + `disambiguate_telescope_hits`) for the same event in the
+same alignment-corrected frame:
+
+- a plane the old path also resolves keeps its own quality (`golden`/`cluster`)
+  — a *shared* / anchor plane;
+- a plane only the combinatorial search recovers is labelled **`combo`** (the
+  headline case being two of three planes fold-ambiguous, which the two-plane
+  predictor cannot resolve).
+
+The anchor guard above guarantees ≥ 1 non-`combo` plane per accepted event.
+A **subset violation** (`subset_ok = False`) is recorded if a plane the old
+path resolved disagrees in position with the combinatorial winner by more than
+half a strip — i.e. an old hit that is *not* on the chosen track. Each
+violation also records **how** the old path fixed that plane
+(`SubsetViolation.main_resolved_by`), because the two cases mean very different
+things:
+
+- **`decoded`** — `decode_position` resolved the plane *uniquely* (one fiber ×
+  one ribbon cluster, contiguous combined range). The combinatorial enumeration
+  re-runs the same clustering and yields that *same single* candidate, so the
+  χ² search has no alternative to pick: a `decoded` hit **cannot** diverge. A
+  `decoded` violation would therefore signal a real bug (e.g. a decode-path
+  mismatch between the two routes).
+- **`recovered`** — `decode_position` left the plane `unresolved` (a mirror
+  fold: a half has ≥ 2 bit-clusters) and `disambiguate_telescope_hits` picked a
+  fold partner using a *two-plane* linear prediction. The combinatorial
+  *three-plane* χ² fit enumerates the same fold partners and may legitimately
+  choose a different one. So `recovered` divergences are **expected** — two
+  disambiguation strategies resolving the same ambiguity — not lost hits.
+
+The strict invariant "every *uniquely-decoded* old hit lies on the
+combinatorial track" thus holds and is expected never to fire; on testLab data
+all observed violations are `recovered` folds. The flag and per-plane `combo`
+counts are surfaced by `run_pipeline.py` (Stage 3 funnel). The flag is
+diagnostic only — it is not a rejection gate.
+
 ### 8.3 The residual
 
 For each coincidence `i`, the predicted telescope position at the probe

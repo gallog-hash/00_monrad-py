@@ -31,6 +31,7 @@ from monrad.stage5 import (
     DecodeReport,
     PoseResult,
     PoseFitter,
+    SubsetViolation,
     fit_probe_pose,
     _tel_line_fit,
     _linear_solve_fixed_theta,
@@ -527,11 +528,45 @@ def pose_result_fold_2plane_realistic(tmp_path_factory):
     return pr
 
 
+@pytest.fixture(scope="module")
+def fold_1plane_reports(tmp_path_factory):
+    """Accepted DecodeReports for the single-ambiguous-plane fold scenario."""
+    out = tmp_path_factory.mktemp("synth_stage5_fold1_reports")
+    reports: list[DecodeReport] = []
+    _run_fold_pipeline(out, fold_planes={1}, on_decode=reports.append)
+    return [r for r in reports if r.accepted]
+
+
+@pytest.fixture(scope="module")
+def fold_2plane_reports(tmp_path_factory):
+    """Accepted DecodeReports for the two-ambiguous-plane fold scenario."""
+    out = tmp_path_factory.mktemp("synth_stage5_fold2_reports")
+    reports: list[DecodeReport] = []
+    _run_fold_pipeline(out, fold_planes={0, 1}, on_decode=reports.append)
+    return [r for r in reports if r.accepted]
+
+
 class TestFoldedPoseRecovery1Plane:
     """3σ recovery with one mirror-fold-ambiguous telescope plane."""
 
     def test_zp_within_3sigma(self, pose_result_fold_1plane):
         _assert_pose_within_3sigma(pose_result_fold_1plane)
+
+    def test_no_combo_when_disambiguator_recovers(self, fold_1plane_reports):
+        """
+        With only plane 1 ambiguous, main's own disambiguate_telescope_hits
+        recovers it from the two clean planes (0, 2), so the combinatorial
+        winner is not the *only* path that resolves it — no plane is labelled
+        "combo".  Guards against over-flagging: a plane main can already reach
+        must stay classified as a shared anchor.  (Verified: with planes 0
+        and 2 golden, the two-plane predictor lands plane 1's candidate
+        within tolerance.)
+        """
+        assert fold_1plane_reports, "no coincidence accepted in 1-plane fold"
+        for r in fold_1plane_reports:
+            assert "combo" not in r.tel_quality, r.tel_quality
+            assert r.subset_ok is True
+            assert r.subset_violations is None
 
 
 class TestFoldedPoseRecovery2Plane:
@@ -544,6 +579,34 @@ class TestFoldedPoseRecovery2Plane:
 
     def test_zp_within_3sigma(self, pose_result_fold_2plane):
         _assert_pose_within_3sigma(pose_result_fold_2plane)
+
+    def test_tel_quality_flags_two_combo_planes(self, fold_2plane_reports):
+        """
+        Planes 0 and 1 are mirror-fold ambiguous on every event; main's
+        disambiguate_telescope_hits cannot recover either (it needs the other
+        two planes clean, but each is the other's unresolved neighbour).  Only
+        the combinatorial χ² search resolves them, so both are "combo"; plane 2
+        is the golden anchor main also resolves.  subset_ok holds because the
+        anchor agrees with the combinatorial winner.
+        """
+        assert fold_2plane_reports, "no coincidence accepted in 2-plane fold"
+        for r in fold_2plane_reports:
+            assert r.tel_quality == ("combo", "combo", "golden"), r.tel_quality
+            assert r.subset_ok is True
+            assert r.subset_violations is None
+
+    def test_subset_violation_resolved_by_field(self):
+        """
+        SubsetViolation.main_resolved_by defaults to "decoded" (preserving
+        positional construction) and accepts "recovered".  The field lets the
+        summary separate the impossible case (a uniquely-decoded hit diverging)
+        from the expected one (main's two-plane fold guess differing from the
+        combinatorial χ² pick).
+        """
+        v = SubsetViolation(0, "cluster", 1.0, 2.0, "golden", 3.0, 2.0, 2.0, 0.0)
+        assert v.main_resolved_by == "decoded"
+        v2 = v._replace(main_resolved_by="recovered")
+        assert v2.main_resolved_by == "recovered"
 
 
 class TestFoldedPoseRecovery2PlaneRealisticNoise:
@@ -899,6 +962,13 @@ class TestDecodeReport:
             # Clean synthetic telescope hits are golden: exactly one candidate
             # per plane.
             assert r.cand_counts == (1, 1, 1)
+            # Every plane is resolved by main too (no fold), so the triple is
+            # all-anchor and main's hits trivially lie on the combinatorial
+            # track — the subset check passes and tel_quality is threaded
+            # through to the on_decode callback.
+            assert r.tel_quality == ("golden", "golden", "golden")
+            assert r.subset_ok is True
+            assert r.subset_violations is None
 
     def test_cand_counts_absent_before_candidate_enumeration(self):
         """An ambiguous cluster is rejected before any candidate is enumerated,
