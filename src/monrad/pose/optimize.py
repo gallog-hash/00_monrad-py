@@ -7,6 +7,7 @@ fit_probe_pose(coincidences, tel_z, alignment) -> PoseResult
 """
 
 import math
+from typing import NamedTuple
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -100,12 +101,41 @@ def _tel_line_fit(
     )
 
 
+class TelAlignArrays(NamedTuple):
+    """
+    Per-plane alignment offsets/tilts as length-3 arrays, hoisted out of the
+    combinatorial triple loop.
+
+    delta_x/delta_y/tilt_x/tilt_y are constant across every candidate triple of
+    one event, so PoseFitter._decode_cluster builds them once (via
+    :func:`tel_align_arrays`) and passes them to every _fit_triple call instead
+    of rebuilding four length-3 arrays per candidate — up to 16³ candidates in
+    the worst mirror-fold case.
+    """
+
+    delta_x: np.ndarray
+    delta_y: np.ndarray
+    tilt_x: np.ndarray
+    tilt_y: np.ndarray
+
+
+def tel_align_arrays(alignment: AlignmentCorrection) -> TelAlignArrays:
+    """Bundle one alignment's per-plane delta/tilt into :class:`TelAlignArrays`."""
+    planes = alignment.planes
+    return TelAlignArrays(
+        delta_x=np.array([planes[k].delta_x for k in range(3)]),
+        delta_y=np.array([planes[k].delta_y for k in range(3)]),
+        tilt_x=np.array([planes[k].tilt_x for k in range(3)]),
+        tilt_y=np.array([planes[k].tilt_y for k in range(3)]),
+    )
+
+
 def _fit_triple(
     x_raw: np.ndarray,
     y_raw: np.ndarray,
     sigma_x: np.ndarray,
     sigma_y: np.ndarray,
-    alignment: AlignmentCorrection,
+    tel_align: TelAlignArrays,
     z_corr: np.ndarray,
 ) -> tuple[
     float,
@@ -127,16 +157,16 @@ def _fit_triple(
     out-of-plane tilt is removed exactly. Returns the same tuple as
     _tel_line_fit: (a_x, b_x, a_y, b_y, cov_x, cov_y, chi2).
 
-    z_corr is the alignment-corrected plane z (alignment.corrected_z_tel(tel_z));
-    it is constant across every triple of one event, so the caller computes it
-    once and passes it in rather than re-deriving it per triple.
+    tel_align (the per-plane delta/tilt arrays) and z_corr (the
+    alignment-corrected plane z) are both constant across every triple of one
+    event, so the caller computes them once and passes them in rather than
+    re-deriving them per triple.
     """
-    corr = alignment
-    x_arr = x_raw - np.array([corr.planes[k].delta_x for k in range(3)])
-    y_arr = y_raw - np.array([corr.planes[k].delta_y for k in range(3)])
+    x_arr = x_raw - tel_align.delta_x
+    y_arr = y_raw - tel_align.delta_y
 
-    z_x_arr = z_corr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
-    z_y_arr = z_corr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
+    z_x_arr = z_corr + tel_align.tilt_y * x_arr
+    z_y_arr = z_corr + tel_align.tilt_x * y_arr
 
     return _tel_line_fit(x_arr, y_arr, z_x_arr, sigma_x, sigma_y, z_y_arr=z_y_arr)
 

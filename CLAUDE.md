@@ -79,7 +79,7 @@ src/monrad/                 # each stage is a domain package; its public API is
 |---|---|---|
 | 1 — time reconstruction | `*_GPS.bin` + header per detector | `Iterator[(TimedEvent, PosRef)]` |
 | 2 — coincidence search | n+1 `reconstruct_stream()` iterators | `Iterator[list[(det_id, TimedEvent, PosRef)]]` |
-| 3 — position decoding | `PosRef` + `*.bin` paths | `list[Hit | None]` (one per plane) |
+| 3 — position decoding | `PosRef` + `*.bin` paths | `list[Hit]` (one per plane) |
 | 4 — telescope alignment | all telescope events | per-plane offsets/rotations (parallel to stages 2–3) |
 | 5 — probe pose fit | coincidence events + `AlignmentCorrection` | `PoseResult`: `(t_x, t_y, θ, z_p)` + covariance |
 
@@ -103,7 +103,7 @@ buffer `tee` would need.
 Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 (stages 1–5 end-to-end with a 512 MB memory bound):
 `tests/test_pipeline_stream.py`. All tests use synthetic data from
-`monrad.synth.generate()`; no real detector files are required.
+`monrad.synthetic.generate()`; no real detector files are required.
 
 ### Key invariants to preserve
 

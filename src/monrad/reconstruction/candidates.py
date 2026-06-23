@@ -12,6 +12,8 @@ import math
 from pathlib import Path
 from typing import Literal, NamedTuple, Sequence
 
+import numpy as np
+
 from ..timing import PosRef
 from ..decoders.position import BinDecoder
 from .hit import (
@@ -119,7 +121,7 @@ def reconstruct_plane_candidates(
 
 def disambiguate_telescope_hits(
     hits: list[Hit],
-    z_tel: Sequence[float],
+    z_tel: Sequence[float] | np.ndarray,
     offsets: Sequence[tuple[float, float]] | None = None,
 ) -> list[Hit]:
     """

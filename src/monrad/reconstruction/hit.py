@@ -1,7 +1,7 @@
 """
 Stage 3 (part) — single-hit position decoding.
 
-decode_position(pos_ref, pos_paths, n_cols) -> list[Hit | None]
+decode_position(pos_ref, pos_paths, n_cols) -> list[Hit]
     one entry per column (detector plane)
 
 Hit
@@ -290,7 +290,7 @@ def decode_position(
     n_cols: int,
     tot_thresh: int = 1,
     tot_weights: bool = False,
-) -> list[Hit | None]:
+) -> list[Hit]:
     """
     Decode one event's position from its PosRef.
 
@@ -324,7 +324,7 @@ def decode_position(
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
 
-    hits: list[Hit | None] = []
+    hits: list[Hit] = []
     for col in range(n_cols):
         if not tot_weights:
             # Fast path: OR (with threshold if requested) — DESIGN.md §6.2

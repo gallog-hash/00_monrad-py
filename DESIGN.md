@@ -378,15 +378,14 @@ def decode_position(
     n_cols: int,
     tot_thresh: int = 1,
     tot_weights: bool = False,
-) -> list[Hit | None]:
+) -> list[Hit]:
 ```
 
 `pos_ref` is received directly from the stream — no `pos_map` lookup is
-needed. Returns one entry per plane (`n_cols` elements). In practice every
-entry is a real `Hit`: when reconstruction fails the plane is returned with
-quality `'invalid'` or `'unresolved'` rather than `None`, so callers test on
-`quality` instead of null-checking (the `Hit | None` return type is kept for
-backward compatibility).
+needed. Returns one entry per plane (`n_cols` elements), always a real `Hit`
+(the list never contains `None`): when reconstruction fails the plane is
+returned with quality `'invalid'` or `'unresolved'`, so callers test on
+`quality` instead of null-checking.
 
 `tot_thresh` keeps only bits that fired in ≥ `tot_thresh` of the 16 block
 rows (1 = plain bitwise OR; 2–4 filters single-row noise). `tot_weights`
@@ -672,10 +671,10 @@ this stage.
 
 **`combo` provenance flag and subset check.** The combinatorial search above
 replaces the older two-plane recovery
-(`stage3.disambiguate_telescope_hits`), which could only resolve an ambiguous
-plane when the *other two* were already clean. To verify and report that the
-new search is a strict superset of the old behaviour, each accepted triple is
-classified per plane by **replaying** the old path
+(`reconstruction.disambiguate_telescope_hits`), which could only resolve an
+ambiguous plane when the *other two* were already clean. To verify and report
+that the new search is a strict superset of the old behaviour, each accepted
+triple is classified per plane by **replaying** the old path
 (`decode_position` + `disambiguate_telescope_hits`) for the same event in the
 same alignment-corrected frame:
 
@@ -710,7 +709,12 @@ The strict invariant "every *uniquely-decoded* old hit lies on the
 combinatorial track" thus holds and is expected never to fire; on testLab data
 all observed violations are `recovered` folds. The flag and per-plane `combo`
 counts are surfaced by `run_pipeline.py` (Stage 3 funnel). The flag is
-diagnostic only — it is not a rejection gate.
+diagnostic only — it is not a rejection gate. Because nothing in the fit reads
+it, the replay (a second `decode_position` + `disambiguate_telescope_hits` per
+accepted event) runs **only when a diagnostic consumer is attached** via the
+`PoseFitter` `on_decode` callback; the streaming/monitoring path leaves
+`on_decode` unset and labels each plane by its winning candidate's own quality,
+skipping the replay.
 
 ### 8.3 The residual
 
@@ -906,16 +910,16 @@ Key types:
 
 | Type | Module | Description |
 |---|---|---|
-| `Quality` | `stage1` | GOOD / DEGRADED / UNTRUSTED |
-| `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
-| `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
-| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits |
-| `PlaneCandidate` | `stage3` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
-| `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
-| `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
-| `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
-| `DecodeReport` | `stage5` | per-cluster decode outcome (`accepted`, `reason`, …); `GATE_ORDER` is the rejection-funnel order |
-| `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
+| `Quality` | `timing` | GOOD / DEGRADED / UNTRUSTED |
+| `TimedEvent` | `timing` | `(t_ns, evt_seq, quality)` |
+| `PosRef` | `timing` | `(file_idx, row_offset, split_rows)` |
+| `Hit` | `reconstruction` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits |
+| `PlaneCandidate` | `reconstruction` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
+| `PlaneCorrection` | `alignment` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
+| `AlignmentCorrection` | `alignment` | list of `PlaneCorrection` + `needs_correction` |
+| `Coincidence` | `pose` | decoded coincidence ready for pose fit |
+| `DecodeReport` | `pose` | per-cluster decode outcome (`accepted`, `reason`, …); `GATE_ORDER` is the rejection-funnel order |
+| `PoseResult` | `pose` | full fit bundle (params, cov, diagnostics) |
 
 
 ## 10. Open items and assumptions to verify
@@ -1042,7 +1046,7 @@ real data on first inspection:
      addresses this directly by recognising (k, 9−k) patterns and remapping
      to a single position before clustering.
 
-  5. *Synthetic test coverage.*  `monrad.synth.generate()`'s `fold=True` /
+  5. *Synthetic test coverage.*  `monrad.synthetic.generate()`'s `fold=True` /
      `fold_planes` path defaults to an idealised, perfectly periodic fold
      pattern (every mirror pair co-fires, no cross-talk) for backward
      compatibility with the existing fold-recovery tests.  Two additional
@@ -1120,7 +1124,7 @@ test guards the pipeline as a regression suite.
 
 **Implementation status.** All three requirements above are implemented:
 
-- `monrad.synth.generate()` produces the synthetic dataset described in
+- `monrad.synthetic.generate()` produces the synthetic dataset described in
   step 1.
 - `tests/test_pipeline_stream.py` runs the complete two-pass streaming
   pipeline and asserts that recovered parameters lie within 3σ of ground
