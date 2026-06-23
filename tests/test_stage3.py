@@ -16,7 +16,12 @@ from monrad.stage1 import (
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage3 import decode_position, disambiguate_telescope_hits, Hit
+from monrad.stage3 import (
+    decode_position,
+    disambiguate_telescope_hits,
+    reconstruct_plane_candidates,
+    Hit,
+)
 from monrad.synth import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
@@ -468,3 +473,301 @@ class TestCandidatesPopulated:
         assert h.candidates_x is not None and len(h.candidates_x) > 0
         # Resolved axis: kept as one golden candidate at channel 11, width 1.
         assert h.candidates_y == [(11.0, 1)]
+
+
+# ── Tests for reconstruct_plane_candidates ─────────────────────────────────
+
+
+class TestPlaneCandidates:
+    """
+    reconstruct_plane_candidates() enumerates per-plane candidate (x, y)
+    positions instead of collapsing each plane to a single resolved Hit —
+    the basis of the Stage 5 combinatorial track finder.
+    """
+
+    def _write_block(self, tmp_path, name, word, n_cols=1):
+        import struct
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / name
+        bin_path.write_bytes(raw)
+        return bin_path
+
+    def test_mirror_fold_axis_yields_multiple_candidates(self, tmp_path):
+        """
+        X is mirror-fold ambiguous: ribbon bits {2, 7} and fiber bits {3, 6}
+        both fire (the folded-fiber MAROC wiring, DESIGN.md §10), giving 4
+        ribbon×fiber combinations.  Y is golden (ribbon=1, fiber=1 → ch=11).
+        Expect exactly the 4 X-candidates × 1 Y-candidate = 4 points.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(res) == 1
+        cands = res[0]
+        assert len(cands) == 4
+
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        expected_chs = [10 * r + f for r in (2, 7) for f in (3, 6)]
+        assert x_mm_set == {(ch + 0.5) * STRIP_MM for ch in expected_chs}
+        for c in cands:
+            assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+            assert c.sigma_x == pytest.approx(_SIGMA_GOLD)
+            assert c.sigma_y == pytest.approx(_SIGMA_GOLD)
+            # Every bit fires in all 16 rows (the word is repeated unchanged),
+            # so every candidate's TOT score is 16*16 regardless of which
+            # mirror-pair channel it picks, and width-1 axes are "golden".
+            assert c.quality == "golden"
+            assert c.tot_x == 16 * 16
+            assert c.tot_y == 16 * 16
+
+    def test_mirror_fold_axis_with_crosstalk_bit_degrades_gracefully(self, tmp_path):
+        """
+        X mirror-fold pair (ribbon {2, 7}, fiber {3, 6}) plus one stray
+        cross-talk fiber bit (bit 8, distinct from both 3 and 6) injected
+        into the same block — mimicking the fiber-only cross-talk DESIGN.md
+        §10 documents (1.7-2.6% on real data) landing on top of an
+        otherwise-clean fold pattern.  Y stays golden (ribbon=1, fiber=1).
+
+        The extra fiber bit turns the fiber half from 2 clusters ({3}, {6})
+        into 3 ({3}, {6}, {8}), so the ribbon×fiber cross-product grows from
+        2×2=4 to 2×3=6 candidates.  reconstruct_plane_candidates must
+        enumerate all 6 without crashing or dropping the true channels —
+        graceful degradation (more candidates), not lost data.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6) | (1 << 8)  # stray cross-talk bit
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold_crosstalk.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(res) == 1
+        cands = res[0]
+        assert len(cands) == 6
+
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        true_chs = [10 * r + f for r in (2, 7) for f in (3, 6)]
+        true_x_mm = {(ch + 0.5) * STRIP_MM for ch in true_chs}
+        crosstalk_chs = [10 * r + 8 for r in (2, 7)]
+        crosstalk_x_mm = {(ch + 0.5) * STRIP_MM for ch in crosstalk_chs}
+        # The 4 legitimate mirror-pair candidates must still be present...
+        assert true_x_mm <= x_mm_set
+        # ...alongside the 2 spurious cross-talk candidates.
+        assert crosstalk_x_mm <= x_mm_set
+        assert x_mm_set == true_x_mm | crosstalk_x_mm
+
+        for c in cands:
+            assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+            assert c.quality == "golden"  # every candidate is still width-1×1
+
+    def test_cap_limits_candidate_count(self, tmp_path):
+        """
+        Both axes mirror-fold ambiguous → 4×4 = 16 candidate points, all of
+        equal compactness (width 1 on each axis), so the cap keeps exactly
+        max_per_plane of them.
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = (1 << 1) | (1 << 8)
+        y_fib = (1 << 1) | (1 << 8)
+        x_rib = (1 << 2) | (1 << 7)
+        x_fib = (1 << 3) | (1 << 6)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "mirror_fold_both.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1, max_per_plane=8)
+        assert len(res[0]) == 8
+
+    def test_invalid_plane_returns_empty_list(self, tmp_path):
+        """X_ribbon=0 (no ribbon channel fired) → invalid → empty list."""
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 0
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "invalid.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert res == [[]]
+
+    def test_golden_plane_yields_one_candidate(self, tmp_path):
+        """A clean golden hit on both axes yields exactly one candidate."""
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "golden.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(res[0]) == 1
+        c = res[0][0]
+        assert c.x_mm == pytest.approx((23 + 0.5) * STRIP_MM)
+        assert c.y_mm == pytest.approx((11 + 0.5) * STRIP_MM)
+        assert c.quality == "golden"
+        assert c.tot_x == 16 * 16
+        assert c.tot_y == 16 * 16
+
+    def test_tot_reflects_per_bit_row_counts_and_cluster_quality(self, tmp_path):
+        """
+        X is a 2-wide cluster (fiber bits 3 and 4, ribbon bit 2 fixed) where
+        fiber bit 3 fires in all 16 rows but fiber bit 4 only fires in 4 —
+        mirrors test_tot_weighted_centroid_shifts_cluster's row pattern.
+        The single resulting X candidate must report tot_x as the *sum* of
+        each contributing (ribbon, fiber) pair's TOT product, and its width
+        (2 on X) must downgrade quality from "golden" to "cluster" even
+        though Y stays golden.
+        """
+        import struct
+
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        gen = 0
+
+        word_full = (
+            y_rib
+            | (y_fib << 10)
+            | (x_rib << 32)
+            | ((x_fib_3 | x_fib_4) << 42)
+            | (gen << 52)
+        )
+        word_f3_only = (
+            y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42) | (gen << 52)
+        )
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+
+        bin_path = tmp_path / "tot_cluster.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(res[0]) == 1
+        c = res[0][0]
+
+        # ribbon bit 2: TOT=16 throughout.  fiber bit 3: TOT=16.  fiber bit 4: TOT=4.
+        # tot_x = ribbon[2]*fiber[3] + ribbon[2]*fiber[4] = 16*16 + 16*4 = 320.
+        assert c.tot_x == 16 * 16 + 16 * 4
+        assert c.tot_y == 16 * 16
+        assert c.quality == "cluster"
+
+    def test_adjacent_ribbons_split_into_separate_runs(self, tmp_path):
+        """
+        A single contiguous ribbon cluster {2,3} crossed with fiber cluster
+        {3,4} gives combined channels {23,24,33,34}.  These are NOT one
+        width-4 hit straddling the 25..32 gap — adjacent ribbons are 10
+        channels apart, so the cross-product splits into two gap-free runs,
+        each a distinct 2-wide cluster candidate: [23,24] and [33,34].
+        """
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 3)  # adjacent ribbons → one cluster [2,3]
+        x_fib = (1 << 3) | (1 << 4)  # adjacent fibers  → one cluster [3,4]
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "adjacent_ribbons.bin", word)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+        res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        cands = res[0]
+        # Two X-runs × one Y-candidate = 2 points, each a 2-wide X cluster.
+        assert len(cands) == 2
+        x_mm_set = {round(c.x_mm, 6) for c in cands}
+        assert x_mm_set == {
+            round((23.5 + 0.5) * STRIP_MM, 6),  # centroid of [23,24] = 23.5
+            round((33.5 + 0.5) * STRIP_MM, 6),  # centroid of [33,34] = 33.5
+        }
+        for c in cands:
+            assert c.quality == "cluster"  # width 2 on X
+            assert c.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))
+
+    def test_tot_weights_shifts_cluster_centroid(self, tmp_path):
+        """
+        With tot_weights=True the X cluster centroid is TOT-weighted toward the
+        stronger fiber bit, exactly as decode_position's tot_weights path does —
+        otherwise the telescope candidates silently ignore the pipeline's
+        --tot-weights flag (the probe decode honours it).
+
+        X cluster = fiber bits 3,4 (ribbon 2) → channels 23,24.  Fiber bit 3
+        fires in all 16 rows, fiber bit 4 in only 4.  Weights: ch23 = 16*16,
+        ch24 = 16*4.  Weighted centroid = (256*23 + 64*24)/320 = 23.2, vs the
+        unweighted 23.5.
+        """
+        import struct
+
+        from monrad.stage1 import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        gen = 0
+        word_full = (
+            y_rib
+            | (y_fib << 10)
+            | (x_rib << 32)
+            | ((x_fib_3 | x_fib_4) << 42)
+            | (gen << 52)
+        )
+        word_f3_only = (
+            y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42) | (gen << 52)
+        )
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+        bin_path = tmp_path / "tot_weighted.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        unweighted = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)[0][0]
+        assert unweighted.x_mm == pytest.approx((23.5 + 0.5) * STRIP_MM)
+
+        weighted = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, tot_weights=True
+        )[0][0]
+        assert weighted.x_mm == pytest.approx((23.2 + 0.5) * STRIP_MM)
+        # Width/quality unchanged — tot_weights only moves the centroid.
+        assert weighted.quality == "cluster"
+        assert weighted.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))

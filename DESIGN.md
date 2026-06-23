@@ -12,9 +12,9 @@ against real data before code is finalised. Each section includes both the
 the algorithm can be made with full context.
 
 The reference decoders for the on-disk formats are
-`decode_header.py`, `decode_gps.py`, and `decode_bin.py`. This document treats
-their bit-level behaviour as authoritative; if anything stated here disagrees
-with the scripts, the scripts win.
+`decoders/header.py`, `decoders/gps.py`, and `decoders/position.py`. This
+document treats their bit-level behaviour as authoritative; if anything
+stated here disagrees with the scripts, the scripts win.
 
 > **Note.** This document incorporates the streaming redesign previously
 > described in `DESIGN_UPDATE.md`. The algorithms are unchanged; the
@@ -65,7 +65,7 @@ A small INI-like text file with bracketed module sections (`[J11]`, `[GPS]`,
   all detectors.
 - The **GPS string** in the `[GPS]` section, written as latin-1 with `\XX` hex
   escapes for non-printable bytes. This is a UBX-TIM-TM2 binary frame from
-  the receiver, decoded by `decode_ubx_tm2()` in `decode_header.py`. There is
+  the receiver, decoded by `decode_ubx_tm2()` in `decoders/header.py`. There is
   exactly **one such GPS string per acquisition**, capturing the absolute UTC
   time of one TIMEPULSE rising edge near the start of the run, plus an
   accuracy estimate `accEst` (in ns). Typical `accEst` is 20–50 ns.
@@ -376,11 +376,22 @@ def decode_position(
     pos_ref: PosRef,
     pos_paths: list[Path],
     n_cols: int,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
 ) -> list[Hit | None]:
 ```
 
 `pos_ref` is received directly from the stream — no `pos_map` lookup is
-needed. Returns one `Hit | None` per plane (`n_cols` elements).
+needed. Returns one entry per plane (`n_cols` elements). In practice every
+entry is a real `Hit`: when reconstruction fails the plane is returned with
+quality `'invalid'` or `'unresolved'` rather than `None`, so callers test on
+`quality` instead of null-checking (the `Hit | None` return type is kept for
+backward compatibility).
+
+`tot_thresh` keeps only bits that fired in ≥ `tot_thresh` of the 16 block
+rows (1 = plain bitwise OR; 2–4 filters single-row noise). `tot_weights`
+weights cluster centroids by each bit's per-row TOT count (no effect on
+golden hits). Both back the `--tot-thresh` / `--tot-weights` pipeline flags.
 
 ### 6.2 Random access into `*.bin`
 
@@ -399,7 +410,7 @@ wrong; halt and report.
 A column is **invalid** if any of the four 10-bit halves of the OR equals
 1023 (all bits set, indicating channel saturation), or if either ribbon half
 is zero (no ribbon channel fired, so no coordinate can be recovered). This
-matches the existing logic in `decode_bin.py::_is_valid`.
+matches the existing logic in `decoders/position.py::BinDecoder._is_valid`.
 
 ### 6.4 Hit reconstruction
 
@@ -612,18 +623,39 @@ For each coincidence, the three telescope hits `(x_k, y_k, z_k)`, `k = 1, 2,
 parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
 
-Before the fit, a single `unresolved` plane is recovered by the two-plane
-projection of §6.3b (the same step Stage 4 applies before its alignment
-fit): if the other two planes are `golden`/`cluster`, the line they define
-predicts plane `k`, and the nearest candidate within 1.5 strips is promoted
-to `cluster`. On real data this is the single largest source of recovered
-coincidences — most events with all three planes resolved are otherwise lost
-at the telescope-quality cut. Unlike Stage 4, the alignment is already known
-here, so the prediction and the candidate-distance test are evaluated in the
-alignment-corrected frame (`coord − δ`): the sharper prediction admits fewer
-but cleaner candidates than the raw frame, which would otherwise pass wrong
-matches that the §8.2 track-χ² cut then rejects. A coincidence is fit only if
-all three planes resolve after this step.
+**Resolving plane ambiguity — combinatorial candidate search.** A telescope
+plane is frequently *ambiguous*: the mirror-fold fiber/ribbon readout
+(§10 Deduction #4) leaves several plausible channels per axis, and the raw
+bit pattern of a true folded hit is indistinguishable from that of two
+overlapping particles. Rather than recover one plane from the other two,
+Stage 5 enumerates candidates on **all** planes and lets the geometry choose:
+
+- `reconstruct_plane_candidates()` (stage 3) returns, per plane, the list of
+  plausible `(x, y)` positions — a single candidate when both axes resolve
+  cleanly (`golden`/`cluster`), or the full ribbon × fiber cross-product
+  (capped at 16/plane) when an axis is fold-ambiguous.
+- `PoseFitter._decode_cluster` then searches the Cartesian product
+  `cands₀ × cands₁ × cands₂` of the three planes' candidate lists, evaluates
+  the weighted line fit above for **every** candidate triple, and keeps the
+  triple with the minimum line-fit χ². Discrete fold disambiguation is thus
+  folded into the same χ² the continuous track fit minimises.
+
+Two guards protect this search:
+
+- **zero-candidate plane** — if any plane yields no candidate (e.g. a
+  single-half dropout), the triple cannot be formed and the coincidence is
+  rejected.
+- **anchor plane required** (`no_anchor_plane`) — if *all three* planes are
+  multi-candidate, the search is refused. With no already-resolved plane to
+  anchor it, a genuine pile-up (two particles in one window) can minimise χ²
+  by coincidence just as a single fold-mirrored track does; the bit patterns
+  are identical, so the search cannot tell them apart. Requiring ≥ 1 resolved
+  anchor plane relaxes the old two-plane-recovery requirement of two clean
+  planes to one, while still rejecting unanchored pile-up.
+
+The winning triple is fit in the alignment-corrected frame (`coord − δ`), so
+the line fit and the χ² cut below use the corrected plane positions. A
+coincidence is fit only if a valid anchored triple survives this step.
 
 When a middle-plane tilt has been fitted, the X and Y fits use *different*
 plane `z` values: a tilted plane reports its hit at an effective
@@ -637,6 +669,48 @@ A **track quality cut** (e.g. χ² of the line fit < 4, equivalent to ≤ 1 stri
 of residual on each plane) is applied here to remove ghost tracks before
 they corrupt the alignment fit. Loose cuts are preferred over tight ones at
 this stage.
+
+**`combo` provenance flag and subset check.** The combinatorial search above
+replaces the older two-plane recovery
+(`stage3.disambiguate_telescope_hits`), which could only resolve an ambiguous
+plane when the *other two* were already clean. To verify and report that the
+new search is a strict superset of the old behaviour, each accepted triple is
+classified per plane by **replaying** the old path
+(`decode_position` + `disambiguate_telescope_hits`) for the same event in the
+same alignment-corrected frame:
+
+- a plane the old path also resolves keeps its own quality (`golden`/`cluster`)
+  — a *shared* / anchor plane;
+- a plane only the combinatorial search recovers is labelled **`combo`** (the
+  headline case being two of three planes fold-ambiguous, which the two-plane
+  predictor cannot resolve).
+
+The anchor guard above guarantees ≥ 1 non-`combo` plane per accepted event.
+A **subset violation** (`subset_ok = False`) is recorded if a plane the old
+path resolved disagrees in position with the combinatorial winner by more than
+half a strip — i.e. an old hit that is *not* on the chosen track. Each
+violation also records **how** the old path fixed that plane
+(`SubsetViolation.main_resolved_by`), because the two cases mean very different
+things:
+
+- **`decoded`** — `decode_position` resolved the plane *uniquely* (one fiber ×
+  one ribbon cluster, contiguous combined range). The combinatorial enumeration
+  re-runs the same clustering and yields that *same single* candidate, so the
+  χ² search has no alternative to pick: a `decoded` hit **cannot** diverge. A
+  `decoded` violation would therefore signal a real bug (e.g. a decode-path
+  mismatch between the two routes).
+- **`recovered`** — `decode_position` left the plane `unresolved` (a mirror
+  fold: a half has ≥ 2 bit-clusters) and `disambiguate_telescope_hits` picked a
+  fold partner using a *two-plane* linear prediction. The combinatorial
+  *three-plane* χ² fit enumerates the same fold partners and may legitimately
+  choose a different one. So `recovered` divergences are **expected** — two
+  disambiguation strategies resolving the same ambiguity — not lost hits.
+
+The strict invariant "every *uniquely-decoded* old hit lies on the
+combinatorial track" thus holds and is expected never to fire; on testLab data
+all observed violations are `recovered` folds. The flag and per-plane `combo`
+counts are surfaced by `run_pipeline.py` (Stage 3 funnel). The flag is
+diagnostic only — it is not a rejection gate.
 
 ### 8.3 The residual
 
@@ -809,10 +883,12 @@ src/monrad/
     stage1.py        # reconstruct_stream(), load_header_params(),
                      # find_file_pairs(), reconstruct() [deprecated]
     stage2.py        # coincidence_stream()
-    stage3.py        # Hit, decode_position()
+    stage3.py        # Hit, GOOD_QUALITIES, decode_position(),
+                     # reconstruct_plane_candidates(), PlaneCandidate,
+                     # disambiguate_telescope_hits()
     stage4.py        # PlaneCorrection, AlignmentCorrection,
                      # AlignmentAccumulator, fit_telescope_alignment()
-    stage5.py        # Coincidence, PoseResult,
+    stage5.py        # Coincidence, DecodeReport, GATE_ORDER, PoseResult,
                      # PoseFitter, fit_probe_pose()
 ```
 
@@ -823,10 +899,12 @@ Key types:
 | `Quality` | `stage1` | GOOD / DEGRADED / UNTRUSTED |
 | `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
 | `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
-| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality)` |
+| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits |
+| `PlaneCandidate` | `stage3` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
 | `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
 | `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
 | `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
+| `DecodeReport` | `stage5` | per-cluster decode outcome (`accepted`, `reason`, …); `GATE_ORDER` is the rejection-funnel order |
 | `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
 
 
@@ -884,7 +962,7 @@ real data on first inspection:
   curve (stage 5), and the alignment drift log.  These are the primary
   human-readable outputs for deciding whether to trust the fitted parameters.
 - **Alignment curvature degeneracy.** `fit_telescope_alignment` uses the
-  two-plane predictor (§6.3b).  For z = [0, 400, 800] mm the interpolation
+  two-plane predictor (§7.3b).  For z = [0, 400, 800] mm the interpolation
   fractions are t₀ = −1, t₁ = 0.5, t₂ = 2, so the residuals satisfy
   r₀ = r₂ = x₀ − 2·x₁ + x₂ and r₁ = −r₀/2 for any dataset.  The predictor
   therefore measures only the second difference (curvature) of hit positions
@@ -953,6 +1031,20 @@ real data on first inspection:
      rate in telescope coincident hits; the fold-pair decoder (§11 task 3.4)
      addresses this directly by recognising (k, 9−k) patterns and remapping
      to a single position before clustering.
+
+  5. *Synthetic test coverage.*  `monrad.synth.generate()`'s `fold=True` /
+     `fold_planes` path defaults to an idealised, perfectly periodic fold
+     pattern (every mirror pair co-fires, no cross-talk) for backward
+     compatibility with the existing fold-recovery tests.  Two additional
+     parameters, `fold_symmetry` (probability the mirror partner bit also
+     fires; default 1.0) and `fold_crosstalk_rate` (probability an extra,
+     unrelated fiber bit also fires; default 0.0, fiber-only per the ~0 %
+     ribbon cross-talk finding below), let a test inject the realistic
+     0.71–0.95 fold-symmetry / 1.7–2.6 % fiber cross-talk statistics
+     measured above instead of the idealised pattern.
+     `tests/test_stage5.py::TestFoldedPoseRecovery2PlaneRealisticNoise`
+     exercises the combinatorial track finder (§8.2) against this messier,
+     non-idealised data on the two-ambiguous-plane case.
 
 - **MAROC cross-talk — per-run severity and 2023 plane-1 failure.**
   The all-bits-set popcount (= 10) rate is the primary cross-talk proxy.

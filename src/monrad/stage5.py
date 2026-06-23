@@ -5,7 +5,8 @@ Public API
 ----------
 PoseResult
     Dataclass: fitted (t_x, t_y, theta, z_p), 4×4 covariance,
-    chi²(θ) curve, final residuals, n_inliers, half-consistency params.
+    chi²(θ) curve, final residuals, n_inliers, half-consistency params,
+    and the inlier Coincidences themselves (for diagnostics/plotting).
 
 PoseFitter
     .add(cluster)               -> PoseResult | None
@@ -13,25 +14,68 @@ PoseFitter
     .update_alignment(corr)     -> None
 
 fit_probe_pose(coincidences, tel_z, alignment) -> PoseResult
-    Implements DESIGN.md §7.4 four-step optimizer.
+    Implements DESIGN.md §8.4 four-step optimizer.
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import numpy as np
 from scipy.optimize import least_squares
 
-from .stage3 import decode_position, disambiguate_telescope_hits
+from .stage3 import (
+    GOOD_QUALITIES,
+    decode_position,
+    disambiguate_telescope_hits,
+    reconstruct_plane_candidates,
+)
 from .stage4 import AlignmentCorrection
 
-_MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §7.4
-_CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §7.2
+_MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §8.4
+_CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §8.2
+N_TEL_PLANES = 3  # telescope planes the combinatorial search fits a line through
+# Half a strip (10 mm strip pitch, DESIGN.md §6.5).  When a plane main's
+# pipeline resolves disagrees with the combinatorial winner's position by more
+# than this, main's hit is not on the combinatorial track — a subset violation.
+_SUBSET_TOL_MM = 5.0
 
 
 # ── Internal data structure ───────────────────────────────────────────────
+
+
+class SubsetViolation(NamedTuple):
+    """
+    One plane where main's pipeline (decode_position +
+    disambiguate_telescope_hits) resolved a hit that the combinatorial winner
+    does *not* lie on — a `main ⊄ combinatorial` case (DESIGN.md §8.2).
+
+    Positions are raw (pre-alignment) mm, the frame both hits are stored in;
+    the per-plane δ cancels in the difference, so dx/dy are the
+    alignment-corrected divergence.  Surfaced so run_pipeline.py can show what
+    diverged rather than only counting that something did.
+    """
+
+    plane: int  # telescope column index (0..2)
+    main_quality: str  # "golden" / "cluster" — main's post-disambiguation label
+    main_x: float
+    main_y: float
+    combo_quality: str  # winning candidate's own quality
+    combo_x: float
+    combo_y: float
+    dx: float  # combo_x − main_x (mm)
+    dy: float  # combo_y − main_y (mm)
+    main_resolved_by: str = "decoded"  # how main fixed this plane's position:
+    # "decoded"   — decode_position resolved it uniquely (one fiber × one ribbon
+    #               cluster, contiguous): the combinatorial enumeration yields
+    #               that same single candidate, so such a hit CANNOT diverge.
+    # "recovered" — decode_position left it 'unresolved' (mirror-fold) and
+    #               disambiguate_telescope_hits picked a fold partner via a
+    #               two-plane prediction.  Divergence here is main's 2-plane
+    #               guess vs the combinatorial 3-plane χ² guess — expected, not
+    #               a lost hit.
 
 
 class Coincidence(NamedTuple):
@@ -50,6 +94,56 @@ class Coincidence(NamedTuple):
     v: float  # probe v-coordinate (mm)
     sigma_prb_x: float  # probe position uncertainty along x (mm)
     sigma_prb_y: float  # probe position uncertainty along y (mm)
+    # Per-plane provenance of the winning telescope triple.  "golden"/"cluster"
+    # mean main's pipeline (decode_position + disambiguate_telescope_hits) also
+    # resolved that plane; "combo" marks a plane only the combinatorial χ²
+    # search recovered (DESIGN.md §8.2).  The default keeps positional
+    # construction in tests working unchanged.
+    tel_quality: tuple[str, str, str] = ("golden", "golden", "golden")
+
+
+class DecodeReport(NamedTuple):
+    """
+    Outcome of one PoseFitter._decode_cluster call, for instrumentation
+    (e.g. scripts/run_pipeline.py's Stage 3 table, track_coincidence_loss.py)
+    so diagnostics read the gates _decode_cluster actually applied instead
+    of re-deriving their own copy of its logic.
+
+    reason is one of: "ambiguous_cluster", "zero_candidate_plane",
+    "no_anchor_plane", "chi2_track_cut", "probe_quality", "accepted".
+    cand_counts/chi2/prb_quality are None when the cluster was rejected before
+    that quantity was computed.
+    """
+
+    accepted: bool
+    reason: str
+    cand_counts: tuple[int, int, int] | None
+    chi2: float | None
+    prb_quality: str | None
+    # Per-plane provenance of the winning telescope triple (see Coincidence)
+    # and whether main's golden/cluster hits are a subset of the combinatorial
+    # track.  tel_quality/subset_ok are None until the cluster reaches the
+    # telescope-classification step (i.e. on the "probe_quality" and "accepted"
+    # paths).  subset_violations carries the per-plane divergence detail when
+    # subset_ok is False (else None), so diagnostics can show what diverged.
+    tel_quality: tuple[str, str, str] | None = None
+    subset_ok: bool | None = None
+    subset_violations: tuple[SubsetViolation, ...] | None = None
+
+
+# The rejection gates _decode_cluster applies, in the order it checks them
+# (the "accepted" terminal is the success path, not a gate).  This is the
+# single source of truth for the funnel ordering: diagnostics import it
+# instead of hard-coding their own copy, so they can't drift from
+# _decode_cluster.  A DecodeReport.reason outside this tuple and not
+# "accepted" should be caught by callers as a catch-all, not silently lost.
+GATE_ORDER = (
+    "ambiguous_cluster",
+    "zero_candidate_plane",
+    "no_anchor_plane",
+    "chi2_track_cut",
+    "probe_quality",
+)
 
 
 # ── Result bundle ─────────────────────────────────────────────────────────
@@ -58,7 +152,7 @@ class Coincidence(NamedTuple):
 @dataclass
 class PoseResult:
     """
-    Full output of fit_probe_pose().  Implements DESIGN.md §7.7.
+    Full output of fit_probe_pose().  Implements DESIGN.md §8.7.
 
     Parameter order in `cov`: [t_x, t_y, theta, z_p].
     """
@@ -73,8 +167,11 @@ class PoseResult:
     residuals_y: np.ndarray  # (n_inliers,) final y residuals (mm)
     n_inliers: int
     # half_params[0] = [tx, ty, theta, zp] for even-index inliers,
-    # half_params[1] = same for odd-index inliers (stratified consistency §7.7)
+    # half_params[1] = same for odd-index inliers (stratified consistency §8.7)
     half_params: np.ndarray  # (2, 4)
+    inliers: list[Coincidence]  # the n_inliers Coincidences kept after the
+    # Mahalanobis cut (used for the final refit) — exposed for diagnostics
+    # such as 3D track plots.
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -160,6 +257,47 @@ def _tel_line_fit(
     )
 
 
+def _fit_triple(
+    x_raw: np.ndarray,
+    y_raw: np.ndarray,
+    sigma_x: np.ndarray,
+    sigma_y: np.ndarray,
+    alignment: AlignmentCorrection,
+    z_corr: np.ndarray,
+) -> tuple[
+    float,
+    float,
+    float,
+    float,
+    tuple[float, float, float],
+    tuple[float, float, float],
+    float,
+]:
+    """
+    Apply per-plane alignment correction and fit a straight line through one
+    telescope (x, y) triple — one candidate position per plane.
+
+    Mirrors the alignment block PoseFitter._decode_cluster used to apply to
+    its single resolved hit per plane: each plane's raw position is shifted
+    by its fitted (delta_x, delta_y), and each axis is fit at its own
+    z-frame, shifted by tilt_y·x / tilt_x·y (DESIGN.md §7.3/§10) so an
+    out-of-plane tilt is removed exactly. Returns the same tuple as
+    _tel_line_fit: (a_x, b_x, a_y, b_y, cov_x, cov_y, chi2).
+
+    z_corr is the alignment-corrected plane z (alignment.corrected_z_tel(tel_z));
+    it is constant across every triple of one event, so the caller computes it
+    once and passes it in rather than re-deriving it per triple.
+    """
+    corr = alignment
+    x_arr = x_raw - np.array([corr.planes[k].delta_x for k in range(3)])
+    y_arr = y_raw - np.array([corr.planes[k].delta_y for k in range(3)])
+
+    z_x_arr = z_corr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
+    z_y_arr = z_corr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
+
+    return _tel_line_fit(x_arr, y_arr, z_x_arr, sigma_x, sigma_y, z_y_arr=z_y_arr)
+
+
 def _linear_solve_fixed_theta(
     coincs: list[Coincidence],
     c: float,  # cos θ
@@ -237,7 +375,7 @@ def fit_probe_pose(
     alignment: AlignmentCorrection,
 ) -> PoseResult:
     """
-    Four-step probe pose optimizer.  Implements DESIGN.md §7.4.
+    Four-step probe pose optimizer.  Implements DESIGN.md §8.4.
 
     Step 1 — coarse θ scan at 1° over [−180°, 180°).
     Step 2 — diagnostic χ²(θ) curve stored in PoseResult.
@@ -373,6 +511,7 @@ def fit_probe_pose(
         residuals_y=res_y,
         n_inliers=n_inliers,
         half_params=half_params,
+        inliers=inliers,
     )
 
 
@@ -382,7 +521,7 @@ def fit_probe_pose(
 class PoseFitter:
     """
     Accumulates telescope-probe coincidences and refits the probe pose
-    every refit_every new coincidences.  Implements DESIGN_UPDATE.md §6.1.
+    every refit_every new coincidences.  Implements DESIGN.md §8.8.
     """
 
     MIN_FIT = 30
@@ -399,7 +538,14 @@ class PoseFitter:
         refit_every: int = REFIT_EVERY,
         tot_thresh: int = 1,
         tot_weights: bool = False,
+        min_anchor_planes: int = 1,
+        on_decode: Callable[[DecodeReport], None] | None = None,
     ) -> None:
+        if not 0 <= min_anchor_planes <= N_TEL_PLANES:
+            raise ValueError(
+                f"min_anchor_planes must be in [0, {N_TEL_PLANES}], "
+                f"got {min_anchor_planes}"
+            )
         self.tel_z = tel_z
         self.alignment = alignment
         self.tel_id = tel_id
@@ -409,6 +555,14 @@ class PoseFitter:
         self.refit_every = refit_every
         self.tot_thresh = tot_thresh
         self.tot_weights = tot_weights
+        # Minimum number of telescope planes that must decode to a single
+        # resolved candidate (an "anchor") before the combinatorial χ² search
+        # is allowed to run.  1 (default) reproduces the original gate; 0
+        # removes it entirely (search every all-ambiguous cluster too — more
+        # tracks, far heavier compute, and pile-up can fabricate a low-χ²
+        # track); N_TEL_PLANES requires every plane already resolved.
+        self.min_anchor_planes = min_anchor_planes
+        self.on_decode = on_decode
         self._coincs: list[Coincidence] = []
         self._since_last = 0
         self.result: PoseResult | None = None
@@ -448,6 +602,30 @@ class PoseFitter:
         apply alignment correction, fit a telescope line, apply the
         track quality cut, and return a Coincidence or None.
         """
+
+        def _report(
+            reason: str,
+            cand_counts: tuple[int, int, int] | None = None,
+            chi2: float | None = None,
+            prb_quality: str | None = None,
+            tel_quality: tuple[str, str, str] | None = None,
+            subset_ok: bool | None = None,
+            subset_violations: tuple[SubsetViolation, ...] | None = None,
+        ) -> None:
+            if self.on_decode is not None:
+                self.on_decode(
+                    DecodeReport(
+                        accepted=(reason == "accepted"),
+                        reason=reason,
+                        cand_counts=cand_counts,
+                        chi2=chi2,
+                        prb_quality=prb_quality,
+                        tel_quality=tel_quality,
+                        subset_ok=subset_ok,
+                        subset_violations=subset_violations,
+                    )
+                )
+
         # A genuine coincidence pairs exactly one telescope track with exactly
         # one hit in *this* probe.  A cluster carrying two or more events from
         # either of those two detectors is ambiguous (two particles inside the
@@ -459,59 +637,158 @@ class PoseFitter:
         tel_refs = [ref for det_id, _ev, ref in cluster if det_id == self.tel_id]
         prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
         if len(tel_refs) != 1 or len(prb_refs) != 1:
+            _report("ambiguous_cluster")
             return None
         tel_ref = tel_refs[0]
         prb_ref = prb_refs[0]
 
-        # Decode telescope (3 planes)
-        tel_hits = decode_position(
+        # Enumerate per-plane candidate positions (golden/cluster axes give
+        # one candidate; mirror-fold-ambiguous axes give their full
+        # ribbon×fiber cross-product) and search every one-candidate-per-
+        # plane triple for the lowest-χ² straight line.  This resolves the
+        # mirror-fold ambiguity globally from which combination actually
+        # lies on a track, instead of needing two already-clean planes to
+        # bootstrap a third (replaces the two-plane disambiguate_telescope_hits
+        # recovery in this path; see DESIGN.md §8.2 and §10 Deduction #4).
+        cands = reconstruct_plane_candidates(
+            tel_ref,
+            self.tel_pos_paths,
+            n_cols=3,
+            max_per_plane=16,
+            tot_thresh=self.tot_thresh,
+            tot_weights=self.tot_weights,
+        )
+        cand_counts = (len(cands[0]), len(cands[1]), len(cands[2]))
+        if any(len(c) == 0 for c in cands):
+            # A triple needs all 3 planes; single-half dropouts are out of
+            # scope for this phase-1 combinatorial search.
+            _report("zero_candidate_plane", cand_counts=cand_counts)
+            return None
+        # Anchor-plane gate (tunable via min_anchor_planes).  An "anchor" is a
+        # plane that decoded to a single resolved candidate; zero-candidate
+        # planes were already rejected above, so an anchor is exactly a plane
+        # with len(cands) == 1.  Require at least min_anchor_planes of them
+        # before running the combinatorial χ² search.
+        #
+        # The mirror-fold/pile-up ambiguity is identical at the bit level for
+        # both causes, so a search over fully-ambiguous planes cannot tell "one
+        # particle, fold-mirrored" from "two particles overlapping in the same
+        # window" — it only finds whichever combination minimises χ², which a
+        # genuine pile-up can do by coincidence (see
+        # TestPerScenarioHandling::test_E2_pileup_same_window_unresolved_rejected).
+        # min_anchor_planes=1 (default) keeps that guard, matching the old
+        # disambiguate_telescope_hits ≥2-clean-plane requirement relaxed to one
+        # combinatorial reference; 0 disables it (search every cluster — more
+        # tracks, far heavier compute); N_TEL_PLANES demands all planes resolved.
+        n_anchor = sum(1 for c in cands if len(c) == 1)
+        if n_anchor < self.min_anchor_planes:
+            _report("no_anchor_plane", cand_counts=cand_counts)
+            return None
+
+        # The alignment-corrected plane z is constant across every triple of
+        # this event, so compute it once instead of per-triple in _fit_triple.
+        z_corr = self.alignment.corrected_z_tel(self.tel_z)
+
+        best_chi2 = math.inf
+        best_fit = None
+        best_cands: tuple[object, object, object] | None = None
+        for c0, c1, c2 in itertools.product(*cands):
+            x_raw = np.array([c0.x_mm, c1.x_mm, c2.x_mm])
+            y_raw = np.array([c0.y_mm, c1.y_mm, c2.y_mm])
+            sigma_x_arr = np.array([c0.sigma_x, c1.sigma_x, c2.sigma_x])
+            sigma_y_arr = np.array([c0.sigma_y, c1.sigma_y, c2.sigma_y])
+            fit = _fit_triple(
+                x_raw, y_raw, sigma_x_arr, sigma_y_arr, self.alignment, z_corr
+            )
+            if fit[-1] < best_chi2:
+                best_chi2 = fit[-1]
+                best_fit = fit
+                best_cands = (c0, c1, c2)
+
+        if best_fit is None or best_chi2 >= _CHI2_TRACK:
+            _report(
+                "chi2_track_cut",
+                cand_counts=cand_counts,
+                chi2=(best_chi2 if best_fit is not None else None),
+            )
+            return None
+        a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
+        assert best_cands is not None  # set whenever best_fit is
+
+        # Classify each plane of the winning triple by replaying main's
+        # telescope reconstruction (decode_position + the two-plane
+        # disambiguate_telescope_hits recovery) for the same event, in the
+        # same alignment-corrected frame.  A plane main also resolves keeps the
+        # winning candidate's own quality ("golden"/"cluster"); a plane main
+        # leaves unresolved is labelled "combo" — recovered only by the
+        # combinatorial χ² search (DESIGN.md §8.2).  We replay main's actual
+        # functions rather than re-deriving the rule from candidate counts so
+        # the comparison cannot drift from what main truly does.
+        #
+        # `decoded_hits` is the pre-disambiguation decode; `main_hits` is after
+        # the two-plane recovery.  The distinction matters for the subset check:
+        # a plane decode_position resolves *uniquely* yields exactly one
+        # combinatorial candidate, so it can never diverge from the winner.  A
+        # plane it leaves 'unresolved' is recovered by a two-plane guess that
+        # the combinatorial 3-plane χ² may legitimately resolve differently — so
+        # each violation records which case it is via `main_resolved_by`.
+        align = self.alignment
+        decoded_hits = decode_position(
             tel_ref,
             self.tel_pos_paths,
             n_cols=3,
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
         )
-        # Recover an 'unresolved' plane from the other two via the two-plane
-        # line projection (stage3.disambiguate_telescope_hits, DESIGN.md §6.3b).
-        # Stage 4 already does this before the alignment fit; applying it here
-        # lets the pose fit keep coincidences where exactly one plane is
-        # ambiguous but its candidate lands on the track predicted by the
-        # other two — the dominant loss at this gate on real data.  Unlike
-        # Stage 4 the alignment is known here, so predict and select in the
-        # alignment-corrected frame (the same delta_x/delta_y applied below).
-        align = self.alignment
-        tel_hits = disambiguate_telescope_hits(
-            tel_hits,
+        main_hits = disambiguate_telescope_hits(
+            decoded_hits,
             self.tel_z,
             offsets=[
                 (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
             ],
         )
-        if any(h.quality not in ("golden", "cluster") for h in tel_hits):
-            return None
-
-        # Apply alignment correction — DESIGN.md §7.2 preamble
-        corr = self.alignment
-        x_arr = np.array([tel_hits[k].x_mm - corr.planes[k].delta_x for k in range(3)])
-        y_arr = np.array([tel_hits[k].y_mm - corr.planes[k].delta_y for k in range(3)])
-        sigma_x_arr = np.array([tel_hits[k].sigma_x for k in range(3)])
-        sigma_y_arr = np.array([tel_hits[k].sigma_y for k in range(3)])
-
-        # A tilted plane reports its hit at an effective z that depends on the
-        # in-plane coordinate (DESIGN.md §7.3/§10): a tilt about the y-axis
-        # puts the x measurement at z + tilt_y·x, and a tilt about the x-axis
-        # puts the y measurement at z + tilt_x·y.  Fitting each axis in its own
-        # corrected z-frame removes the tilt exactly, with no iteration — the
-        # coordinate that sets the z shift is itself measured.  Identity/
-        # translation-only corrections carry tilt = 0, so this is a no-op.
-        z_arr = self.alignment.corrected_z_tel(self.tel_z)
-        z_x_arr = z_arr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
-        z_y_arr = z_arr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
-        a_x, b_x, a_y, b_y, cov_x, cov_y, chi2_line = _tel_line_fit(
-            x_arr, y_arr, z_x_arr, sigma_x_arr, sigma_y_arr, z_y_arr=z_y_arr
+        tel_quality_list: list[str] = []
+        violations: list[SubsetViolation] = []
+        for k in range(3):
+            mh = main_hits[k]
+            wc = best_cands[k]
+            if mh.quality in GOOD_QUALITIES:
+                tel_quality_list.append(wc.quality)
+                # main resolved plane k: its hit must lie on the combinatorial
+                # track, i.e. agree with the winner.  Both positions are raw
+                # (pre-alignment); the per-plane delta cancels in the
+                # difference, so the raw comparison is the corrected-frame one.
+                dx = wc.x_mm - mh.x_mm
+                dy = wc.y_mm - mh.y_mm
+                if abs(dx) > _SUBSET_TOL_MM or abs(dy) > _SUBSET_TOL_MM:
+                    resolved_by = (
+                        "decoded"
+                        if decoded_hits[k].quality in GOOD_QUALITIES
+                        else "recovered"
+                    )
+                    violations.append(
+                        SubsetViolation(
+                            plane=k,
+                            main_quality=mh.quality,
+                            main_x=mh.x_mm,
+                            main_y=mh.y_mm,
+                            combo_quality=wc.quality,
+                            combo_x=wc.x_mm,
+                            combo_y=wc.y_mm,
+                            dx=dx,
+                            dy=dy,
+                            main_resolved_by=resolved_by,
+                        )
+                    )
+            else:
+                tel_quality_list.append("combo")
+        tel_quality = (
+            tel_quality_list[0],
+            tel_quality_list[1],
+            tel_quality_list[2],
         )
-        if chi2_line >= _CHI2_TRACK:
-            return None
+        subset_ok = not violations
+        subset_violations = tuple(violations) if violations else None
 
         # Decode probe (1 plane)
         prb_hits = decode_position(
@@ -522,9 +799,27 @@ class PoseFitter:
             tot_weights=self.tot_weights,
         )
         prb_hit = prb_hits[0]
-        if prb_hit.quality not in ("golden", "cluster"):
+        if prb_hit.quality not in GOOD_QUALITIES:
+            _report(
+                "probe_quality",
+                cand_counts=cand_counts,
+                chi2=best_chi2,
+                prb_quality=prb_hit.quality,
+                tel_quality=tel_quality,
+                subset_ok=subset_ok,
+                subset_violations=subset_violations,
+            )
             return None
 
+        _report(
+            "accepted",
+            cand_counts=cand_counts,
+            chi2=best_chi2,
+            prb_quality=prb_hit.quality,
+            tel_quality=tel_quality,
+            subset_ok=subset_ok,
+            subset_violations=subset_violations,
+        )
         return Coincidence(
             a_x=a_x,
             b_x=b_x,
@@ -536,6 +831,7 @@ class PoseFitter:
             v=prb_hit.y_mm,
             sigma_prb_x=prb_hit.sigma_x,
             sigma_prb_y=prb_hit.sigma_y,
+            tel_quality=tel_quality,
         )
 
     def _refit(self) -> "PoseResult":

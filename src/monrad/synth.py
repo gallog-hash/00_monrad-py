@@ -118,6 +118,31 @@ def _cluster_fiber_mask(f: int, width: int) -> int:
     return ((1 << width) - 1) << f_start
 
 
+def _fold_half_bits(
+    k: int,
+    rng: np.random.Generator,
+    fold_symmetry: float,
+    crosstalk_rate: float,
+) -> int:
+    """Encode one 10-bit fiber/ribbon half for a fold-ambiguous hit at bit k,
+    with non-idealised fold statistics (DESIGN.md §10).
+
+    fold_symmetry: probability the mirror partner bit (9-k) also fires, on
+    top of the true-channel bit k which always fires.  1.0 reproduces the
+    old always-both-bits behaviour exactly.  crosstalk_rate: probability one
+    extra bit, distinct from {k, 9-k}, also fires — drawn uniformly among
+    the remaining 8 positions, since DESIGN.md §10 documents a cross-talk
+    rate but not its spatial structure.
+    """
+    bits = 1 << k
+    if rng.random() < fold_symmetry:
+        bits |= 1 << (9 - k)
+    if crosstalk_rate > 0.0 and rng.random() < crosstalk_rate:
+        choices = [b for b in range(10) if b != k and b != 9 - k]
+        bits |= 1 << rng.choice(choices)
+    return bits
+
+
 def _ch_to_u64(
     c_x: int,
     c_y: int,
@@ -125,6 +150,9 @@ def _ch_to_u64(
     fold: bool = False,
     width_x: int = 1,
     width_y: int = 1,
+    rng: np.random.Generator | None = None,
+    fold_symmetry: float = 1.0,
+    fold_crosstalk_rate: float = 0.0,
 ) -> int:
     """Encode a hit as a u64 word.
 
@@ -136,6 +164,14 @@ def _ch_to_u64(
     telescope MAROC wiring.  Mirror-pair patterns are reported as
     diagnostics by or_visual() but are not resolved in reconstruction.
 
+    fold_symmetry, fold_crosstalk_rate: with fold=True, inject realistic
+    (non-idealised) fold statistics instead of the perfectly periodic
+    pattern — see _fold_half_bits().  Defaults (1.0, 0.0) reproduce the old
+    always-both-bits, no-crosstalk behaviour exactly and need no rng.
+    Otherwise rng is required.  crosstalk only applies to the fiber halves
+    (DESIGN.md §10 measures ~0% ribbon cross-talk); fold_symmetry applies
+    to both fiber and ribbon halves.
+
     width_x, width_y: per-axis cluster widths (channels).  width=1 is a
     golden hit; width>1 fires that many contiguous fiber bits so the axis
     decodes as a `cluster` of that width (σ = STRIP_MM*width/√12), letting
@@ -146,10 +182,21 @@ def _ch_to_u64(
     r_y, f_y = c_y // 10, c_y % 10
     r_x, f_x = c_x // 10, c_x % 10
     if fold:
-        y_rib = (1 << r_y) | (1 << (9 - r_y))
-        y_fib = (1 << f_y) | (1 << (9 - f_y))
-        x_rib = (1 << r_x) | (1 << (9 - r_x))
-        x_fib = (1 << f_x) | (1 << (9 - f_x))
+        if fold_symmetry >= 1.0 and fold_crosstalk_rate <= 0.0:
+            # Exact legacy path — no rng needed, byte-identical to today.
+            y_rib = (1 << r_y) | (1 << (9 - r_y))
+            y_fib = (1 << f_y) | (1 << (9 - f_y))
+            x_rib = (1 << r_x) | (1 << (9 - r_x))
+            x_fib = (1 << f_x) | (1 << (9 - f_x))
+        else:
+            if rng is None:
+                raise ValueError(
+                    "fold_symmetry < 1.0 or fold_crosstalk_rate > 0.0 requires rng"
+                )
+            y_rib = _fold_half_bits(r_y, rng, fold_symmetry, 0.0)
+            y_fib = _fold_half_bits(f_y, rng, fold_symmetry, fold_crosstalk_rate)
+            x_rib = _fold_half_bits(r_x, rng, fold_symmetry, 0.0)
+            x_fib = _fold_half_bits(f_x, rng, fold_symmetry, fold_crosstalk_rate)
     else:
         y_rib = 1 << r_y
         y_fib = _cluster_fiber_mask(f_y, width_y)
@@ -251,6 +298,9 @@ def generate(
     f0: int = F0,
     plane_offsets: dict[int, tuple[float, float]] | None = None,
     fold: bool = False,
+    fold_planes: set[int] | None = None,
+    fold_symmetry: float = 1.0,
+    fold_crosstalk_rate: float = 0.0,
     z_tel_offsets: dict[int, float] | None = None,
     z_tel_tilts: dict[int, tuple[float, float]] | None = None,
     tel_cluster_widths: dict[int, tuple[int, int]] | None = None,
@@ -268,6 +318,32 @@ def generate(
                      bits set (k and 9-k) in each mask half, mimicking
                      folded-fiber MAROC wiring.  fold-pair decoding should
                      recover the original channels.
+    fold_planes    : optional set of plane indices to fold-encode, leaving
+                     the other planes golden/cluster — overrides `fold`
+                     per-plane.  Lets a test ambiguate only 1–2 of the 3
+                     telescope planes per event instead of all 3 at once
+                     (DESIGN.md §10 Deduction #4).  Ignored (falls back to
+                     `fold` for every plane) when None.
+    fold_symmetry  : probability (0-1) each fold-ambiguous axis's mirror
+                     partner bit actually fires, on top of the
+                     always-present true-channel bit.  1.0 (default)
+                     reproduces the old always-both-bits behaviour exactly
+                     — every existing fold test is unaffected.  Real
+                     telescope data shows 0.71-0.95 (DESIGN.md §10); pass a
+                     value in that range to exercise the combinatorial
+                     finder (§8.2) against realistic, non-idealised fold
+                     statistics instead of a perfectly periodic pattern.
+                     Applies to both fiber and ribbon halves.  Ignored when
+                     fold/fold_planes select no folded planes.
+    fold_crosstalk_rate : probability (0-1) an extra, unrelated bit also
+                     fires in a fold-ambiguous plane's fiber half only
+                     (DESIGN.md §10 measures ~0% ribbon cross-talk, so
+                     ribbon stays clean).  0.0 (default) reproduces the old
+                     no-crosstalk behaviour exactly.  Real data shows
+                     1.7-2.6% (DESIGN.md §10).  The extra bit is drawn
+                     uniformly among the 8 remaining fiber positions — a
+                     documented simplification, since DESIGN.md does not
+                     specify cross-talk's spatial structure.
     z_tel_offsets  : optional dict {plane_idx: dz_mm} — the telescope
                      *.bin file is written with hits computed at
                      Z_TEL[k] + dz, but the header still records the
@@ -369,7 +445,20 @@ def generate(
                 cx = _quantize_clamp(x_coord, N_TEL)
                 cy = _quantize_clamp(y_coord, N_TEL)
             wx, wy = tel_cluster_widths.get(k, (1, 1))
-            words.append(_ch_to_u64(cx, cy, gen, fold=fold, width_x=wx, width_y=wy))
+            plane_fold = fold if fold_planes is None else (k in fold_planes)
+            words.append(
+                _ch_to_u64(
+                    cx,
+                    cy,
+                    gen,
+                    fold=plane_fold,
+                    width_x=wx,
+                    width_y=wy,
+                    rng=rng,
+                    fold_symmetry=fold_symmetry,
+                    fold_crosstalk_rate=fold_crosstalk_rate,
+                )
+            )
         tel_blocks.append(words)
         gen = (gen + 1) % 2048
 

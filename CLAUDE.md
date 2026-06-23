@@ -57,7 +57,7 @@ src/monrad/
     synth.py         # generate() — synthetic test-data generator
     stage1.py        # reconstruct_stream(), load_header_params(), find_file_pairs()
     stage2.py        # coincidence_stream()
-    stage3.py        # Hit, decode_position()
+    stage3.py        # Hit, decode_position(), reconstruct_plane_candidates()
     stage4.py        # AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
     stage5.py        # PoseFitter, PoseResult, fit_probe_pose()
 ```

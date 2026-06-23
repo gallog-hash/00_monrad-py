@@ -28,8 +28,10 @@ from monrad.stage3 import Hit, disambiguate_telescope_hits
 from monrad.stage4 import AlignmentCorrection, PlaneCorrection
 from monrad.stage5 import (
     Coincidence,
+    DecodeReport,
     PoseResult,
     PoseFitter,
+    SubsetViolation,
     fit_probe_pose,
     _tel_line_fit,
     _linear_solve_fixed_theta,
@@ -376,6 +378,362 @@ class TestPoseParameterRecovery:
             assert abs(np.mean(pose_result.residuals_y)) < tol
 
 
+# ── combinatorial track finder: recovery from fold-ambiguous data ──────────
+
+
+def _run_fold_pipeline(
+    out,
+    fold=False,
+    fold_planes=None,
+    n_tracks=_N_TRACKS,
+    fold_symmetry=1.0,
+    fold_crosstalk_rate=0.0,
+    on_decode=None,
+    min_anchor_planes=1,
+):
+    """Generate fold-ambiguous synthetic data and run the streaming
+    pipeline through PoseFitter.flush(); return the PoseResult (or None).
+
+    fold_symmetry / fold_crosstalk_rate: forwarded to synth.generate() to
+    inject realistic (non-idealised) fold-mirror and fiber cross-talk noise
+    (DESIGN.md §10) instead of the default perfectly periodic fold pattern.
+    """
+    generate(
+        out_dir=out,
+        t_x=_TRUE_TX,
+        t_y=_TRUE_TY,
+        theta=_TRUE_THETA,
+        z_p=_TRUE_ZP,
+        n_tracks=n_tracks,
+        seed=42,
+        start_utc=_START_UTC,
+        f0=F0,
+        fold=fold,
+        fold_planes=fold_planes,
+        fold_symmetry=fold_symmetry,
+        fold_crosstalk_rate=fold_crosstalk_rate,
+    )
+    tel_dir = out / "telescope"
+    prb_dir = out / "probe"
+
+    tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+    prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header.txt")))
+
+    tel_gps, tel_pos = find_file_pairs(tel_dir)
+    prb_gps, prb_pos = find_file_pairs(prb_dir)
+
+    tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
+    prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
+
+    fitter = PoseFitter(
+        tel_z=Z_TEL,
+        alignment=AlignmentCorrection.identity(),
+        tel_id=0,
+        prb_id=1,
+        tel_pos_paths=tel_pos,
+        prb_pos_paths=prb_pos,
+        refit_every=n_tracks + 1,  # no auto-flush; use explicit flush()
+        min_anchor_planes=min_anchor_planes,
+        on_decode=on_decode,
+    )
+
+    for cluster in coincidence_stream(
+        [tel_stream, prb_stream],
+        detector_ids=[0, 1],
+    ):
+        fitter.add(cluster)
+
+    return fitter.flush()
+
+
+def _assert_pose_within_3sigma(pr):
+    sigma_zp = math.sqrt(abs(pr.cov[3, 3]))
+    err_zp = abs(pr.z_p - _TRUE_ZP)
+    assert err_zp < 3 * sigma_zp, (
+        f"z_p={pr.z_p:.2f} mm, true={_TRUE_ZP} mm, "
+        f"err={err_zp:.2f} mm, 3σ={3 * sigma_zp:.2f} mm"
+    )
+
+    sigma_th = math.sqrt(abs(pr.cov[2, 2]))
+    err_th = _theta_err_mod90(pr.theta, _TRUE_THETA)
+    assert err_th < 3 * sigma_th, (
+        f"theta={math.degrees(pr.theta):.3f}°, "
+        f"nearest equiv={math.degrees(_TRUE_THETA):.3f}°±k·90°, "
+        f"err={math.degrees(err_th):.3f}°, 3σ={math.degrees(3 * sigma_th):.3f}°"
+    )
+
+    k = _nearest_k90(pr.theta, _TRUE_THETA)
+    sigma_tx = math.sqrt(abs(pr.cov[0, 0]))
+    sigma_ty = math.sqrt(abs(pr.cov[1, 1]))
+    if k == 0:
+        assert abs(pr.t_x - _TRUE_TX) < 3 * sigma_tx, (
+            f"t_x={pr.t_x:.2f}, true={_TRUE_TX}, 3σ={3 * sigma_tx:.2f}"
+        )
+        assert abs(pr.t_y - _TRUE_TY) < 3 * sigma_ty, (
+            f"t_y={pr.t_y:.2f}, true={_TRUE_TY}, 3σ={3 * sigma_ty:.2f}"
+        )
+    else:
+        n = pr.n_inliers
+        tol = 3 * _SIGMA_STRIP / math.sqrt(n)
+        assert abs(np.mean(pr.residuals_x)) < tol
+        assert abs(np.mean(pr.residuals_y)) < tol
+
+
+@pytest.fixture(scope="module")
+def pose_result_fold_1plane(tmp_path_factory):
+    """
+    Single ambiguous plane (plane 1; planes 0 and 2 stay golden/cluster).
+    This is the regime disambiguate_telescope_hits already partly handles
+    (predicting the ambiguous plane from the two clean ones); the
+    combinatorial finder should recover it just as well.
+    """
+    out = tmp_path_factory.mktemp("synth_stage5_fold1")
+    pr = _run_fold_pipeline(out, fold_planes={1})
+    assert pr is not None, "PoseFitter.flush() returned None (too few coincidences)"
+    return pr
+
+
+@pytest.fixture(scope="module")
+def pose_result_fold_2plane(tmp_path_factory):
+    """
+    Two ambiguous planes (0 and 1; plane 2 stays golden as the sole anchor).
+    disambiguate_telescope_hits cannot resolve this (it needs two clean
+    planes to bootstrap the third) — this is the combinatorial finder's
+    headline win: per-plane candidate enumeration + line-fit χ² search
+    across both ambiguous planes simultaneously.
+    """
+    out = tmp_path_factory.mktemp("synth_stage5_fold2")
+    pr = _run_fold_pipeline(out, fold_planes={0, 1})
+    assert pr is not None, "PoseFitter.flush() returned None (too few coincidences)"
+    return pr
+
+
+@pytest.fixture(scope="module")
+def pose_result_fold_2plane_realistic(tmp_path_factory):
+    """
+    Same 2-ambiguous-plane scenario as pose_result_fold_2plane, but with
+    realistic (non-idealised) fold statistics from DESIGN.md §10 instead of
+    a perfectly periodic mirror pattern: fold_symmetry=0.85 (within the
+    documented 0.71-0.95 range) and fold_crosstalk_rate=0.02 (within the
+    documented 1.7-2.6% fiber cross-talk range).  This is the combinatorial
+    finder's real payoff per the architectural audit: messy fold data, not
+    the idealised always-both-bits pattern the other fold fixtures use.
+    """
+    out = tmp_path_factory.mktemp("synth_stage5_fold2_realistic")
+    pr = _run_fold_pipeline(
+        out,
+        fold_planes={0, 1},
+        fold_symmetry=0.85,
+        fold_crosstalk_rate=0.02,
+    )
+    assert pr is not None, "PoseFitter.flush() returned None (too few coincidences)"
+    return pr
+
+
+@pytest.fixture(scope="module")
+def fold_1plane_reports(tmp_path_factory):
+    """Accepted DecodeReports for the single-ambiguous-plane fold scenario."""
+    out = tmp_path_factory.mktemp("synth_stage5_fold1_reports")
+    reports: list[DecodeReport] = []
+    _run_fold_pipeline(out, fold_planes={1}, on_decode=reports.append)
+    return [r for r in reports if r.accepted]
+
+
+@pytest.fixture(scope="module")
+def fold_2plane_reports(tmp_path_factory):
+    """Accepted DecodeReports for the two-ambiguous-plane fold scenario."""
+    out = tmp_path_factory.mktemp("synth_stage5_fold2_reports")
+    reports: list[DecodeReport] = []
+    _run_fold_pipeline(out, fold_planes={0, 1}, on_decode=reports.append)
+    return [r for r in reports if r.accepted]
+
+
+class TestFoldedPoseRecovery1Plane:
+    """3σ recovery with one mirror-fold-ambiguous telescope plane."""
+
+    def test_zp_within_3sigma(self, pose_result_fold_1plane):
+        _assert_pose_within_3sigma(pose_result_fold_1plane)
+
+    def test_no_combo_when_disambiguator_recovers(self, fold_1plane_reports):
+        """
+        With only plane 1 ambiguous, main's own disambiguate_telescope_hits
+        recovers it from the two clean planes (0, 2), so the combinatorial
+        winner is not the *only* path that resolves it — no plane is labelled
+        "combo".  Guards against over-flagging: a plane main can already reach
+        must stay classified as a shared anchor.  (Verified: with planes 0
+        and 2 golden, the two-plane predictor lands plane 1's candidate
+        within tolerance.)
+        """
+        assert fold_1plane_reports, "no coincidence accepted in 1-plane fold"
+        for r in fold_1plane_reports:
+            assert "combo" not in r.tel_quality, r.tel_quality
+            assert r.subset_ok is True
+            assert r.subset_violations is None
+
+
+class TestFoldedPoseRecovery2Plane:
+    """
+    Headline win for the combinatorial track finder (DESIGN.md §10
+    Deduction #4): recover the probe pose with two of three telescope
+    planes mirror-fold ambiguous on every event, which the old
+    two-plane disambiguate_telescope_hits path cannot do.
+    """
+
+    def test_zp_within_3sigma(self, pose_result_fold_2plane):
+        _assert_pose_within_3sigma(pose_result_fold_2plane)
+
+    def test_tel_quality_flags_two_combo_planes(self, fold_2plane_reports):
+        """
+        Planes 0 and 1 are mirror-fold ambiguous on every event; main's
+        disambiguate_telescope_hits cannot recover either (it needs the other
+        two planes clean, but each is the other's unresolved neighbour).  Only
+        the combinatorial χ² search resolves them, so both are "combo"; plane 2
+        is the golden anchor main also resolves.  subset_ok holds because the
+        anchor agrees with the combinatorial winner.
+        """
+        assert fold_2plane_reports, "no coincidence accepted in 2-plane fold"
+        for r in fold_2plane_reports:
+            assert r.tel_quality == ("combo", "combo", "golden"), r.tel_quality
+            assert r.subset_ok is True
+            assert r.subset_violations is None
+
+    def test_subset_violation_resolved_by_field(self):
+        """
+        SubsetViolation.main_resolved_by defaults to "decoded" (preserving
+        positional construction) and accepts "recovered".  The field lets the
+        summary separate the impossible case (a uniquely-decoded hit diverging)
+        from the expected one (main's two-plane fold guess differing from the
+        combinatorial χ² pick).
+        """
+        v = SubsetViolation(0, "cluster", 1.0, 2.0, "golden", 3.0, 2.0, 2.0, 0.0)
+        assert v.main_resolved_by == "decoded"
+        v2 = v._replace(main_resolved_by="recovered")
+        assert v2.main_resolved_by == "recovered"
+
+
+class TestFoldedPoseRecovery2PlaneRealisticNoise:
+    """
+    Closes the architectural-audit gap: recovers the probe pose from
+    fold-ambiguous data with realistic (DESIGN.md §10) fold-symmetry and
+    fiber cross-talk noise, not the idealised perfectly-periodic fold
+    pattern every other fold test in this module uses.
+    """
+
+    def test_zp_within_3sigma(self, pose_result_fold_2plane_realistic):
+        _assert_pose_within_3sigma(pose_result_fold_2plane_realistic)
+
+    def test_noise_model_engages(self, tmp_path_factory):
+        """
+        Guard against a silent no-op: with fold_symmetry < 1.0 and
+        fold_crosstalk_rate > 0.0, the per-plane candidate counts seen
+        across accepted coincidences must vary, unlike the idealised fold
+        pattern's fixed shape (planes 0 and 1 folded, plane 2 golden ->
+        always (4, 4, 1) candidates).  Dropped mirror partner bits shrink
+        a candidate list toward 1; cross-talk bits grow one past 4 — either
+        way, count variety is the noise model's observable fingerprint.
+        """
+        out = tmp_path_factory.mktemp("synth_stage5_fold2_realistic_report")
+        reports: list[DecodeReport] = []
+        _run_fold_pipeline(
+            out,
+            fold_planes={0, 1},
+            fold_symmetry=0.85,
+            fold_crosstalk_rate=0.02,
+            on_decode=reports.append,
+        )
+        accepted = [r for r in reports if r.accepted]
+        assert accepted, "no coincidence was accepted under realistic fold noise"
+        cand_counts_seen = {r.cand_counts for r in accepted}
+        assert len(cand_counts_seen) > 1, (
+            "candidate counts are constant across every accepted coincidence "
+            "— fold_symmetry/fold_crosstalk_rate do not appear to be engaging"
+        )
+
+
+class TestFoldedPoseRecoveryAllPlanesFails:
+    """
+    Documented negative result (see handoff-combinatorial-track-finder.md):
+    with all 3 telescope planes mirror-fold ambiguous on both axes on every
+    event, every plane's candidate list has >1 entry, so PoseFitter's
+    "require ≥1 already-resolved anchor plane" guard (added to fix
+    TestPerScenarioHandling::test_E2_pileup_same_window_unresolved_rejected
+    — the same ambiguous-bit-pattern problem a genuine multi-particle
+    pile-up produces) rejects every coincidence outright, and flush()
+    returns None for lack of any accepted coincidence.
+
+    Before that guard existed, the search instead ran to completion and
+    found an exact mathematical tie: monrad.synth.generate() has no
+    measurement noise, so reflecting an entire straight line is still a
+    straight line, and the all-3-planes-mirrored candidate triple achieved
+    *exactly* the same χ² as the true triple (verified directly: true
+    χ²≈3.9e-28 vs full-mirror χ²≈4.7e-27, both numerically zero) — a tie
+    the χ²-only search cannot break.  Either way the case is unrecoverable;
+    real data only requires recovering *at least one* ambiguous plane per
+    event (DESIGN.md §10 Deduction #4), not all three at once, so this is
+    more extreme than the strategy needs to handle.  Pinned here so a
+    future change doesn't silently regress without re-deriving this
+    finding.
+    """
+
+    @pytest.fixture(scope="class")
+    def pose_result_fold_all(self, tmp_path_factory):
+        out = tmp_path_factory.mktemp("synth_stage5_fold_all")
+        return _run_fold_pipeline(out, fold=True)
+
+    def test_pose_not_recovered(self, pose_result_fold_all):
+        assert pose_result_fold_all is None, (
+            "flush() unexpectedly returned a PoseResult for the all-3-planes "
+            "fold case — the anchor-plane guard or the exact-tie ambiguity "
+            "appears to have changed; see this test's docstring before "
+            "relaxing it"
+        )
+
+
+class TestMinAnchorPlanesTunable:
+    """
+    The anchor-plane guard is tunable via PoseFitter(min_anchor_planes=N):
+    the search runs only when at least N planes decoded to a single resolved
+    candidate.  N=1 is the default (original behaviour); N=0 disables the guard
+    so even all-3-ambiguous clusters reach the χ² search.
+    """
+
+    @pytest.mark.parametrize("bad", [-1, 4])
+    def test_constructor_rejects_out_of_range(self, bad):
+        with pytest.raises(ValueError, match="min_anchor_planes"):
+            PoseFitter(
+                tel_z=Z_TEL,
+                alignment=AlignmentCorrection.identity(),
+                tel_id=0,
+                prb_id=1,
+                tel_pos_paths=[],
+                prb_pos_paths=[],
+                min_anchor_planes=bad,
+            )
+
+    def test_default_gate_rejects_all_fold(self, tmp_path_factory):
+        # With every plane mirror-fold ambiguous, no plane is an anchor, so the
+        # default guard (min_anchor_planes=1) rejects every coincidence via the
+        # "no_anchor_plane" gate and nothing reaches the χ² search.
+        out = tmp_path_factory.mktemp("min_anchor_default")
+        reports: list = []
+        _run_fold_pipeline(out, fold=True, on_decode=reports.append)
+        assert reports, "no coincidences were decoded at all"
+        assert any(r.reason == "no_anchor_plane" for r in reports)
+        assert not any(r.accepted for r in reports)
+
+    def test_zero_disables_gate(self, tmp_path_factory):
+        # min_anchor_planes=0 removes the guard: the same all-fold clusters now
+        # run the combinatorial search instead of being rejected, so not a
+        # single "no_anchor_plane" rejection is emitted.
+        out = tmp_path_factory.mktemp("min_anchor_zero")
+        reports: list = []
+        _run_fold_pipeline(
+            out, fold=True, on_decode=reports.append, min_anchor_planes=0
+        )
+        assert reports, "no coincidences were decoded at all"
+        assert not any(r.reason == "no_anchor_plane" for r in reports)
+
+
 # ── unit tests for cluster disambiguation in PoseFitter._decode_cluster ─────
 
 
@@ -522,32 +880,19 @@ class TestPerAxisSigmaPropagation:
         assert np.trace(pr_hetero.cov) > np.trace(pr_scalar.cov)
 
 
-class TestDecodeClusterUnresolvedRecovery:
+class TestDisambiguateOffsetSelection:
     """
-    PoseFitter._decode_cluster recovers a single 'unresolved' telescope plane
-    via the two-plane projection (DESIGN.md §6.3b/§8.2), selecting the
-    candidate in the *alignment-corrected* frame.
+    disambiguate_telescope_hits() selects candidates in the
+    *alignment-corrected* frame (DESIGN.md §6.3b/§8.2).  PoseFitter's own
+    telescope-plane recovery now goes through the combinatorial track
+    finder (reconstruct_plane_candidates + _fit_triple in _decode_cluster)
+    instead of this function, but the function itself is still used by
+    Stage 4 and the run_pipeline.py quality table, so its offset-frame
+    behaviour is tested directly here.
     """
 
     _Z = np.array([0.0, 400.0, 800.0])
     _SIG = STRIP_MM / math.sqrt(12)
-
-    def _make_fitter(self, monkeypatch, tel_hits, prb_hit, alignment):
-        """A PoseFitter whose decode_position returns canned hits."""
-        import monrad.stage5 as s5
-
-        def fake_decode_position(ref, paths, n_cols, tot_thresh=1, tot_weights=False):
-            return list(tel_hits) if n_cols == 3 else [prb_hit]
-
-        monkeypatch.setattr(s5, "decode_position", fake_decode_position)
-        return PoseFitter(
-            tel_z=self._Z,
-            alignment=alignment,
-            tel_id=0,
-            prb_id=1,
-            tel_pos_paths=[],
-            prb_pos_paths=[],
-        )
 
     def _scenario(self):
         """
@@ -585,22 +930,6 @@ class TestDecodeClusterUnresolvedRecovery:
         )
         return tel_hits, prb_hit, alignment
 
-    def test_corrected_frame_recovers_on_track(self, monkeypatch):
-        """The recovered coincidence is accepted with an on-track line."""
-        tel_hits, prb_hit, alignment = self._scenario()
-        fitter = self._make_fitter(monkeypatch, tel_hits, prb_hit, alignment)
-        co = fitter._decode_cluster([(0, object(), object()), (1, object(), object())])
-
-        assert co is not None  # recovered AND passed the track-χ² cut
-        # Flat track in the corrected frame: slope ≈ 0, intercept ≈ (100, 50).
-        assert co.b_x == pytest.approx(0.0, abs=1e-6)
-        assert co.a_x == pytest.approx(100.0, abs=1e-6)
-        assert co.b_y == pytest.approx(0.0, abs=1e-6)
-        assert co.a_y == pytest.approx(50.0, abs=1e-6)
-        # Probe hit passes straight through to the coincidence.
-        assert co.u == pytest.approx(10.0)
-        assert co.v == pytest.approx(20.0)
-
     def test_offsets_change_selected_candidate(self):
         """
         Guard the refinement at the disambiguation level: the raw frame and
@@ -622,3 +951,91 @@ class TestDecodeClusterUnresolvedRecovery:
         )
         assert corrected[1].quality == "cluster"
         assert corrected[1].x_mm == pytest.approx(110.0)  # corrected → right one
+
+
+class TestDecodeReport:
+    """
+    DecodeReport surfaces the gate outcome (reason), the winning triple's χ²
+    and the per-plane candidate counts that PoseFitter._decode_cluster
+    actually computed, so run_pipeline.py reads the gates instead of
+    re-deriving them.
+    """
+
+    def test_accepted_report_carries_chi2_and_cand_counts(self, tmp_path):
+        out = tmp_path / "synth"
+        generate(
+            out_dir=out,
+            t_x=_TRUE_TX,
+            t_y=_TRUE_TY,
+            theta=_TRUE_THETA,
+            z_p=_TRUE_ZP,
+            n_tracks=_N_TRACKS,
+            seed=42,
+            start_utc=_START_UTC,
+            f0=F0,
+        )
+        tel_dir, prb_dir = out / "telescope", out / "probe"
+        tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header.txt")))
+        prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header.txt")))
+        tel_gps, tel_pos = find_file_pairs(tel_dir)
+        prb_gps, prb_pos = find_file_pairs(prb_dir)
+        tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
+        prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
+
+        reports: list[DecodeReport] = []
+        fitter = PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=tel_pos,
+            prb_pos_paths=prb_pos,
+            refit_every=_N_TRACKS + 1,
+            on_decode=reports.append,
+        )
+        for cluster in coincidence_stream(
+            [tel_stream, prb_stream], detector_ids=[0, 1]
+        ):
+            fitter.add(cluster)
+        fitter.flush()
+
+        accepted = [r for r in reports if r.accepted]
+        assert accepted, "no coincidence was accepted"
+        for r in accepted:
+            assert r.reason == "accepted"
+            assert r.chi2 is not None
+            assert r.prb_quality in ("golden", "cluster")
+            assert r.cand_counts is not None and len(r.cand_counts) == 3
+            # Clean synthetic telescope hits are golden: exactly one candidate
+            # per plane.
+            assert r.cand_counts == (1, 1, 1)
+            # Every plane is resolved by main too (no fold), so the triple is
+            # all-anchor and main's hits trivially lie on the combinatorial
+            # track — the subset check passes and tel_quality is threaded
+            # through to the on_decode callback.
+            assert r.tel_quality == ("golden", "golden", "golden")
+            assert r.subset_ok is True
+            assert r.subset_violations is None
+
+    def test_cand_counts_absent_before_candidate_enumeration(self):
+        """An ambiguous cluster is rejected before any candidate is enumerated,
+        so the per-plane candidate counts are reported as None."""
+        reports: list[DecodeReport] = []
+        fitter = PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=[],
+            prb_pos_paths=[],
+            on_decode=reports.append,
+        )
+        # Two telescope events in one cluster → "ambiguous_cluster" gate.
+        assert (
+            fitter._decode_cluster([_entry(0, 0), _entry(0, 1), _entry(1, 2)]) is None
+        )
+        assert len(reports) == 1
+        r = reports[0]
+        assert r.reason == "ambiguous_cluster"
+        assert r.cand_counts is None
+        assert r.chi2 is None

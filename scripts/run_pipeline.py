@@ -40,13 +40,41 @@ Expected console output (example values):
       Coincidences     :    523
       Mean cluster size:   2.00
 
-    === Stage 3: Hit quality (coincidence survivors) ===
-      523 coincidences x 3 telescope planes = 1569 readings
-      Plane 0    golden 314   cluster 32   unresolved 4   invalid 2   missing 1
-      Plane 1    golden 315   cluster 30   unresolved 5   invalid 1   missing 1
-      Plane 2    golden 312   cluster 32   unresolved 3   invalid 2   missing 0
-      523 coincidences x 1 probe plane = 523 readings
-      Probe      golden 410   cluster 80   unresolved 20   invalid 13   missing 0
+    === Stage 3: Pose-fit gate funnel (combinatorial path) ===
+      (counts come from PoseFitter._decode_cluster's own DecodeReport, not a
+      separate re-derivation)
+      rejected: ambiguous_cluster            12   survivors -> 511
+      rejected: zero_candidate_plane          8   survivors -> 503
+      rejected: no_anchor_plane               3   survivors -> 500
+      rejected: chi2_track_cut                9   survivors -> 491
+      rejected: probe_quality                 4   survivors -> 487
+      accepted (fed to pose optimizer)         487
+
+      Telescope candidates per plane (before the triple search):
+        Plane 0    invalid(0)      8   resolved(1)    460   ambiguous(2+)     55
+        Plane 1    invalid(0)      6   resolved(1)    455   ambiguous(2+)     62
+        Plane 2    invalid(0)      9   resolved(1)    462   ambiguous(2+)     52
+
+      Accepted winning-triple hit quality, per plane
+        (golden/cluster = main's pipeline resolves it too; combo = recovered only by the χ² search):
+        Plane 0    golden    453   cluster     27   combo      7
+        Plane 1    golden    448   cluster     33   combo      6
+        Plane 2    golden    455   cluster     26   combo      6
+        Combinatorial-only recoveries: 18 of 487 accepted events carry >=1 combo plane (19 combo planes total).
+
+      Probe hit quality (coincidences that reached probe decode):
+        golden 410   cluster 91
+
+      Winning-triple line-fit χ²:
+        passed cut (accepted + probe_quality-rejected): mean=0.42  std=0.61  n=491
+        failed cut (chi2_track_cut, best of a noisy search): mean=182.0  std=210.4  n=20
+
+      Subset check (is every main-resolved hit on the combinatorial track?): FAIL (2 of 487 events)
+        2 event(s) where a main-resolved plane is off the winning
+        track by > 0.5 strip (5 mm) — main's hit is NOT on that track.
+        Diverging planes by main's resolution:  recovered-fold: 2
+          evt   1  χ²=    2.31  triple=(cluster,combo,cluster)
+            plane 0: main cluster(recovered) @(123.5,245.0) -> combo cluster @(155.0,245.0)  Δ=(+31.5,+0.0) mm
 
     === Stage 5: Probe pose fit ===
       t_x   =  +51.3 ±  1.2 mm
@@ -54,6 +82,9 @@ Expected console output (example values):
       theta =  +17.1 ±  0.3 deg
       z_p   = +301.4 ±  4.7 mm
       n_inliers = 487
+      Probe footprint (inferred from inlier hit spread, ±15 mm margin; not a measured detector size):
+        u:  -132.4 to  +128.9 mm  (width  261.3 mm)
+        v:   -95.1 to   +99.7 mm  (height 194.8 mm)
 
 If stage 5 has too few coincidences:
 
@@ -78,11 +109,27 @@ from monrad.stage1 import (
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position, disambiguate_telescope_hits
-from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import PoseFitter
+from monrad.stage3 import decode_position
+from monrad.stage4 import AlignmentAccumulator, AlignmentCorrection
+from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
 
-_HIT_QUALITIES = ("golden", "cluster", "unresolved", "invalid", "missing")
+_CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
+# Probe Hit.quality values (stage3.Hit), in canonical order, for the probe
+# hit-quality table.  decode_position can yield any of these for the probe
+# plane, so the table must list them all — printing only golden/cluster
+# silently drops the unresolved/invalid rejections.
+_PRB_QUALITY_ORDER = ("golden", "cluster", "unresolved", "invalid")
+# Provenance of each plane in an accepted winning triple (stage5.tel_quality):
+# golden/cluster = main's pipeline also resolves it; combo = recovered only by
+# the combinatorial χ² search.
+_TEL_QUALITY_ORDER = ("golden", "cluster", "combo")
+# Cap on how many subset-check failures are printed per-event before the rest
+# are summarised, so a pathological run can't flood the summary.
+_SUBSET_FAIL_SHOW = 50
+# Telescope active area (monrad.synth.N_TEL * monrad.synth.STRIP_MM), used
+# only to draw plane footprints in the 3D plot — not a pipeline parameter.
+_TEL_SIZE_MM = 99 * 10.0
+_PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe footprint
 
 
 def _parse_args() -> argparse.Namespace:
@@ -127,10 +174,31 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tot-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Weight cluster centroids by per-bit TOT counts "
+        "(ribbon_count × fiber_count). No effect on golden hits. On by "
+        "default for the combinatorial path; pass --no-tot-weights to disable.",
+    )
+    p.add_argument(
+        "--min-anchor-planes",
+        type=int,
+        default=1,
+        metavar="N",
+        choices=range(0, 4),
+        help="Minimum telescope planes that must decode to a single resolved "
+        "candidate (an 'anchor') before the combinatorial track search runs, "
+        "0-3 (default: 1). 1 keeps the original gate; 0 also searches "
+        "all-ambiguous clusters (more tracks, much heavier compute, pile-up "
+        "can fabricate tracks); 3 demands every plane already resolved.",
+    )
+    p.add_argument(
+        "--plot",
         action="store_true",
         default=False,
-        help="Weight cluster centroids by per-bit TOT counts "
-        "(ribbon_count × fiber_count). No effect on golden hits.",
+        help="Save an interactive 3D plot of the telescope planes, the fitted "
+        "probe plane, and the inlier tracks to <out>/pose_3d.html "
+        "(requires plotly; no-op if stage 5 is skipped).",
     )
     return p.parse_args()
 
@@ -162,6 +230,213 @@ def _emit(lines: list[str], msg: str = "") -> None:
     lines.append(msg)
 
 
+def _cand_bucket(n: int) -> str:
+    if n == 0:
+        return "invalid(0)"
+    if n == 1:
+        return "resolved(1)"
+    return "ambiguous(2+)"
+
+
+def _emit_subset_failures(lines: list[str], reports: list[DecodeReport]) -> None:
+    """
+    Print the per-event divergence for every subset-check failure: each event's
+    winning-triple χ², its per-plane provenance, and — for each plane main's
+    pipeline resolved but the combinatorial winner does not lie on — main's hit
+    vs. the combinatorial winner and their separation Δ (raw mm, the frame both
+    are stored in; the per-plane alignment δ cancels in Δ).
+    """
+    n = len(reports)
+    _emit(lines, f"    {n} event(s) where a main-resolved plane is off the winning")
+    _emit(lines, "    track by > 0.5 strip (5 mm) — main's hit is NOT on that track.")
+    # Break the violations down by HOW main fixed the diverging plane.  A
+    # "decoded" disagreement (decode_position resolved the plane uniquely) would
+    # be a real bug — that hit yields a single combinatorial candidate and so
+    # cannot diverge.  A "recovered-fold" disagreement is expected: main left
+    # the plane 'unresolved' (mirror-fold) and a two-plane predictor guessed a
+    # fold partner that the combinatorial 3-plane χ² resolved differently.
+    by_src: Counter = Counter()
+    for r in reports:
+        for v in r.subset_violations or ():
+            by_src[v.main_resolved_by] += 1
+    breakdown = "   ".join(
+        f"{label}: {by_src[key]}"
+        for key, label in (("recovered", "recovered-fold"), ("decoded", "decoded"))
+        if by_src[key]
+    )
+    _emit(lines, f"    Diverging planes by main's resolution:  {breakdown or '(none)'}")
+    for i, r in enumerate(reports[:_SUBSET_FAIL_SHOW], start=1):
+        chi2 = f"{r.chi2:.2f}" if r.chi2 is not None else "n/a"
+        triple = ",".join(r.tel_quality) if r.tel_quality is not None else "?"
+        _emit(lines, f"      evt {i:>3}  χ²={chi2:>8}  triple=({triple})")
+        for v in r.subset_violations or ():
+            _emit(
+                lines,
+                f"        plane {v.plane}: "
+                f"main {v.main_quality}({v.main_resolved_by}) "
+                f"@({v.main_x:.1f},{v.main_y:.1f}) "
+                f"-> combo {v.combo_quality} @({v.combo_x:.1f},{v.combo_y:.1f})  "
+                f"Δ=({v.dx:+.1f},{v.dy:+.1f}) mm",
+            )
+    if n > _SUBSET_FAIL_SHOW:
+        _emit(
+            lines,
+            f"      … and {n - _SUBSET_FAIL_SHOW} more (showing first "
+            f"{_SUBSET_FAIL_SHOW}).",
+        )
+
+
+def _probe_footprint(pose: PoseResult) -> tuple[float, float, float, float]:
+    """
+    Padded bounding box (u_lo, u_hi, v_lo, v_hi) of the inlier hits in the
+    probe's local (u, v) frame, used as a stand-in for its true active area
+    — the probe's real channel count/extent is not known a priori (DESIGN.md
+    "Probe active area inference"), so this is a data-driven estimate, not a
+    measured detector dimension.
+    """
+    u_arr = np.array([co.u for co in pose.inliers])
+    v_arr = np.array([co.v for co in pose.inliers])
+    u_lo, u_hi = u_arr.min() - _PLOT_PAD_MM, u_arr.max() + _PLOT_PAD_MM
+    v_lo, v_hi = v_arr.min() - _PLOT_PAD_MM, v_arr.max() + _PLOT_PAD_MM
+    return float(u_lo), float(u_hi), float(v_lo), float(v_hi)
+
+
+def _plot_pose_3d(
+    pose: PoseResult,
+    alignment: AlignmentCorrection,
+    z_tel: np.ndarray,
+    out_path: Path,
+    show: bool = False,
+) -> None:
+    """
+    Save a self-contained, interactive 3D plot (rotate/zoom/pan/hover) of the
+    telescope planes, the fitted probe plane, and the inlier tracks
+    connecting them, as an HTML file viewable in any browser without
+    matplotlib/Python installed. If show is True, also open it in a browser
+    tab — Plotly's fig.show() spawns the tab and returns immediately, so it
+    never blocks the rest of the pipeline.
+
+    Telescope planes are drawn at the nominal [0, _TEL_SIZE_MM]^2 footprint
+    in the alignment-corrected common frame — the same frame the pose fit
+    itself works in (PoseFitter._decode_cluster subtracts each plane's
+    delta_x/delta_y before fitting), so no per-plane offset is drawn. The
+    probe footprint is inferred from the inlier hit spread since its true
+    channel count is not known a priori (DESIGN.md "Probe active area
+    inference").
+    """
+    import plotly.graph_objects as go
+
+    inliers = pose.inliers
+    z_corr = alignment.corrected_z_tel(z_tel)
+
+    traces = []
+
+    # ── Telescope planes ────────────────────────────────────────────────
+    square_x = [0.0, _TEL_SIZE_MM, _TEL_SIZE_MM, 0.0, 0.0]
+    square_y = [0.0, 0.0, _TEL_SIZE_MM, _TEL_SIZE_MM, 0.0]
+    for k, z in enumerate(z_corr):
+        traces.append(
+            go.Scatter3d(
+                x=square_x,
+                y=square_y,
+                z=[float(z)] * 5,
+                mode="lines",
+                line=dict(color="steelblue", width=4),
+                name=f"Plane {k}",
+            )
+        )
+
+    # ── Probe plane (footprint from the inlier hit spread, plus margin) ──
+    c, s = math.cos(pose.theta), math.sin(pose.theta)
+    u_lo, u_hi, v_lo, v_hi = _probe_footprint(pose)
+    local_u = [u_lo, u_hi, u_hi, u_lo, u_lo]
+    local_v = [v_lo, v_lo, v_hi, v_hi, v_lo]
+    probe_x = [pose.t_x + u * c - v * s for u, v in zip(local_u, local_v)]
+    probe_y = [pose.t_y + u * s + v * c for u, v in zip(local_u, local_v)]
+    traces.append(
+        go.Scatter3d(
+            x=probe_x,
+            y=probe_y,
+            z=[pose.z_p] * 5,
+            mode="lines",
+            line=dict(color="crimson", width=4),
+            name="Probe (footprint inferred from inlier spread)",
+            hovertemplate="Probe footprint<br>inferred from inlier hit spread"
+            " — not a measured detector size<extra></extra>",
+        )
+    )
+
+    # ── Inlier tracks, passing through each telescope plane and the probe ─
+    # Pack all disconnected segments into one trace, separated by None.
+    z_pts = np.sort(np.append(z_corr, pose.z_p))  # (4,)
+    a_x = np.array([co.a_x for co in inliers])
+    b_x = np.array([co.b_x for co in inliers])
+    a_y = np.array([co.a_y for co in inliers])
+    b_y = np.array([co.b_y for co in inliers])
+    xs_all = a_x[:, None] + b_x[:, None] * z_pts[None, :]  # (n_inliers, 4)
+    ys_all = a_y[:, None] + b_y[:, None] * z_pts[None, :]
+
+    track_x: list[float | None] = []
+    track_y: list[float | None] = []
+    track_z: list[float | None] = []
+    for xs, ys in zip(xs_all, ys_all):
+        track_x.extend([*xs.tolist(), None])
+        track_y.extend([*ys.tolist(), None])
+        track_z.extend([*z_pts.tolist(), None])
+    traces.append(
+        go.Scatter3d(
+            x=track_x,
+            y=track_y,
+            z=track_z,
+            mode="lines",
+            line=dict(color="gray", width=1),
+            opacity=0.4,
+            name="Inlier tracks",
+            hoverinfo="skip",
+        )
+    )
+    traces.append(
+        go.Scatter3d(
+            x=xs_all.ravel(),
+            y=ys_all.ravel(),
+            z=np.tile(z_pts, len(inliers)),
+            mode="markers",
+            marker=dict(color="darkorange", size=2, opacity=0.5),
+            name="Track hits",
+        )
+    )
+
+    # Caption flagging the probe footprint as inferred rather than measured —
+    # placed at one corner of the drawn square so it doesn't overlap the
+    # track cloud in the middle.
+    footprint_note = dict(
+        x=probe_x[0],
+        y=probe_y[0],
+        z=pose.z_p,
+        text="Probe footprint: inferred from inlier spread, not a measured size",
+        showarrow=False,
+        font=dict(size=10, color="crimson"),
+        xanchor="left",
+        yanchor="top",
+    )
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="x  [mm]",
+            yaxis_title="y  [mm]",
+            zaxis_title="z  [mm]",
+            aspectmode="data",
+            annotations=[footprint_note],
+        ),
+        title=f"Probe pose fit — {len(inliers)} inlier tracks",
+    )
+    fig.write_html(out_path)
+
+    if show:
+        fig.show()
+
+
 def main() -> None:
     args = _parse_args()
     tel_dir: Path = args.telescope
@@ -170,6 +445,7 @@ def main() -> None:
     z_tel = np.array(args.z_tel)
     tot_thresh: int = args.tot_thresh
     tot_weights: bool = args.tot_weights
+    min_anchor_planes: int = args.min_anchor_planes
 
     lines: list[str] = []
 
@@ -183,6 +459,7 @@ def main() -> None:
     _emit(lines, f"  Telescope data: {tel_dir}")
     _emit(lines, f"  Probe data:     {prb_dir}")
     _emit(lines, f"  Telescope plane z (mm): {z_str}")
+    _emit(lines, f"  Min anchor planes: {min_anchor_planes}")
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────
@@ -299,6 +576,55 @@ def main() -> None:
     tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
     prb_stream = reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0)
 
+    # Gate-funnel and per-plane candidate-count stats, collected straight
+    # from PoseFitter._decode_cluster's own DecodeReport — not a separate
+    # re-derivation of its logic (see DecodeReport's docstring in stage5.py).
+    gate_counts: Counter = Counter()
+    cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
+    prb_q_at_decode: Counter = Counter()
+    # The winning triple's χ² is reported for every cluster that reached the
+    # χ² search, both ones that then passed the <_CHI2_TRACK cut ("accepted"/
+    # "probe_quality") and ones that didn't ("chi2_track_cut" — the best of
+    # a noisy candidate search, can be huge). Track pass/fail separately:
+    # conflating them buries the post-cut population (which should look like
+    # genuine tracks) under the much larger, much noisier rejected pool.
+    chi2_n = {"pass": 0, "fail": 0}
+    chi2_sum = {"pass": 0.0, "fail": 0.0}
+    chi2_sumsq = {"pass": 0.0, "fail": 0.0}
+    # Combinatorial-only recovery + subset tracking, straight from
+    # DecodeReport.tel_quality/subset_ok (see stage5.py).  tel_q_dist[k] is the
+    # golden/cluster/combo breakdown of accepted winning triples per plane
+    # ("combo" = recovered only by the χ² search, not by main's pipeline);
+    # combo_stats counts events with >=1 combo plane.  subset_fail_reports
+    # holds the reports where a plane main resolved disagrees with the
+    # combinatorial winner (a main ⊄ combinatorial violation), kept whole so
+    # the per-event divergence can be printed below.
+    tel_q_dist: list[Counter] = [Counter(), Counter(), Counter()]
+    combo_stats = {"events": 0, "planes": 0}
+    subset_fail_reports: list[DecodeReport] = []
+
+    def _on_decode(r: DecodeReport) -> None:
+        gate_counts[r.reason] += 1
+        if r.cand_counts is not None:
+            for k in range(3):
+                cand_dist[k][_cand_bucket(r.cand_counts[k])] += 1
+        if r.prb_quality is not None:
+            prb_q_at_decode[r.prb_quality] += 1
+        bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
+        if r.chi2 is not None:
+            chi2_n[bucket] += 1
+            chi2_sum[bucket] += r.chi2
+            chi2_sumsq[bucket] += r.chi2 * r.chi2
+        if r.accepted and r.tel_quality is not None:
+            for k in range(3):
+                tel_q_dist[k][r.tel_quality[k]] += 1
+            n_combo = sum(1 for q in r.tel_quality if q == "combo")
+            if n_combo:
+                combo_stats["events"] += 1
+                combo_stats["planes"] += n_combo
+        if r.subset_ok is False:
+            subset_fail_reports.append(r)
+
     fitter = PoseFitter(
         tel_z=z_tel,
         alignment=alignment,
@@ -308,14 +634,12 @@ def main() -> None:
         prb_pos_paths=prb_pos,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        min_anchor_planes=min_anchor_planes,
+        on_decode=_on_decode,
     )
 
     n_coinc = 0
     total_cluster_size = 0
-    tel_hit_q: list[Counter] = [Counter(), Counter(), Counter()]
-    prb_hit_q: Counter = Counter()
-    _pos_paths = {0: tel_pos, 1: prb_pos}
-    _n_cols = {0: 3, 1: 1}
 
     for cluster in coincidence_stream(
         [tel_stream, prb_stream],
@@ -323,31 +647,6 @@ def main() -> None:
     ):
         n_coinc += 1
         total_cluster_size += len(cluster)
-        for det_id, _ev, ref in cluster:
-            hits = decode_position(
-                ref,
-                _pos_paths[det_id],
-                n_cols=_n_cols[det_id],
-                tot_thresh=tot_thresh,
-                tot_weights=tot_weights,
-            )
-            if det_id == 0:
-                # Reflect the two-plane recovery the pose fit applies, so the
-                # quality table is not artificially dominated by 'unresolved'
-                # (corrected-frame offsets, matching PoseFitter._decode_cluster).
-                hits = disambiguate_telescope_hits(
-                    hits,
-                    z_tel,
-                    offsets=[
-                        (alignment.planes[k].delta_x, alignment.planes[k].delta_y)
-                        for k in range(3)
-                    ],
-                )
-                for plane_idx, h in enumerate(hits):
-                    tel_hit_q[plane_idx][h.quality if h is not None else "missing"] += 1
-            else:
-                for h in hits:
-                    prb_hit_q[h.quality if h is not None else "missing"] += 1
         fitter.add(cluster)
 
     pose = fitter.flush()
@@ -360,21 +659,101 @@ def main() -> None:
     _emit(lines)
 
     # ── Print stage 3 ────────────────────────────────────────────────────
-    _emit(lines, "=== Stage 3: Hit quality (coincidence survivors) ===")
+    _emit(lines, "=== Stage 3: Pose-fit gate funnel (combinatorial path) ===")
     _emit(
         lines,
-        "  (telescope quality is after two-plane recovery, as used by the pose "
-        "fit; probe is raw)",
+        "  (counts come from PoseFitter._decode_cluster's own DecodeReport, "
+        "not a separate re-derivation)",
     )
+    running = n_coinc
+    for reason in GATE_ORDER:
+        n = gate_counts[reason]
+        running -= n
+        _emit(lines, f"  rejected: {reason:<22} {n:>7}   survivors -> {running}")
+    # Catch-all: any reason _decode_cluster emits that is neither a known gate
+    # nor "accepted" (e.g. a gate added to _decode_cluster but not to
+    # GATE_ORDER).  Without this the funnel would silently drop those counts
+    # and the survivor arithmetic would no longer reconcile.
+    other = sum(
+        n for r, n in gate_counts.items() if r not in GATE_ORDER and r != "accepted"
+    )
+    if other:
+        running -= other
+        _emit(
+            lines, f"  rejected: {'gate_other':<22} {other:>7}   survivors -> {running}"
+        )
     _emit(
-        lines, f"  {n_coinc} coincidences x 3 telescope planes = {n_coinc * 3} readings"
+        lines,
+        f"  accepted (fed to pose optimizer)         {gate_counts['accepted']:>7}",
     )
-    for k, q in enumerate(tel_hit_q):
-        parts = "   ".join(f"{qn} {q[qn]}" for qn in _HIT_QUALITIES)
-        _emit(lines, f"  Plane {k}    {parts}")
-    _emit(lines, f"  {n_coinc} coincidences x 1 probe plane = {n_coinc} readings")
-    prb_parts = "   ".join(f"{q} {prb_hit_q[q]}" for q in _HIT_QUALITIES)
-    _emit(lines, f"  Probe      {prb_parts}")
+    _emit(lines)
+    # ── Telescope candidates per plane (before the triple search) ──
+    _emit(lines, "  Telescope candidates per plane (before the triple search):")
+    for k in range(3):
+        parts = "   ".join(
+            f"{label} {cand_dist[k][label]:>6}" for label in _CAND_BUCKETS
+        )
+        _emit(lines, f"    Plane {k}    {parts}")
+
+    # ── Accepted winning-triple hit quality (per plane) ──
+    n_accepted = gate_counts["accepted"]
+    _emit(lines)
+    _emit(lines, "  Accepted winning-triple hit quality, per plane")
+    _emit(
+        lines,
+        "    (golden/cluster = main's pipeline resolves it too; "
+        "combo = recovered only by the χ² search):",
+    )
+    for k in range(3):
+        parts = "   ".join(
+            f"{label} {tel_q_dist[k][label]:>6}" for label in _TEL_QUALITY_ORDER
+        )
+        _emit(lines, f"    Plane {k}    {parts}")
+    _emit(
+        lines,
+        f"    Combinatorial-only recoveries: {combo_stats['events']} of {n_accepted}"
+        f" accepted events carry >=1 combo plane ({combo_stats['planes']} combo"
+        f" planes total).",
+    )
+
+    # ── Probe hit quality ──
+    _emit(lines)
+    _emit(lines, "  Probe hit quality (coincidences that reached probe decode):")
+    # List every quality that actually occurred, in canonical order, so the
+    # rejected buckets (unresolved / invalid) aren't hidden and the counts
+    # reconcile with the number of probe decodes.
+    prb_parts = "   ".join(
+        f"{q} {prb_q_at_decode[q]}" for q in _PRB_QUALITY_ORDER if prb_q_at_decode[q]
+    )
+    _emit(lines, f"    {prb_parts or '(none)'}")
+
+    # ── Winning-triple χ² ──
+    _emit(lines)
+    _emit(lines, "  Winning-triple line-fit χ²:")
+    for bucket, label in (
+        ("pass", "passed cut (accepted + probe_quality-rejected)"),
+        ("fail", "failed cut (chi2_track_cut, best of a noisy search)"),
+    ):
+        n = chi2_n[bucket]
+        if n:
+            mean = chi2_sum[bucket] / n
+            var = max(chi2_sumsq[bucket] / n - mean * mean, 0.0)
+            _emit(
+                lines,
+                f"    {label}: mean={mean:.3f}  std={math.sqrt(var):.3f}  n={n}",
+            )
+
+    # ── Subset check: main golden/cluster ⊆ combinatorial ──
+    _emit(lines)
+    n_fail = len(subset_fail_reports)
+    verdict = "PASS" if n_fail == 0 else f"FAIL ({n_fail} of {n_accepted} events)"
+    _emit(
+        lines,
+        f"  Subset check (is every main-resolved hit on the combinatorial "
+        f"track?): {verdict}",
+    )
+    if n_fail:
+        _emit_subset_failures(lines, subset_fail_reports)
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────
@@ -398,9 +777,32 @@ def main() -> None:
         )
         _emit(lines, f"  z_p   = {pose.z_p:+7.1f} ± {sigma_zp:.1f} mm")
         _emit(lines, f"  n_inliers = {pose.n_inliers}")
+        u_lo, u_hi, v_lo, v_hi = _probe_footprint(pose)
+        _emit(
+            lines,
+            f"  Probe footprint (inferred from inlier hit spread, "
+            f"±{_PLOT_PAD_MM:.0f} mm margin; not a measured detector size):",
+        )
+        _emit(
+            lines,
+            f"    u: {u_lo:+7.1f} to {u_hi:+7.1f} mm  (width  {u_hi - u_lo:6.1f} mm)",
+        )
+        _emit(
+            lines,
+            f"    v: {v_lo:+7.1f} to {v_hi:+7.1f} mm  (height {v_hi - v_lo:6.1f} mm)",
+        )
+
+    # ── Optional 3D plot ─────────────────────────────────────────────────
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.plot:
+        if pose is None:
+            _emit(lines, "  (--plot skipped: no pose fit available)")
+        else:
+            plot_path = out_dir / "pose_3d.html"
+            _plot_pose_3d(pose, alignment, z_tel, plot_path, show=True)
+            _emit(lines, f"  3D plot written to {plot_path}")
 
     # ── Write summary.txt ─────────────────────────────────────────────────
-    out_dir.mkdir(parents=True, exist_ok=True)
     summary = out_dir / "summary.txt"
     summary.write_text("\n".join(lines) + "\n")
     print(f"\nSummary written to {summary}")

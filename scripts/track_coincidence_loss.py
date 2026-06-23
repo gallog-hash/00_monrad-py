@@ -2,8 +2,10 @@
 
 Replays pass 2 of run_pipeline.py (coincidence search + pose fit) against real
 data, but tallies *why* each Stage 2 coincidence fails to become a Stage 5
-inlier.  The five gates live inside PoseFitter._decode_cluster + fit_probe_pose
-(stage5.py); we subclass PoseFitter to count them without altering behaviour.
+inlier.  The gates live inside PoseFitter._decode_cluster; rather than
+re-implementing them here (which previously drifted out of sync when
+_decode_cluster's algorithm changed), this hooks PoseFitter.on_decode and
+tallies the DecodeReport it emits, so this script can never go stale again.
 """
 
 from __future__ import annotations
@@ -23,88 +25,13 @@ from monrad.stage1 import (  # noqa: E402
     reconstruct_stream,
 )
 from monrad.stage2 import coincidence_stream  # noqa: E402
-from monrad.stage3 import (  # noqa: E402
-    decode_position,
-    disambiguate_telescope_hits,
-)
+from monrad.stage3 import decode_position  # noqa: E402
 from monrad.stage4 import AlignmentAccumulator  # noqa: E402
-from monrad.stage5 import _CHI2_TRACK, PoseFitter, _tel_line_fit  # noqa: E402
+from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter  # noqa: E402
 
 Z_TEL = np.array([0.0, -1340.0, -670.0])
 TEL_DIR = Path("data/0_testLab_20210723/Base")
 PRB_DIR = Path("data/0_testLab_20210723/Probe_0")
-
-
-class CountingPoseFitter(PoseFitter):
-    """PoseFitter that tallies each rejection gate in _decode_cluster."""
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.reasons: Counter = Counter()
-
-    def _decode_cluster(self, cluster):
-        tel_refs = [r for det_id, _e, r in cluster if det_id == self.tel_id]
-        prb_refs = [r for det_id, _e, r in cluster if det_id == self.prb_id]
-        if len(tel_refs) != 1 or len(prb_refs) != 1:
-            self.reasons["gate1_ambiguous_cluster"] += 1
-            return None
-        tel_ref, prb_ref = tel_refs[0], prb_refs[0]
-
-        tel_hits = decode_position(
-            tel_ref,
-            self.tel_pos_paths,
-            n_cols=3,
-            tot_thresh=self.tot_thresh,
-            tot_weights=self.tot_weights,
-        )
-        fail_before = any(h.quality not in ("golden", "cluster") for h in tel_hits)
-        align = self.alignment
-        tel_hits = disambiguate_telescope_hits(
-            tel_hits,
-            self.tel_z,
-            offsets=[
-                (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
-            ],
-        )
-        fail_after = any(h.quality not in ("golden", "cluster") for h in tel_hits)
-        if fail_before and not fail_after:
-            self.reasons["recovered_by_disambiguation"] += 1
-        if fail_after:
-            self.reasons["gate2_tel_hit_quality"] += 1
-            return None
-
-        corr = self.alignment
-        x_arr = np.array([tel_hits[k].x_mm - corr.planes[k].delta_x for k in range(3)])
-        y_arr = np.array([tel_hits[k].y_mm - corr.planes[k].delta_y for k in range(3)])
-        sigma_x_arr = np.array([tel_hits[k].sigma_x for k in range(3)])
-        sigma_y_arr = np.array([tel_hits[k].sigma_y for k in range(3)])
-        z_arr = self.alignment.corrected_z_tel(self.tel_z)
-        z_x_arr = z_arr + np.array([corr.planes[k].tilt_y * x_arr[k] for k in range(3)])
-        z_y_arr = z_arr + np.array([corr.planes[k].tilt_x * y_arr[k] for k in range(3)])
-        _ax, _bx, _ay, _by, _cx, _cy, chi2_line = _tel_line_fit(
-            x_arr, y_arr, z_x_arr, sigma_x_arr, sigma_y_arr, z_y_arr=z_y_arr
-        )
-        if chi2_line >= _CHI2_TRACK:
-            self.reasons["gate3_track_chi2"] += 1
-            return None
-
-        prb_hits = decode_position(
-            prb_ref,
-            self.prb_pos_paths,
-            n_cols=1,
-            tot_thresh=self.tot_thresh,
-            tot_weights=self.tot_weights,
-        )
-        if prb_hits[0].quality not in ("golden", "cluster"):
-            self.reasons["gate4_probe_hit_quality"] += 1
-            return None
-
-        co = super()._decode_cluster(cluster)
-        if co is None:
-            self.reasons["gate_other"] += 1
-        else:
-            self.reasons["accepted_clean"] += 1
-        return co
 
 
 def _load(d: Path) -> tuple[datetime, int, list[Path], list[Path]]:
@@ -124,7 +51,28 @@ def main() -> None:
         accum.add(decode_position(ref, tel_pos, n_cols=3, tot_thresh=1))
     alignment = accum.flush()
 
-    fitter = CountingPoseFitter(
+    reasons: Counter = Counter()
+    cand_ambiguous_planes: Counter = Counter()  # per cluster: 0/1/2/3 planes len>1
+    # The winning triple's chi2 is reported both for clusters that passed the
+    # <_CHI2_TRACK cut ("accepted"/"probe_quality") and ones that didn't
+    # ("chi2_track_cut" — the best of a noisy candidate search). Keep the
+    # two separate throughout, or the much larger/noisier rejected pool
+    # buries the post-cut stats (e.g. chi2 should sit near 0 post-cut, but
+    # averaged with the rejected pool it looks like it's mean=147).
+    chi2_n = {"pass": 0, "fail": 0}
+    chi2_sum = {"pass": 0.0, "fail": 0.0}
+
+    def _on_decode(r: DecodeReport) -> None:
+        reasons[r.reason] += 1
+        if r.cand_counts is not None:
+            n_ambiguous = sum(1 for n in r.cand_counts if n > 1)
+            cand_ambiguous_planes[n_ambiguous] += 1
+        bucket = "fail" if r.reason == "chi2_track_cut" else "pass"
+        if r.chi2 is not None:
+            chi2_n[bucket] += 1
+            chi2_sum[bucket] += r.chi2
+
+    fitter = PoseFitter(
         tel_z=Z_TEL,
         alignment=alignment,
         tel_id=0,
@@ -132,6 +80,7 @@ def main() -> None:
         tel_pos_paths=tel_pos,
         prb_pos_paths=prb_pos,
         tot_thresh=1,
+        on_decode=_on_decode,
     )
 
     tel_stream = reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0)
@@ -143,32 +92,45 @@ def main() -> None:
         fitter.add(cluster)
     pose = fitter.flush()
 
-    r = fitter.reasons
-    clean = r["accepted_clean"]
+    clean = reasons["accepted"]
     n_inliers = pose.n_inliers if pose else 0
     ransac = clean - n_inliers
 
     print("\n=== Coincidence loss funnel (Stage 2 -> Stage 5) ===")
     print(f"  Stage 2 coincidences found            : {n_coinc:>8}")
-    rows = [
-        ("gate1: ambiguous cluster (not 1 tel+1 prb)", r["gate1_ambiguous_cluster"]),
-        ("gate2: telescope hit quality (any plane)  ", r["gate2_tel_hit_quality"]),
-        ("gate3: telescope track chi2 cut           ", r["gate3_track_chi2"]),
-        ("gate4: probe hit quality                  ", r["gate4_probe_hit_quality"]),
-        ("gate_other                                ", r["gate_other"]),
-    ]
     running = n_coinc
-    for label, n in rows:
+    for reason in GATE_ORDER:
+        n = reasons[reason]
         pct = 100.0 * n / n_coinc if n_coinc else 0.0
         running -= n
-        print(f"  - {label}: {n:>8}  ({pct:5.2f}%)   survivors -> {running}")
-    print(f"  Clean coincidences fed to fit         : {clean:>8}")
-    print(f"  - gate5: RANSAC Mahalanobis outliers      : {ransac:>8}")
-    print(f"  Stage 5 inliers (final)               : {n_inliers:>8}")
-    print(
-        f"\n  (of which recovered by two-plane disambiguation at gate2: "
-        f"{r['recovered_by_disambiguation']})"
+        print(f"  - {reason:<28}: {n:>8}  ({pct:5.2f}%)   survivors -> {running}")
+    # Catch-all for any reason that is neither a known gate nor "accepted"
+    # (e.g. a gate added to _decode_cluster but not to GATE_ORDER), so the
+    # funnel never silently loses counts and survivors stay reconciled.
+    other = sum(
+        n for r, n in reasons.items() if r not in GATE_ORDER and r != "accepted"
     )
+    if other:
+        pct = 100.0 * other / n_coinc if n_coinc else 0.0
+        running -= other
+        print(
+            f"  - {'gate_other':<28}: {other:>8}  ({pct:5.2f}%)   survivors -> {running}"
+        )
+    print(f"  Clean coincidences fed to fit         : {clean:>8}")
+    print(f"  - RANSAC Mahalanobis outliers          : {ransac:>8}")
+    print(f"  Stage 5 inliers (final)               : {n_inliers:>8}")
+    print("\n  Telescope ambiguous-plane count per cluster (candidates>1):")
+    for n_amb in sorted(cand_ambiguous_planes):
+        print(f"    {n_amb} plane(s) ambiguous: {cand_ambiguous_planes[n_amb]:>8}")
+    for bucket, label in (
+        ("pass", "passed cut (accepted + probe_quality-rejected)"),
+        ("fail", "failed cut (chi2_track_cut, best of a noisy search)"),
+    ):
+        n = chi2_n[bucket]
+        if n:
+            print(
+                f"\n  Winning-triple chi2, {label}: mean={chi2_sum[bucket] / n:.3f}  n={n}"
+            )
     if n_coinc:
         print(
             f"\n  Overall survival: {n_inliers}/{n_coinc} = "

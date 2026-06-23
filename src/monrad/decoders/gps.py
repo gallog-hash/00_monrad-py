@@ -15,6 +15,20 @@ import struct
 import numpy as np
 import sys
 
+GPS_CLK_BITS = 52
+GPS_CLK_MASK = (1 << GPS_CLK_BITS) - 1  # 0xFFFFFFFFFFFFF
+GPS_GEN_SHIFT = GPS_CLK_BITS  # 52
+GPS_GEN_MASK = 0x7FF
+GPS_FLAG_SHIFT = 63
+
+
+def unpack_gps_word(value: int) -> tuple[int, int, bool]:
+    """Return (clk, gen, flag) extracted from one GPS u64 word."""
+    clk = value & GPS_CLK_MASK
+    gen = (value >> GPS_GEN_SHIFT) & GPS_GEN_MASK
+    flag = bool((value >> GPS_FLAG_SHIFT) & 1)
+    return clk, gen, flag
+
 
 class GPSDecoder:
     """Decoder for _GPS.bin files."""
@@ -48,11 +62,8 @@ class GPSDecoder:
 
     @staticmethod
     def _parse_u64(value: int) -> dict:
-        return {
-            "CLK": value & 0xFFFFFFFFFFFFF,  # bits  0-51 (52 bits)
-            "GEN": (value >> 52) & 0x7FF,  # bits 52-62 (11 bits)
-            "FLAG": (value >> 63) & 0x1,  # bit  63    ( 1 bit)
-        }
+        clk, gen, flag = unpack_gps_word(value)
+        return {"CLK": clk, "GEN": gen, "FLAG": flag}
 
     def analyze(self):
         n_rows, data = self.read()

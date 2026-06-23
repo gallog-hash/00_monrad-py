@@ -17,10 +17,21 @@ from pathlib import Path
 from typing import Literal, NamedTuple, Sequence
 
 from .stage1 import PosRef
-from .decoders.position import BinDecoder
+from .decoders.position import (
+    BinDecoder,
+    POS_COORD_MASK,
+    POS_X_SHIFT,
+    POS_HALF_BITS,
+    split_half,
+    combine_channel,
+    split_channel,
+)
 
-_STRIP_MM = 10.0  # mm per channel strip — DESIGN.md §5.4
-_N = 10  # fiber × ribbon encoding multiplier
+_STRIP_MM = 10.0  # mm per channel strip — DESIGN.md §6.5
+_N = POS_HALF_BITS  # fiber × ribbon encoding multiplier
+
+# Qualities that count as a usable hit for the pose fit.
+GOOD_QUALITIES = ("golden", "cluster")
 
 
 class Hit(NamedTuple):
@@ -78,6 +89,56 @@ def _read_block(
     return head + tail
 
 
+def _bit_counts(words: list[int], col: int, n_cols: int) -> tuple[list[int], list[int]]:
+    """
+    Per-bit row counts (0..16) for one column's X/Y 20-bit fields across the
+    16-row block.  bits 0-9 = ribbon, bits 10-19 = fiber.  Shared by
+    _or_masks's tot_thresh>1 path, decode_position's tot_weights path, and
+    reconstruct_plane_candidates's TOT scoring.
+    """
+    x_counts = [0] * 20
+    y_counts = [0] * 20
+    for row in range(16):
+        w = words[row * n_cols + col]
+        y_bits = w & POS_COORD_MASK
+        x_bits = (w >> POS_X_SHIFT) & POS_COORD_MASK
+        for bit in range(20):
+            if (x_bits >> bit) & 1:
+                x_counts[bit] += 1
+            if (y_bits >> bit) & 1:
+                y_counts[bit] += 1
+    return x_counts, y_counts
+
+
+def _or_masks(
+    words: list[int],
+    col: int,
+    n_cols: int,
+    tot_thresh: int = 1,
+) -> tuple[int, int]:
+    """
+    OR the X/Y 20-bit fields for one column across the 16-row block,
+    keeping only bits that fired in >= tot_thresh of the 16 rows.
+
+    tot_thresh=1 is a plain bitwise OR (DESIGN.md §6.2); tot_thresh>1 filters
+    single-row noise spikes via a per-bit TOT count, identical to the
+    count-path in decode_position().
+    """
+    if tot_thresh <= 1:
+        x_or = 0
+        y_or = 0
+        for row in range(16):
+            w = words[row * n_cols + col]
+            y_or |= w & POS_COORD_MASK
+            x_or |= (w >> POS_X_SHIFT) & POS_COORD_MASK
+        return x_or, y_or
+
+    x_counts, y_counts = _bit_counts(words, col, n_cols)
+    x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
+    y_or = sum((1 << bit) for bit in range(20) if y_counts[bit] >= tot_thresh)
+    return x_or, y_or
+
+
 def _tot_weighted_centroid(
     candidates: list[int],
     ribbon_counts: list[int],
@@ -89,7 +150,8 @@ def _tot_weighted_centroid(
     Each candidate ch = 10*r + f gets weight = ribbon_counts[r] * fiber_counts[f].
     Falls back to the unweighted mean if all weights are zero.
     """
-    weights = [ribbon_counts[ch // _N] * fiber_counts[ch % _N] for ch in candidates]
+    rf = [split_channel(ch, _N) for ch in candidates]
+    weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
     total = sum(weights)
     if total == 0:
         return sum(candidates) / len(candidates)
@@ -102,8 +164,7 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
     'unresolved'.  centroid_ch is in channel units; width is the number of
     combined channels in the hypothesis, used to compute sigma on selection.
     """
-    fiber_half = (field_or >> _N) & 0x3FF
-    ribbon_half = field_or & 0x3FF
+    fiber_half, ribbon_half = split_half(field_or)
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
@@ -111,8 +172,80 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
     candidates: list[tuple[float, int]] = []
     for rc in rcs:
         for fc in fcs:
-            chs = [_N * r + f for r in rc for f in fc]
-            candidates.append((sum(chs) / len(chs), len(chs)))
+            # Split the (ribbon × fiber) cross-product into maximal contiguous
+            # channel runs — see _axis_candidates_with_tot for the rationale.
+            # Adjacent ribbons are N apart, so e.g. fiber {3,4} × ribbon {2,3}
+            # yields two candidates [23,24] and [33,34], not one width-4 blob
+            # straddling the 25..32 gap.
+            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
+            run = [chs[0]]
+            for ch in chs[1:]:
+                if ch == run[-1] + 1:
+                    run.append(ch)
+                else:
+                    candidates.append((sum(run) / len(run), len(run)))
+                    run = [ch]
+            candidates.append((sum(run) / len(run), len(run)))
+    return candidates
+
+
+def _axis_candidates_with_tot(
+    field_or: int, counts: list[int], tot_weights: bool = False
+) -> list[tuple[float, int, int]]:
+    """
+    Like _axis_candidates, but also returns each candidate's TOT score:
+    sum of ribbon_count * fiber_count (the _tot_weighted_centroid weighting
+    convention) over its contributing (ribbon, fiber) pairs — a measure of
+    how solidly each fired bit was seen across the 16-row block.
+
+    counts is the 20-element per-bit row count for this field (ribbon 0-9,
+    fiber 10-19), as returned by _bit_counts.
+
+    tot_weights : when True, each candidate's centroid is TOT-weighted by its
+                  per-channel ribbon_count * fiber_count (same convention as
+                  _tot_weighted_centroid / decode_position's tot_weights path),
+                  falling back to the unweighted mean when all weights are
+                  zero.  Width-1 candidates are unaffected.
+    """
+    fiber_half, ribbon_half = split_half(field_or)
+    ribbon_counts = counts[:_N]
+    fiber_counts = counts[_N:]
+
+    fcs = BinDecoder._find_clusters(fiber_half)
+    rcs = BinDecoder._find_clusters(ribbon_half)
+
+    candidates: list[tuple[float, int, int]] = []
+
+    def _emit(run: list[int]) -> None:
+        rf = [split_channel(c, _N) for c in run]
+        weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
+        tot = sum(weights)
+        if tot_weights and tot > 0:
+            centroid = sum(w * c for w, c in zip(weights, run)) / tot
+        else:
+            centroid = sum(run) / len(run)
+        candidates.append((centroid, len(run), tot))
+
+    for rc in rcs:
+        for fc in fcs:
+            # The (ribbon × fiber) cross-product is not necessarily a single
+            # hit: adjacent ribbons are N apart, so a multi-ribbon cluster only
+            # forms one contiguous channel run when the fiber cluster spans the
+            # full decade.  Otherwise the combined N*r+f channels break into
+            # several gap-free runs, each a distinct candidate — e.g. fiber
+            # {3,4} × ribbon {2,3} yields [23,24] and [33,34], not one width-4
+            # blob straddling the 25..32 gap.  Split into maximal contiguous
+            # runs (mirroring _reconstruct_coord's contiguity rule, but
+            # enumerating each run instead of rejecting the whole pair).
+            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
+            run = [chs[0]]
+            for ch in chs[1:]:
+                if ch == run[-1] + 1:
+                    run.append(ch)
+                else:
+                    _emit(run)
+                    run = [ch]
+            _emit(run)
     return candidates
 
 
@@ -127,14 +260,13 @@ def _decode_axis(
     bits 10–19: fiber mask
 
     Returns (centroid_ch, sigma_mm, quality).
-    Implements DESIGN.md §5.3 steps 1–5.
+    Implements DESIGN.md §6.4 steps 1–5.
 
     bit_counts : optional 20-element list of per-bit TOT counts
                  (bit_counts[0..9] = ribbon, bit_counts[10..19] = fiber).
                  When provided, cluster centroids are TOT-weighted.
     """
-    fiber_half = (field_or >> _N) & 0x3FF
-    ribbon_half = field_or & 0x3FF
+    fiber_half, ribbon_half = split_half(field_or)
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
@@ -164,10 +296,10 @@ def decode_position(
     """
     Decode one event's position from its PosRef.
 
-    Implements DESIGN.md §5.1–§5.4 using the fiber×ribbon logic from
+    Implements DESIGN.md §6.1–§6.5 using the fiber×ribbon logic from
     decoders/position.py (BinDecoder._find_clusters, _reconstruct_coord,
     _is_valid).  The PosRef is received directly from the stage-1 stream
-    (DESIGN_UPDATE.md §4) — no pos_map lookup.
+    (DESIGN.md §4.5) — no pos_map lookup.
 
     Parameters
     ----------
@@ -193,33 +325,18 @@ def decode_position(
     rather than checking for None.
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
-    use_counts = tot_thresh > 1 or tot_weights
 
     hits: list[Hit | None] = []
     for col in range(n_cols):
-        if not use_counts:
-            # Fast path: simple OR (original behaviour) — DESIGN.md §5.1
-            x_or = 0
-            y_or = 0
-            for row in range(16):
-                w = words[row * n_cols + col]
-                y_or |= w & 0xFFFFF
-                x_or |= (w >> 32) & 0xFFFFF
+        if not tot_weights:
+            # Fast path: OR (with threshold if requested) — DESIGN.md §6.2
+            x_or, y_or = _or_masks(words, col, n_cols, tot_thresh)
             x_counts_col = None
             y_counts_col = None
         else:
-            # Count-path: accumulate per-bit TOT counts across 16 rows.
-            x_counts_col = [0] * 20
-            y_counts_col = [0] * 20
-            for row in range(16):
-                w = words[row * n_cols + col]
-                y_bits = w & 0xFFFFF
-                x_bits = (w >> 32) & 0xFFFFF
-                for bit in range(20):
-                    if (x_bits >> bit) & 1:
-                        x_counts_col[bit] += 1
-                    if (y_bits >> bit) & 1:
-                        y_counts_col[bit] += 1
+            # Count-path: accumulate per-bit TOT counts across 16 rows, needed
+            # for weighted centroids (_tot_weighted_centroid below).
+            x_counts_col, y_counts_col = _bit_counts(words, col, n_cols)
             # Apply threshold: keep bit only if count >= tot_thresh.
             x_or = sum(
                 (1 << bit) for bit in range(20) if x_counts_col[bit] >= tot_thresh
@@ -227,11 +344,8 @@ def decode_position(
             y_or = sum(
                 (1 << bit) for bit in range(20) if y_counts_col[bit] >= tot_thresh
             )
-            if not tot_weights:
-                x_counts_col = None
-                y_counts_col = None
 
-        # Validity prefilter — DESIGN.md §5.2
+        # Validity prefilter — DESIGN.md §6.3
         valid, _ = BinDecoder._is_valid(x_or, y_or)
         if not valid:
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "invalid"))
@@ -261,13 +375,107 @@ def decode_position(
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "unresolved", cands_x, cands_y))
             continue
 
-        # Channel → physical coordinate — DESIGN.md §5.4
+        # Channel → physical coordinate — DESIGN.md §6.5
         x_mm = (cx + 0.5) * _STRIP_MM
         y_mm = (cy + 0.5) * _STRIP_MM
         quality = "golden" if (qx == "golden" and qy == "golden") else "cluster"
         hits.append(Hit(x_mm, y_mm, sx, sy, quality))
 
     return hits
+
+
+class PlaneCandidate(NamedTuple):
+    x_mm: float
+    y_mm: float
+    sigma_x: float
+    sigma_y: float
+    quality: Literal["golden", "cluster"]
+    tot_x: int  # ribbon_count * fiber_count summed over the X axis's bits
+    tot_y: int  # same, for the Y axis
+
+
+def reconstruct_plane_candidates(
+    pos_ref: PosRef,
+    pos_paths: list[Path],
+    n_cols: int,
+    max_per_plane: int = 16,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
+) -> list[list[PlaneCandidate]]:
+    """
+    Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
+    instead of collapsing each plane to a single resolved Hit.
+
+    Each plane's candidate list is the Cartesian product of its X-axis and
+    Y-axis candidates (`_axis_candidates_with_tot`): one candidate for a
+    golden/cluster axis, the full ribbon×fiber mirror-fold cross-product for
+    an ambiguous one.  An invalid plane (saturated half, or zero ribbon
+    channel) yields an empty list.  The product is capped at
+    `max_per_plane`, keeping the most compact candidates first (smallest
+    width_x + width_y, ties broken by channel) — used by the Stage 5
+    combinatorial track finder in place of a single resolved Hit per plane.
+
+    The default cap of 16 is the worst-case mirror-fold count: each axis can
+    fold into at most 2 ribbon × 2 fiber = 4 candidates, so a plane folded on
+    both axes yields 4 × 4 = 16 (DESIGN.md §10).  A smaller cap can silently
+    drop the true candidate when every candidate is equally compact.
+
+    Each candidate carries `quality` ("golden" if both axes are width 1,
+    else "cluster") and `tot_x`/`tot_y` (per-axis TOT score, see
+    _axis_candidates_with_tot) so callers can report the signal strength and
+    resolved-vs-cluster status of whichever candidate the Stage 5
+    combinatorial search ultimately picks.
+
+    tot_thresh mirrors decode_position's OR-mask threshold so the masks fed
+    to candidate enumeration match the resolved decode path exactly. Per-bit
+    counts are always computed (regardless of tot_thresh) to produce the TOT
+    scores above; this is the same count-path decode_position's tot_weights
+    uses, just unconditional here.
+
+    tot_weights mirrors decode_position's tot_weights: when True each
+    candidate centroid is TOT-weighted by its per-bit row counts (no effect
+    on width-1 candidates).  Without it the telescope path would silently
+    ignore the pipeline's --tot-weights flag that the probe decode honours.
+    """
+    words = _read_block(pos_paths, pos_ref, n_cols)
+
+    planes: list[list[PlaneCandidate]] = []
+    for col in range(n_cols):
+        x_counts, y_counts = _bit_counts(words, col, n_cols)
+        x_or = sum((1 << bit) for bit in range(20) if x_counts[bit] >= tot_thresh)
+        y_or = sum((1 << bit) for bit in range(20) if y_counts[bit] >= tot_thresh)
+
+        valid, _ = BinDecoder._is_valid(x_or, y_or)
+        if not valid:
+            planes.append([])
+            continue
+
+        cands_x = _axis_candidates_with_tot(x_or, x_counts, tot_weights)
+        cands_y = _axis_candidates_with_tot(y_or, y_counts, tot_weights)
+
+        points = [
+            (wx + wy, cx, cy, wx, wy, tx, ty)
+            for cx, wx, tx in cands_x
+            for cy, wy, ty in cands_y
+        ]
+        points.sort(key=lambda p: p[:3])
+
+        planes.append(
+            [
+                PlaneCandidate(
+                    x_mm=(cx + 0.5) * _STRIP_MM,
+                    y_mm=(cy + 0.5) * _STRIP_MM,
+                    sigma_x=(_STRIP_MM * wx) / math.sqrt(12),
+                    sigma_y=(_STRIP_MM * wy) / math.sqrt(12),
+                    quality="golden" if wx == 1 and wy == 1 else "cluster",
+                    tot_x=tx,
+                    tot_y=ty,
+                )
+                for _, cx, cy, wx, wy, tx, ty in points[:max_per_plane]
+            ]
+        )
+
+    return planes
 
 
 def disambiguate_telescope_hits(
