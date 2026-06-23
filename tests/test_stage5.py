@@ -389,6 +389,7 @@ def _run_fold_pipeline(
     fold_symmetry=1.0,
     fold_crosstalk_rate=0.0,
     on_decode=None,
+    min_anchor_planes=1,
 ):
     """Generate fold-ambiguous synthetic data and run the streaming
     pipeline through PoseFitter.flush(); return the PoseResult (or None).
@@ -432,6 +433,7 @@ def _run_fold_pipeline(
         tel_pos_paths=tel_pos,
         prb_pos_paths=prb_pos,
         refit_every=n_tracks + 1,  # no auto-flush; use explicit flush()
+        min_anchor_planes=min_anchor_planes,
         on_decode=on_decode,
     )
 
@@ -685,6 +687,51 @@ class TestFoldedPoseRecoveryAllPlanesFails:
             "appears to have changed; see this test's docstring before "
             "relaxing it"
         )
+
+
+class TestMinAnchorPlanesTunable:
+    """
+    The anchor-plane guard is tunable via PoseFitter(min_anchor_planes=N):
+    the search runs only when at least N planes decoded to a single resolved
+    candidate.  N=1 is the default (original behaviour); N=0 disables the guard
+    so even all-3-ambiguous clusters reach the χ² search.
+    """
+
+    @pytest.mark.parametrize("bad", [-1, 4])
+    def test_constructor_rejects_out_of_range(self, bad):
+        with pytest.raises(ValueError, match="min_anchor_planes"):
+            PoseFitter(
+                tel_z=Z_TEL,
+                alignment=AlignmentCorrection.identity(),
+                tel_id=0,
+                prb_id=1,
+                tel_pos_paths=[],
+                prb_pos_paths=[],
+                min_anchor_planes=bad,
+            )
+
+    def test_default_gate_rejects_all_fold(self, tmp_path_factory):
+        # With every plane mirror-fold ambiguous, no plane is an anchor, so the
+        # default guard (min_anchor_planes=1) rejects every coincidence via the
+        # "no_anchor_plane" gate and nothing reaches the χ² search.
+        out = tmp_path_factory.mktemp("min_anchor_default")
+        reports: list = []
+        _run_fold_pipeline(out, fold=True, on_decode=reports.append)
+        assert reports, "no coincidences were decoded at all"
+        assert any(r.reason == "no_anchor_plane" for r in reports)
+        assert not any(r.accepted for r in reports)
+
+    def test_zero_disables_gate(self, tmp_path_factory):
+        # min_anchor_planes=0 removes the guard: the same all-fold clusters now
+        # run the combinatorial search instead of being rejected, so not a
+        # single "no_anchor_plane" rejection is emitted.
+        out = tmp_path_factory.mktemp("min_anchor_zero")
+        reports: list = []
+        _run_fold_pipeline(
+            out, fold=True, on_decode=reports.append, min_anchor_planes=0
+        )
+        assert reports, "no coincidences were decoded at all"
+        assert not any(r.reason == "no_anchor_plane" for r in reports)
 
 
 # ── unit tests for cluster disambiguation in PoseFitter._decode_cluster ─────

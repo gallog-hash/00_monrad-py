@@ -181,6 +181,18 @@ def _parse_args() -> argparse.Namespace:
         "default for the combinatorial path; pass --no-tot-weights to disable.",
     )
     p.add_argument(
+        "--min-anchor-planes",
+        type=int,
+        default=1,
+        metavar="N",
+        choices=range(0, 4),
+        help="Minimum telescope planes that must decode to a single resolved "
+        "candidate (an 'anchor') before the combinatorial track search runs, "
+        "0-3 (default: 1). 1 keeps the original gate; 0 also searches "
+        "all-ambiguous clusters (more tracks, much heavier compute, pile-up "
+        "can fabricate tracks); 3 demands every plane already resolved.",
+    )
+    p.add_argument(
         "--plot",
         action="store_true",
         default=False,
@@ -433,6 +445,7 @@ def main() -> None:
     z_tel = np.array(args.z_tel)
     tot_thresh: int = args.tot_thresh
     tot_weights: bool = args.tot_weights
+    min_anchor_planes: int = args.min_anchor_planes
 
     lines: list[str] = []
 
@@ -446,6 +459,7 @@ def main() -> None:
     _emit(lines, f"  Telescope data: {tel_dir}")
     _emit(lines, f"  Probe data:     {prb_dir}")
     _emit(lines, f"  Telescope plane z (mm): {z_str}")
+    _emit(lines, f"  Min anchor planes: {min_anchor_planes}")
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────
@@ -620,6 +634,7 @@ def main() -> None:
         prb_pos_paths=prb_pos,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        min_anchor_planes=min_anchor_planes,
         on_decode=_on_decode,
     )
 

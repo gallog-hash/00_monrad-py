@@ -36,6 +36,7 @@ from .stage4 import AlignmentCorrection
 
 _MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §8.4
 _CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §8.2
+N_TEL_PLANES = 3  # telescope planes the combinatorial search fits a line through
 # Half a strip (10 mm strip pitch, DESIGN.md §6.5).  When a plane main's
 # pipeline resolves disagrees with the combinatorial winner's position by more
 # than this, main's hit is not on the combinatorial track — a subset violation.
@@ -537,8 +538,14 @@ class PoseFitter:
         refit_every: int = REFIT_EVERY,
         tot_thresh: int = 1,
         tot_weights: bool = False,
+        min_anchor_planes: int = 1,
         on_decode: Callable[[DecodeReport], None] | None = None,
     ) -> None:
+        if not 0 <= min_anchor_planes <= N_TEL_PLANES:
+            raise ValueError(
+                f"min_anchor_planes must be in [0, {N_TEL_PLANES}], "
+                f"got {min_anchor_planes}"
+            )
         self.tel_z = tel_z
         self.alignment = alignment
         self.tel_id = tel_id
@@ -548,6 +555,13 @@ class PoseFitter:
         self.refit_every = refit_every
         self.tot_thresh = tot_thresh
         self.tot_weights = tot_weights
+        # Minimum number of telescope planes that must decode to a single
+        # resolved candidate (an "anchor") before the combinatorial χ² search
+        # is allowed to run.  1 (default) reproduces the original gate; 0
+        # removes it entirely (search every all-ambiguous cluster too — more
+        # tracks, far heavier compute, and pile-up can fabricate a low-χ²
+        # track); N_TEL_PLANES requires every plane already resolved.
+        self.min_anchor_planes = min_anchor_planes
         self.on_decode = on_decode
         self._coincs: list[Coincidence] = []
         self._since_last = 0
@@ -650,20 +664,24 @@ class PoseFitter:
             # scope for this phase-1 combinatorial search.
             _report("zero_candidate_plane", cand_counts=cand_counts)
             return None
-        if all(len(c) > 1 for c in cands):
-            # No plane decoded as a single, already-resolved candidate: the
-            # mirror-fold/pile-up ambiguity is identical at the bit level
-            # for both causes, so a candidate search over all 3 ambiguous
-            # planes at once can't tell "one particle, fold-mirrored" from
-            # "two particles overlapping in the same window" — it can only
-            # find whichever combination happens to minimise χ², which a
-            # genuine pile-up can do by coincidence (see
-            # TestPerScenarioHandling::test_E2_pileup_same_window_unresolved_rejected).
-            # Require at least one already-resolved plane as an anchor,
-            # matching the old disambiguate_telescope_hits requirement of
-            # ≥2 clean planes to bootstrap a third (here relaxed to ≥1,
-            # since the combinatorial search needs only one true reference
-            # rather than two independent ones).
+        # Anchor-plane gate (tunable via min_anchor_planes).  An "anchor" is a
+        # plane that decoded to a single resolved candidate; zero-candidate
+        # planes were already rejected above, so an anchor is exactly a plane
+        # with len(cands) == 1.  Require at least min_anchor_planes of them
+        # before running the combinatorial χ² search.
+        #
+        # The mirror-fold/pile-up ambiguity is identical at the bit level for
+        # both causes, so a search over fully-ambiguous planes cannot tell "one
+        # particle, fold-mirrored" from "two particles overlapping in the same
+        # window" — it only finds whichever combination minimises χ², which a
+        # genuine pile-up can do by coincidence (see
+        # TestPerScenarioHandling::test_E2_pileup_same_window_unresolved_rejected).
+        # min_anchor_planes=1 (default) keeps that guard, matching the old
+        # disambiguate_telescope_hits ≥2-clean-plane requirement relaxed to one
+        # combinatorial reference; 0 disables it (search every cluster — more
+        # tracks, far heavier compute); N_TEL_PLANES demands all planes resolved.
+        n_anchor = sum(1 for c in cands if len(c) == 1)
+        if n_anchor < self.min_anchor_planes:
             _report("no_anchor_plane", cand_counts=cand_counts)
             return None
 
