@@ -49,17 +49,28 @@ Astral's recommended usage.
 ### Source layout
 
 ```
-src/monrad/
+src/monrad/                 # each stage is a domain package; its public API is
+                            # re-exported from the package __init__.py
     decoders/        # low-level format readers
         header.py    # parse_header() + decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder  — reads *.bin, reconstructs hits
-    synth.py         # generate() — synthetic test-data generator
-    stage1.py        # reconstruct_stream(), load_header_params(), find_file_pairs()
-    stage2.py        # coincidence_stream()
-    stage3.py        # Hit, decode_position(), reconstruct_plane_candidates()
-    stage4.py        # AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
-    stage5.py        # PoseFitter, PoseResult, fit_probe_pose()
+    timing/          # stage 1: reconstruct_stream(), load_header_params(), find_file_pairs()
+        reconstruct.py
+    coincidence/     # stage 2: coincidence_stream()
+        search.py
+    reconstruction/  # stage 3: Hit, decode_position(), reconstruct_plane_candidates()
+        hit.py        #   Hit, decode_position() + OR/centroid helpers
+        candidates.py #   reconstruct_plane_candidates(), disambiguate_telescope_hits()
+    alignment/       # stage 4: AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
+        accumulator.py
+    pose/            # stage 5: PoseFitter, PoseResult, Coincidence, fit_probe_pose()
+        types.py      #   Coincidence, PoseResult, DecodeReport, GATE_ORDER
+        optimize.py   #   fit_probe_pose() four-step optimizer + residual helpers
+        fitter.py     #   PoseFitter streaming accumulator + _decode_cluster
+    synthetic/       # generate() — synthetic test-data generator
+        generate.py
+    monitor/         # probe-position monitoring drivers (resolution, timeseries, multiprobe)
 ```
 
 ### The five pipeline stages

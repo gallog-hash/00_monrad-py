@@ -9,7 +9,7 @@ telescope".  This module builds a synthetic dataset that injects each
 plausible edge case as a *labelled* event, runs the real stage 1-5
 pipeline over it, and asserts how each one is handled.
 
-The dataset reuses the byte-level writers in ``monrad.synth`` (so the
+The dataset reuses the byte-level writers in ``monrad.synthetic`` (so the
 files are format-identical to ``generate()``) but hand-crafts the event
 content per scenario.  Edge cases:
 
@@ -32,23 +32,23 @@ from datetime import datetime
 import numpy as np
 import pytest
 
-from monrad.stage1 import (
+from monrad.timing import (
     _utc_to_ns,
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position
-from monrad.stage4 import AlignmentCorrection
-from monrad.stage5 import (
+from monrad.coincidence import coincidence_stream
+from monrad.reconstruction import decode_position
+from monrad.alignment import AlignmentCorrection
+from monrad.pose import (
     PoseFitter,
     fit_probe_pose,
     _tel_line_fit,
     _sigma_tel_at_z,
     _CHI2_TRACK,
 )
-from monrad.synth import (
+from monrad.synthetic import (
     F0,
     Z_TEL,
     STRIP_MM,

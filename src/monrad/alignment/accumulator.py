@@ -21,7 +21,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .stage3 import Hit, disambiguate_telescope_hits
+from ..reconstruction import Hit, disambiguate_telescope_hits
 
 _Z_TEL = np.array([0.0, 400.0, 800.0])  # mm
 _OFFSET_THRESH = 1.0  # mm  — DESIGN.md §7.4

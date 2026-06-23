@@ -18,18 +18,18 @@ from datetime import datetime
 
 import pytest
 
-from monrad.stage1 import (
+from monrad.timing import (
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage3 import decode_position
-from monrad.stage4 import (
+from monrad.reconstruction import decode_position
+from monrad.alignment import (
     AlignmentAccumulator,
     AlignmentCorrection,
     fit_telescope_alignment,
 )
-from monrad.synth import generate, F0, STRIP_MM
+from monrad.synthetic import generate, F0, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -112,7 +112,7 @@ class TestAlignmentCorrectionIdentity:
 
 class TestAccumulatorFiltering:
     def test_add_wrong_length_ignored(self):
-        from monrad.stage3 import Hit
+        from monrad.reconstruction import Hit
 
         accum = AlignmentAccumulator(flush_every=1)
         h = Hit(5.0, 5.0, 2.0, 2.0, "golden")
@@ -121,7 +121,7 @@ class TestAccumulatorFiltering:
         assert len(accum._hits) == 0
 
     def test_add_invalid_quality_ignored(self):
-        from monrad.stage3 import Hit
+        from monrad.reconstruction import Hit
 
         accum = AlignmentAccumulator(flush_every=1)
         g = Hit(5.0, 5.0, 2.0, 2.0, "golden")
@@ -136,7 +136,7 @@ class TestAccumulatorFiltering:
         assert not ac.needs_correction
 
     def test_auto_flush_on_full(self):
-        from monrad.stage3 import Hit
+        from monrad.reconstruction import Hit
 
         accum = AlignmentAccumulator(flush_every=3)
         h = [Hit(float(5 + k * 10), 5.0, 2.0, 2.0, "golden") for k in range(3)]
@@ -155,8 +155,8 @@ class TestFitTelescopeAlignment:
 
     def test_identity_on_aligned(self):
         """Zero-offset hits → corrections near zero, no flag."""
-        from monrad.stage3 import Hit
-        from monrad.synth import Z_TEL
+        from monrad.reconstruction import Hit
+        from monrad.synthetic import Z_TEL
         import numpy as np
 
         rng = np.random.default_rng(0)
@@ -307,7 +307,7 @@ class TestZOffsetRecovery:
 
     def test_corrected_z_tel(self, correction_z):
         """corrected_z_tel() shifts only the middle plane."""
-        from monrad.synth import Z_TEL
+        from monrad.synthetic import Z_TEL
 
         z_corr = correction_z.corrected_z_tel(Z_TEL)
         assert abs(z_corr[0] - Z_TEL[0]) < 1e-6
@@ -404,7 +404,7 @@ def _straight_track_hits(z_cols, dz_col, dz, n=600, seed=7):
     """N events of 3 collinear hits at z_cols, with column dz_col shifted by dz."""
     import numpy as np
 
-    from monrad.stage3 import Hit
+    from monrad.reconstruction import Hit
 
     rng = np.random.default_rng(seed)
     z = np.asarray(z_cols, dtype=float)

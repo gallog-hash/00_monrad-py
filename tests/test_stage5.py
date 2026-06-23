@@ -18,15 +18,15 @@ from datetime import datetime
 import numpy as np
 import pytest
 
-from monrad.stage1 import (
+from monrad.timing import (
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream
-from monrad.stage3 import Hit, disambiguate_telescope_hits
-from monrad.stage4 import AlignmentCorrection, PlaneCorrection
-from monrad.stage5 import (
+from monrad.coincidence import coincidence_stream
+from monrad.reconstruction import Hit, disambiguate_telescope_hits
+from monrad.alignment import AlignmentCorrection, PlaneCorrection
+from monrad.pose import (
     Coincidence,
     DecodeReport,
     PoseResult,
@@ -37,7 +37,7 @@ from monrad.stage5 import (
     _linear_solve_fixed_theta,
     _sigma_tel_at_z,
 )
-from monrad.synth import generate, F0, Z_TEL, STRIP_MM
+from monrad.synthetic import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -662,7 +662,7 @@ class TestFoldedPoseRecoveryAllPlanesFails:
     returns None for lack of any accepted coincidence.
 
     Before that guard existed, the search instead ran to completion and
-    found an exact mathematical tie: monrad.synth.generate() has no
+    found an exact mathematical tie: monrad.synthetic.generate() has no
     measurement noise, so reflecting an entire straight line is still a
     straight line, and the all-3-planes-mirrored candidate triple achieved
     *exactly* the same χ² as the true triple (verified directly: true
@@ -737,7 +737,7 @@ class TestMinAnchorPlanesTunable:
 # ── unit tests for cluster disambiguation in PoseFitter._decode_cluster ─────
 
 
-from monrad.stage1 import TimedEvent, PosRef, Quality  # noqa: E402
+from monrad.timing import TimedEvent, PosRef, Quality  # noqa: E402
 
 
 def _entry(det_id, seq):

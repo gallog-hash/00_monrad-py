@@ -11,7 +11,7 @@ import logging
 from collections.abc import Iterator
 from heapq import heappush, heappop
 
-from .stage1 import TimedEvent, PosRef
+from ..timing import TimedEvent, PosRef
 
 log = logging.getLogger(__name__)
 

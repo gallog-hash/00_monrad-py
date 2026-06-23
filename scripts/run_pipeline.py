@@ -102,16 +102,16 @@ from pathlib import Path
 
 import numpy as np
 
-from monrad.stage1 import (
+from monrad.timing import (
     Quality,
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position
-from monrad.stage4 import AlignmentAccumulator, AlignmentCorrection
-from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
+from monrad.coincidence import coincidence_stream
+from monrad.reconstruction import decode_position
+from monrad.alignment import AlignmentAccumulator, AlignmentCorrection
+from monrad.pose import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
 
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # Probe Hit.quality values (stage3.Hit), in canonical order, for the probe
@@ -126,7 +126,7 @@ _TEL_QUALITY_ORDER = ("golden", "cluster", "combo")
 # Cap on how many subset-check failures are printed per-event before the rest
 # are summarised, so a pathological run can't flood the summary.
 _SUBSET_FAIL_SHOW = 50
-# Telescope active area (monrad.synth.N_TEL * monrad.synth.STRIP_MM), used
+# Telescope active area (monrad.synthetic.N_TEL * monrad.synthetic.STRIP_MM), used
 # only to draw plane footprints in the 3D plot — not a pipeline parameter.
 _TEL_SIZE_MM = 99 * 10.0
 _PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe footprint

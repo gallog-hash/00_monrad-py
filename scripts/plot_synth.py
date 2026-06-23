@@ -18,7 +18,7 @@ import matplotlib.patches as mpatches
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from monrad.synth import (  # noqa: E402
+from monrad.synthetic import (  # noqa: E402
     generate,
     STRIP_MM,
     N_TEL,

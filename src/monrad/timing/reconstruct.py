@@ -21,9 +21,9 @@ from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
 
-from .decoders.gps import GPSDecoder, unpack_gps_word
-from .decoders.header import parse_header, decode_ubx_tm2
-from .decoders.position import unpack_position_word
+from ..decoders.gps import GPSDecoder, unpack_gps_word
+from ..decoders.header import parse_header, decode_ubx_tm2
+from ..decoders.position import unpack_position_word
 
 log = logging.getLogger(__name__)
 

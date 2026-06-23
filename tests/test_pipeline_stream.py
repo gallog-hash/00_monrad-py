@@ -21,16 +21,16 @@ from datetime import datetime
 import numpy as np
 import pytest
 
-from monrad.stage1 import (
+from monrad.timing import (
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream
-from monrad.stage3 import decode_position
-from monrad.stage4 import AlignmentAccumulator
-from monrad.stage5 import PoseFitter
-from monrad.synth import generate, F0, Z_TEL, STRIP_MM
+from monrad.coincidence import coincidence_stream
+from monrad.reconstruction import decode_position
+from monrad.alignment import AlignmentAccumulator
+from monrad.pose import PoseFitter
+from monrad.synthetic import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000

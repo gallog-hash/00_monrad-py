@@ -1,7 +1,7 @@
 """
 Tests for stage 1 — per-detector time reconstruction.
 
-Run against the synthetic dataset produced by monrad.synth.generate().
+Run against the synthetic dataset produced by monrad.synthetic.generate().
 All events use an ideal 100 MHz clock with no drift, so every tick maps
 to an exact integer nanosecond count and all events should be GOOD.
 """
@@ -10,7 +10,7 @@ import struct
 import pytest
 from datetime import datetime
 
-from monrad.stage1 import (
+from monrad.timing import (
     Quality,
     _utc_to_ns,
     load_header_params,
@@ -18,7 +18,7 @@ from monrad.stage1 import (
     reconstruct,
     reconstruct_stream,
 )
-from monrad.synth import generate, F0
+from monrad.synthetic import generate, F0
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000

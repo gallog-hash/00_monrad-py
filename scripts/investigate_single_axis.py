@@ -27,13 +27,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from monrad.stage1 import (  # noqa: E402
+from monrad.timing import (  # noqa: E402
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream  # noqa: E402
-from monrad.stage3 import decode_position  # noqa: E402
+from monrad.coincidence import coincidence_stream  # noqa: E402
+from monrad.reconstruction import decode_position  # noqa: E402
 
 TEL_DIR = Path("data/0_testLab_20210723/Base")
 PRB_DIR = Path("data/0_testLab_20210723/Probe_0")

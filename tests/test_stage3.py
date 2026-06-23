@@ -11,18 +11,18 @@ import pytest
 import numpy as np
 from datetime import datetime
 
-from monrad.stage1 import (
+from monrad.timing import (
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage3 import (
+from monrad.reconstruction import (
     decode_position,
     disambiguate_telescope_hits,
     reconstruct_plane_candidates,
     Hit,
 )
-from monrad.synth import generate, F0, Z_TEL, STRIP_MM
+from monrad.synthetic import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -176,7 +176,7 @@ class TestTOTThreshold:
         """A two-bit cluster where one bit fires more rows should pull
         the centroid toward the higher-TOT bit."""
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         # Build a minimal *.bin with one event where X has a 2-bit cluster.
         # Channel c_x=23 → ribbon=2, fiber=3.  Cluster = {23, 24}.
@@ -240,8 +240,8 @@ class TestTOTThreshold:
     def test_thresh_removes_single_row_noise(self, tmp_path):
         """A bit that fires in only 1 of 16 rows is removed by thresh=2."""
         import struct
-        from monrad.synth import _ch_to_u64
-        from monrad.stage1 import PosRef
+        from monrad.synthetic import _ch_to_u64
+        from monrad.timing import PosRef
 
         # Build a minimal *.bin with one event:
         # row 0: a clean golden hit (ch=5 in X, ch=3 in Y)
@@ -420,7 +420,7 @@ class TestCandidatesPopulated:
     def test_unresolved_candidates_present(self, tmp_path):
         """An unresolved hit (multiple clusters) carries a non-empty candidate list."""
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         # X: two disconnected fiber clusters (bits 0 and 5 both set, ribbon bit 2)
         # → candidates [20, 25], which are non-contiguous → unresolved
@@ -452,7 +452,7 @@ class TestCandidatesPopulated:
         y is golden (ribbon bit 1, fiber bit 1 → channel 10*1+1 = 11).
         """
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         x_rib = 1 << 2
         x_fib = (1 << 0) | (1 << 5)
@@ -502,7 +502,7 @@ class TestPlaneCandidates:
         ribbon×fiber combinations.  Y is golden (ribbon=1, fiber=1 → ch=11).
         Expect exactly the 4 X-candidates × 1 Y-candidate = 4 points.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -546,7 +546,7 @@ class TestPlaneCandidates:
         enumerate all 6 without crashing or dropping the true channels —
         graceful degradation (more candidates), not lost data.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -583,7 +583,7 @@ class TestPlaneCandidates:
         equal compactness (width 1 on each axis), so the cap keeps exactly
         max_per_plane of them.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = (1 << 1) | (1 << 8)
         y_fib = (1 << 1) | (1 << 8)
@@ -599,7 +599,7 @@ class TestPlaneCandidates:
 
     def test_invalid_plane_returns_empty_list(self, tmp_path):
         """X_ribbon=0 (no ribbon channel fired) → invalid → empty list."""
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -615,7 +615,7 @@ class TestPlaneCandidates:
 
     def test_golden_plane_yields_one_candidate(self, tmp_path):
         """A clean golden hit on both axes yields exactly one candidate."""
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -647,7 +647,7 @@ class TestPlaneCandidates:
         """
         import struct
 
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -695,7 +695,7 @@ class TestPlaneCandidates:
         channels apart, so the cross-product splits into two gap-free runs,
         each a distinct 2-wide cluster candidate: [23,24] and [33,34].
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -733,7 +733,7 @@ class TestPlaneCandidates:
         """
         import struct
 
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1

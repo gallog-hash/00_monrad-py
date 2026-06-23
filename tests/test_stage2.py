@@ -1,7 +1,7 @@
 """
 Tests for stage 2 — sliding-window coincidence search.
 
-Run against the synthetic dataset produced by monrad.synth.generate().
+Run against the synthetic dataset produced by monrad.synthetic.generate().
 In the synthetic data every probe event sits at exactly the same clock
 tick as its corresponding telescope event, so the 200 ns window yields
 one cluster per coincidence and no spurious clusters.
@@ -10,14 +10,14 @@ one cluster per coincidence and no spurious clusters.
 import pytest
 from datetime import datetime
 
-from monrad.stage1 import (
+from monrad.timing import (
     _utc_to_ns,
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream
-from monrad.synth import generate, F0
+from monrad.coincidence import coincidence_stream
+from monrad.synthetic import generate, F0
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -160,7 +160,7 @@ class TestCoincidenceStream:
 # the high-rate transitive-closure behaviour required by DESIGN.md §5.1.
 
 
-from monrad.stage1 import TimedEvent, PosRef, Quality  # noqa: E402
+from monrad.timing import TimedEvent, PosRef, Quality  # noqa: E402
 
 
 def _stream(events):

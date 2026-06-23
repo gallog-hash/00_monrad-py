@@ -874,22 +874,32 @@ time; it is applied to telescope hits at the next refit.
 ## 9. Module layout
 
 ```
-src/monrad/
+src/monrad/                  # each stage is a domain package; the public API
+                             # listed below is re-exported from its __init__.py
     decoders/
         header.py    # parse_header(), decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder — reads *.bin, reconstructs hits
-    synth.py         # generate() — synthetic dataset for testing
-    stage1.py        # reconstruct_stream(), load_header_params(),
-                     # find_file_pairs(), reconstruct() [deprecated]
-    stage2.py        # coincidence_stream()
-    stage3.py        # Hit, GOOD_QUALITIES, decode_position(),
-                     # reconstruct_plane_candidates(), PlaneCandidate,
-                     # disambiguate_telescope_hits()
-    stage4.py        # PlaneCorrection, AlignmentCorrection,
-                     # AlignmentAccumulator, fit_telescope_alignment()
-    stage5.py        # Coincidence, DecodeReport, GATE_ORDER, PoseResult,
-                     # PoseFitter, fit_probe_pose()
+    timing/          # stage 1
+        reconstruct.py   # reconstruct_stream(), load_header_params(),
+                         # find_file_pairs(), reconstruct() [deprecated]
+    coincidence/     # stage 2
+        search.py        # coincidence_stream()
+    reconstruction/  # stage 3
+        hit.py           # Hit, GOOD_QUALITIES, decode_position()
+        candidates.py    # reconstruct_plane_candidates(), PlaneCandidate,
+                         # disambiguate_telescope_hits()
+    alignment/       # stage 4
+        accumulator.py   # PlaneCorrection, AlignmentCorrection,
+                         # AlignmentAccumulator, fit_telescope_alignment()
+    pose/            # stage 5
+        types.py         # Coincidence, DecodeReport, GATE_ORDER, PoseResult,
+                         # SubsetViolation
+        optimize.py      # fit_probe_pose() + line-fit / residual helpers
+        fitter.py        # PoseFitter, _decode_cluster()
+    synthetic/       # generate() — synthetic dataset for testing
+        generate.py
+    monitor/         # probe-position monitoring drivers (Steps 1-3)
 ```
 
 Key types:
