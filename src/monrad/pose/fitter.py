@@ -17,18 +17,13 @@ from ..alignment import AlignmentCorrection
 from ..reconstruction import (
     GOOD_QUALITIES,
     decode_position,
-    disambiguate_telescope_hits,
     reconstruct_plane_candidates,
 )
 from .optimize import _fit_triple, fit_probe_pose, tel_align_arrays
-from .types import Coincidence, DecodeReport, PoseResult, SubsetViolation
+from .types import Coincidence, DecodeReport, PoseResult
 
 _CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §8.2
 N_TEL_PLANES = 3  # telescope planes the combinatorial search fits a line through
-# Half a strip (10 mm strip pitch, DESIGN.md §6.5).  When a plane main's
-# pipeline resolves disagrees with the combinatorial winner's position by more
-# than this, main's hit is not on the combinatorial track — a subset violation.
-_SUBSET_TOL_MM = 5.0
 
 
 class PoseFitter:
@@ -134,8 +129,6 @@ class PoseFitter:
             chi2: float | None = None,
             prb_quality: str | None = None,
             tel_quality: tuple[str, str, str] | None = None,
-            subset_ok: bool | None = None,
-            subset_violations: tuple[SubsetViolation, ...] | None = None,
         ) -> None:
             if self.on_decode is not None:
                 self.on_decode(
@@ -146,8 +139,6 @@ class PoseFitter:
                         chi2=chi2,
                         prb_quality=prb_quality,
                         tel_quality=tel_quality,
-                        subset_ok=subset_ok,
-                        subset_violations=subset_violations,
                     )
                 )
 
@@ -173,10 +164,9 @@ class PoseFitter:
         # one candidate; mirror-fold-ambiguous axes give their full
         # ribbon×fiber cross-product) and search every one-candidate-per-
         # plane triple for the lowest-χ² straight line.  This resolves the
-        # mirror-fold ambiguity globally from which combination actually
-        # lies on a track, instead of needing two already-clean planes to
-        # bootstrap a third (replaces the two-plane disambiguate_telescope_hits
-        # recovery in this path; see DESIGN.md §8.2 and §10 Deduction #4).
+        # per-plane ambiguity globally from which combination actually lies on
+        # a track, instead of recovering one plane from two already-clean ones
+        # (see DESIGN.md §8.2).
         cands = reconstruct_plane_candidates(
             tel_ref,
             self.tel_pos_paths,
@@ -203,10 +193,10 @@ class PoseFitter:
         # window" — it only finds whichever combination minimises χ², which a
         # genuine pile-up can do by coincidence (see
         # TestPerScenarioHandling::test_E2_pileup_same_window_unresolved_rejected).
-        # min_anchor_planes=1 (default) keeps that guard, matching the old
-        # disambiguate_telescope_hits ≥2-clean-plane requirement relaxed to one
-        # combinatorial reference; 0 disables it (search every cluster — more
-        # tracks, far heavier compute); N_TEL_PLANES demands all planes resolved.
+        # min_anchor_planes=1 (default) keeps that guard, requiring one
+        # already-resolved combinatorial reference; 0 disables it (search every
+        # cluster — more tracks, far heavier compute); N_TEL_PLANES demands
+        # all planes resolved.
         n_anchor = sum(1 for c in cands if len(c) == 1)
         if n_anchor < self.min_anchor_planes:
             _report("no_anchor_plane", cand_counts=cand_counts)
@@ -242,100 +232,13 @@ class PoseFitter:
         a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
         assert best_cands is not None  # set whenever best_fit is
 
-        # Cheap per-plane quality straight from the winning triple: each
-        # candidate carries its own "golden"/"cluster" label.  The "combo"
-        # refinement and the subset check below additionally replay main's
-        # telescope reconstruction, which is pure diagnostics (the fit never
-        # reads tel_quality) — so they run only when a diagnostic consumer is
-        # attached via on_decode.  The streaming/monitoring path leaves
-        # on_decode None and skips the extra decode + disambiguation entirely,
-        # the dominant per-cluster cost on the accept path
-        # (memory: demote-disambiguation-replay).
+        # Per-plane quality straight from the winning triple: each candidate
+        # carries its own "golden"/"cluster" label (DESIGN.md §8.2).
         tel_quality = (
             best_cands[0].quality,
             best_cands[1].quality,
             best_cands[2].quality,
         )
-        subset_ok: bool | None = None
-        subset_violations: tuple[SubsetViolation, ...] | None = None
-
-        if self.on_decode is not None:
-            # Classify each plane of the winning triple by replaying main's
-            # telescope reconstruction (decode_position + the two-plane
-            # disambiguate_telescope_hits recovery) for the same event, in the
-            # same alignment-corrected frame.  A plane main also resolves keeps
-            # the winning candidate's own quality ("golden"/"cluster"); a plane
-            # main leaves unresolved is labelled "combo" — recovered only by the
-            # combinatorial χ² search (DESIGN.md §8.2).  We replay main's actual
-            # functions rather than re-deriving the rule from candidate counts
-            # so the comparison cannot drift from what main truly does.
-            #
-            # `decoded_hits` is the pre-disambiguation decode; `main_hits` is
-            # after the two-plane recovery.  The distinction matters for the
-            # subset check: a plane decode_position resolves *uniquely* yields
-            # exactly one combinatorial candidate, so it can never diverge from
-            # the winner.  A plane it leaves 'unresolved' is recovered by a
-            # two-plane guess that the combinatorial 3-plane χ² may legitimately
-            # resolve differently — so each violation records which case it is
-            # via `main_resolved_by`.
-            align = self.alignment
-            decoded_hits = decode_position(
-                tel_ref,
-                self.tel_pos_paths,
-                n_cols=3,
-                tot_thresh=self.tot_thresh,
-                tot_weights=self.tot_weights,
-            )
-            main_hits = disambiguate_telescope_hits(
-                decoded_hits,
-                self.tel_z,
-                offsets=[
-                    (align.planes[k].delta_x, align.planes[k].delta_y) for k in range(3)
-                ],
-            )
-            tel_quality_list: list[str] = []
-            violations: list[SubsetViolation] = []
-            for k in range(3):
-                mh = main_hits[k]
-                wc = best_cands[k]
-                if mh.quality in GOOD_QUALITIES:
-                    tel_quality_list.append(wc.quality)
-                    # main resolved plane k: its hit must lie on the
-                    # combinatorial track, i.e. agree with the winner.  Both
-                    # positions are raw (pre-alignment); the per-plane delta
-                    # cancels in the difference, so the raw comparison is the
-                    # corrected-frame one.
-                    dx = wc.x_mm - mh.x_mm
-                    dy = wc.y_mm - mh.y_mm
-                    if abs(dx) > _SUBSET_TOL_MM or abs(dy) > _SUBSET_TOL_MM:
-                        resolved_by = (
-                            "decoded"
-                            if decoded_hits[k].quality in GOOD_QUALITIES
-                            else "recovered"
-                        )
-                        violations.append(
-                            SubsetViolation(
-                                plane=k,
-                                main_quality=mh.quality,
-                                main_x=mh.x_mm,
-                                main_y=mh.y_mm,
-                                combo_quality=wc.quality,
-                                combo_x=wc.x_mm,
-                                combo_y=wc.y_mm,
-                                dx=dx,
-                                dy=dy,
-                                main_resolved_by=resolved_by,
-                            )
-                        )
-                else:
-                    tel_quality_list.append("combo")
-            tel_quality = (
-                tel_quality_list[0],
-                tel_quality_list[1],
-                tel_quality_list[2],
-            )
-            subset_ok = not violations
-            subset_violations = tuple(violations) if violations else None
 
         # Decode probe (1 plane)
         prb_hits = decode_position(
@@ -353,8 +256,6 @@ class PoseFitter:
                 chi2=best_chi2,
                 prb_quality=prb_hit.quality,
                 tel_quality=tel_quality,
-                subset_ok=subset_ok,
-                subset_violations=subset_violations,
             )
             return None
 
@@ -364,8 +265,6 @@ class PoseFitter:
             chi2=best_chi2,
             prb_quality=prb_hit.quality,
             tel_quality=tel_quality,
-            subset_ok=subset_ok,
-            subset_violations=subset_violations,
         )
         return Coincidence(
             a_x=a_x,

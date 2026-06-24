@@ -21,7 +21,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from ..reconstruction import Hit, disambiguate_telescope_hits
+from ..reconstruction import Hit
 
 _Z_TEL = np.array([0.0, 400.0, 800.0])  # mm
 _OFFSET_THRESH = 1.0  # mm  — DESIGN.md §7.4
@@ -238,14 +238,12 @@ class AlignmentAccumulator:
         Add one decoded 3-plane hit.
 
         Events where any plane quality is not 'golden' or 'cluster' are
-        silently dropped (after attempting disambiguation).  Returns a new
-        AlignmentCorrection when the buffer reaches flush_every events;
+        silently dropped (all three planes must resolve cleanly).  Returns a
+        new AlignmentCorrection when the buffer reaches flush_every events;
         otherwise None.
         """
         if len(hits) != 3:
             return None
-        z = self._z_tel if self._z_tel is not None else _Z_TEL
-        hits = disambiguate_telescope_hits(hits, z)
         if any(h.quality not in ("golden", "cluster") for h in hits):
             return None
         self._hits.append(hits)

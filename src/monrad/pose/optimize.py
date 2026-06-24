@@ -334,8 +334,10 @@ def fit_probe_pose(
 
     mask = maha <= _MAHAL_CUT
     inliers = [co for co, m in zip(coincs, mask) if m]
+    outliers = [co for co, m in zip(coincs, mask) if not m]
     if len(inliers) < 3:
         inliers = list(coincs)  # fallback: keep all
+        outliers = []  # cut bypassed — nothing was rejected
     n_inliers = len(inliers)
 
     if n_inliers < len(coincs):
@@ -385,4 +387,5 @@ def fit_probe_pose(
         n_inliers=n_inliers,
         half_params=half_params,
         inliers=inliers,
+        outliers=outliers,
     )

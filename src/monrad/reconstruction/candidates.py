@@ -1,23 +1,18 @@
 """
-Stage 3 (part) — multi-candidate enumeration and telescope disambiguation.
+Stage 3 (part) — multi-candidate enumeration.
 
 reconstruct_plane_candidates
     Per-plane candidate (x_mm, y_mm) lists for the Stage 5 combinatorial track
     search, instead of collapsing each plane to a single resolved Hit.
-disambiguate_telescope_hits
-    Two-plane linear recovery of 'unresolved' telescope planes.
 """
 
 import math
 from pathlib import Path
-from typing import Literal, NamedTuple, Sequence
-
-import numpy as np
+from typing import Literal, NamedTuple
 
 from ..timing import PosRef
 from ..decoders.position import BinDecoder
 from .hit import (
-    Hit,
     _STRIP_MM,
     _axis_candidates_with_tot,
     _bit_counts,
@@ -117,92 +112,3 @@ def reconstruct_plane_candidates(
         )
 
     return planes
-
-
-def disambiguate_telescope_hits(
-    hits: list[Hit],
-    z_tel: Sequence[float] | np.ndarray,
-    offsets: Sequence[tuple[float, float]] | None = None,
-) -> list[Hit]:
-    """
-    Replace 'unresolved' hits with 'cluster' hits using a two-plane linear
-    predictor, when a candidate exists within 1.5 strips (15 mm).
-
-    For each plane k independently: if the other 2 planes both have quality
-    'golden' or 'cluster', fit a straight line through them and predict the
-    hit position at plane k.  If plane k is 'unresolved' with a non-empty
-    candidate list and the nearest candidate is within 1.5 strips, the hit
-    is replaced with quality 'cluster'.  Both X and Y axes must be resolved
-    for the quality to change.
-
-    Only applied to 3-plane inputs; returns hits unchanged otherwise.
-
-    offsets : optional per-plane (delta_x, delta_y) alignment offsets in mm.
-              When given, the two-plane prediction and the candidate-distance
-              test are evaluated in the alignment-corrected frame
-              (coord - delta), so a plane's recovery is not biased by the
-              telescope's internal misalignment.  The returned hit always
-              carries the *raw* candidate position; callers apply the same
-              offset downstream.  Defaults to zero offsets (raw frame), which
-              reproduces the Stage 4 behaviour exactly.
-    """
-    if len(hits) != 3:
-        return hits
-
-    _MATCH_TOL = 1.5 * _STRIP_MM  # acceptance window in mm
-    if offsets is None:
-        dx = (0.0, 0.0, 0.0)
-        dy = (0.0, 0.0, 0.0)
-    else:
-        dx = tuple(o[0] for o in offsets)
-        dy = tuple(o[1] for o in offsets)
-
-    result = list(hits)
-    for k in range(3):
-        hit_k = hits[k]
-        if hit_k.quality != "unresolved":
-            continue
-
-        j1, j2 = [j for j in range(3) if j != k]
-        ref1, ref2 = hits[j1], hits[j2]
-        if ref1.quality not in ("golden", "cluster"):
-            continue
-        if ref2.quality not in ("golden", "cluster"):
-            continue
-
-        t = (z_tel[k] - z_tel[j1]) / (z_tel[j2] - z_tel[j1])
-        # Predict in the alignment-corrected frame (coord - delta).  With the
-        # default zero offsets this is identical to the raw-frame prediction.
-        rx1, rx2 = ref1.x_mm - dx[j1], ref2.x_mm - dx[j2]
-        ry1, ry2 = ref1.y_mm - dy[j1], ref2.y_mm - dy[j2]
-        x_pred = rx1 + t * (rx2 - rx1)
-        y_pred = ry1 + t * (ry2 - ry1)
-
-        new_x = new_y = None
-        width_x = width_y = 1
-        # Candidate positions are compared in the same corrected frame
-        # (raw channel position - delta[k]); the stored hit keeps raw position.
-        if hit_k.candidates_x:
-            best_ch, best_w = min(
-                hit_k.candidates_x,
-                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - dx[k] - x_pred),
-            )
-            if abs((best_ch + 0.5) * _STRIP_MM - dx[k] - x_pred) <= _MATCH_TOL:
-                new_x = (best_ch + 0.5) * _STRIP_MM
-                width_x = best_w
-
-        if hit_k.candidates_y:
-            best_ch, best_w = min(
-                hit_k.candidates_y,
-                key=lambda cw: abs((cw[0] + 0.5) * _STRIP_MM - dy[k] - y_pred),
-            )
-            if abs((best_ch + 0.5) * _STRIP_MM - dy[k] - y_pred) <= _MATCH_TOL:
-                new_y = (best_ch + 0.5) * _STRIP_MM
-                width_y = best_w
-
-        if new_x is not None and new_y is not None:
-            sigma_x = (_STRIP_MM * width_x) / math.sqrt(12)
-            sigma_y = (_STRIP_MM * width_y) / math.sqrt(12)
-            result[k] = Hit(new_x, new_y, sigma_x, sigma_y, "cluster")
-
-    return result

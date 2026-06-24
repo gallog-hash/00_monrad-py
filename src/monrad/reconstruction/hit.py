@@ -38,8 +38,10 @@ class Hit(NamedTuple):
     sigma_x: float
     sigma_y: float
     quality: Literal["golden", "cluster", "unresolved", "invalid"]
-    # Candidate (centroid_ch, width) pairs for 'unresolved' hits — used by
-    # disambiguate_telescope_hits().  None for all other qualities.
+    # Candidate (centroid_ch, width) pairs for 'unresolved' hits, retained for
+    # diagnostics (e.g. scripts/investigate_single_axis.py).  Stage 5
+    # enumerates its own per-plane candidates via reconstruct_plane_candidates.
+    # None for all other qualities.
     candidates_x: list[tuple[float, int]] | None = None
     candidates_y: list[tuple[float, int]] | None = None
 
@@ -354,12 +356,11 @@ def decode_position(
 
         if qx == "unresolved" or qy == "unresolved":
             # An axis that DID resolve is kept as a one-element candidate at
-            # its own centroid (width recovered from sigma) so that a plane
-            # which failed on only one axis can still be recovered by
-            # disambiguate_telescope_hits(): the known axis is matched
-            # trivially and only the failed axis is filled from the two-plane
-            # projection.  An axis that failed contributes its real candidate
-            # hypotheses.  (DESIGN.md §6.4 / §6.6.)
+            # its own centroid (width recovered from sigma); an axis that
+            # failed contributes its real multi-candidate hypotheses.  These
+            # per-axis lists are retained for diagnostics (DESIGN.md §6.4);
+            # Stage 5 enumerates its own candidates via
+            # reconstruct_plane_candidates rather than reading them here.
             cands_x = (
                 _axis_candidates(x_or)
                 if qx == "unresolved"

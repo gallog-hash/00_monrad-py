@@ -7,14 +7,11 @@ load_header_params(header_path)  -> (utc0, f0)
 find_file_pairs(detector_dir)    -> (gps_paths, pos_paths)
 reconstruct_stream(gps_paths, pos_paths, utc0, f0)
                                  -> Iterator[(TimedEvent, PosRef)]
-reconstruct(gps_paths, pos_paths, utc0, f0)
-                                 -> (events, pos_map)  [deprecated]
 """
 
 import bisect
 import logging
 import struct
-import warnings
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from enum import IntEnum
@@ -490,33 +487,3 @@ def reconstruct_stream(
                     ref,
                 )
                 evt_seq += 1
-
-
-# ── deprecated batch wrapper ─────────────────────────────────────
-
-
-def reconstruct(
-    gps_paths: list[Path],
-    pos_paths: list[Path],
-    utc0: datetime,
-    f0: int = F0_DEFAULT,
-    tau: float = PPS_TAU,
-) -> tuple[list[TimedEvent], dict[int, PosRef]]:
-    """
-    Deprecated. Use reconstruct_stream() for production pipelines.
-
-    Thin wrapper around reconstruct_stream() that materialises all
-    events and returns (events, pos_map) for backward compatibility.
-    """
-    warnings.warn(
-        "reconstruct() is deprecated; use reconstruct_stream()",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    events: list[TimedEvent] = []
-    pos_index: list[PosRef] = []
-    for ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0, tau):
-        events.append(ev)
-        pos_index.append(ref)
-    pos_map = {ev.evt_seq: ref for ev, ref in zip(events, pos_index)}
-    return events, pos_map

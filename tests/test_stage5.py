@@ -24,14 +24,12 @@ from monrad.timing import (
     reconstruct_stream,
 )
 from monrad.coincidence import coincidence_stream
-from monrad.reconstruction import Hit, disambiguate_telescope_hits
-from monrad.alignment import AlignmentCorrection, PlaneCorrection
+from monrad.alignment import AlignmentCorrection
 from monrad.pose import (
     Coincidence,
     DecodeReport,
     PoseResult,
     PoseFitter,
-    SubsetViolation,
     fit_probe_pose,
     _tel_line_fit,
     _linear_solve_fixed_theta,
@@ -483,9 +481,8 @@ def _assert_pose_within_3sigma(pr):
 def pose_result_fold_1plane(tmp_path_factory):
     """
     Single ambiguous plane (plane 1; planes 0 and 2 stay golden/cluster).
-    This is the regime disambiguate_telescope_hits already partly handles
-    (predicting the ambiguous plane from the two clean ones); the
-    combinatorial finder should recover it just as well.
+    The two clean planes anchor the line, and the combinatorial finder
+    recovers plane 1's candidate from the χ² search.
     """
     out = tmp_path_factory.mktemp("synth_stage5_fold1")
     pr = _run_fold_pipeline(out, fold_planes={1})
@@ -497,10 +494,9 @@ def pose_result_fold_1plane(tmp_path_factory):
 def pose_result_fold_2plane(tmp_path_factory):
     """
     Two ambiguous planes (0 and 1; plane 2 stays golden as the sole anchor).
-    disambiguate_telescope_hits cannot resolve this (it needs two clean
-    planes to bootstrap the third) — this is the combinatorial finder's
-    headline win: per-plane candidate enumeration + line-fit χ² search
-    across both ambiguous planes simultaneously.
+    This is the combinatorial finder's headline win: per-plane candidate
+    enumeration + line-fit χ² search across both ambiguous planes
+    simultaneously, anchored by the single clean plane.
     """
     out = tmp_path_factory.mktemp("synth_stage5_fold2")
     pr = _run_fold_pipeline(out, fold_planes={0, 1})
@@ -530,85 +526,23 @@ def pose_result_fold_2plane_realistic(tmp_path_factory):
     return pr
 
 
-@pytest.fixture(scope="module")
-def fold_1plane_reports(tmp_path_factory):
-    """Accepted DecodeReports for the single-ambiguous-plane fold scenario."""
-    out = tmp_path_factory.mktemp("synth_stage5_fold1_reports")
-    reports: list[DecodeReport] = []
-    _run_fold_pipeline(out, fold_planes={1}, on_decode=reports.append)
-    return [r for r in reports if r.accepted]
-
-
-@pytest.fixture(scope="module")
-def fold_2plane_reports(tmp_path_factory):
-    """Accepted DecodeReports for the two-ambiguous-plane fold scenario."""
-    out = tmp_path_factory.mktemp("synth_stage5_fold2_reports")
-    reports: list[DecodeReport] = []
-    _run_fold_pipeline(out, fold_planes={0, 1}, on_decode=reports.append)
-    return [r for r in reports if r.accepted]
-
-
 class TestFoldedPoseRecovery1Plane:
     """3σ recovery with one mirror-fold-ambiguous telescope plane."""
 
     def test_zp_within_3sigma(self, pose_result_fold_1plane):
         _assert_pose_within_3sigma(pose_result_fold_1plane)
 
-    def test_no_combo_when_disambiguator_recovers(self, fold_1plane_reports):
-        """
-        With only plane 1 ambiguous, main's own disambiguate_telescope_hits
-        recovers it from the two clean planes (0, 2), so the combinatorial
-        winner is not the *only* path that resolves it — no plane is labelled
-        "combo".  Guards against over-flagging: a plane main can already reach
-        must stay classified as a shared anchor.  (Verified: with planes 0
-        and 2 golden, the two-plane predictor lands plane 1's candidate
-        within tolerance.)
-        """
-        assert fold_1plane_reports, "no coincidence accepted in 1-plane fold"
-        for r in fold_1plane_reports:
-            assert "combo" not in r.tel_quality, r.tel_quality
-            assert r.subset_ok is True
-            assert r.subset_violations is None
-
 
 class TestFoldedPoseRecovery2Plane:
     """
-    Headline win for the combinatorial track finder (DESIGN.md §10
-    Deduction #4): recover the probe pose with two of three telescope
-    planes mirror-fold ambiguous on every event, which the old
-    two-plane disambiguate_telescope_hits path cannot do.
+    Headline win for the combinatorial track finder (DESIGN.md §8.2):
+    recover the probe pose with two of three telescope planes ambiguous on
+    every event — resolved globally by the per-plane candidate enumeration +
+    line-fit χ² search, using the remaining clean plane as the anchor.
     """
 
     def test_zp_within_3sigma(self, pose_result_fold_2plane):
         _assert_pose_within_3sigma(pose_result_fold_2plane)
-
-    def test_tel_quality_flags_two_combo_planes(self, fold_2plane_reports):
-        """
-        Planes 0 and 1 are mirror-fold ambiguous on every event; main's
-        disambiguate_telescope_hits cannot recover either (it needs the other
-        two planes clean, but each is the other's unresolved neighbour).  Only
-        the combinatorial χ² search resolves them, so both are "combo"; plane 2
-        is the golden anchor main also resolves.  subset_ok holds because the
-        anchor agrees with the combinatorial winner.
-        """
-        assert fold_2plane_reports, "no coincidence accepted in 2-plane fold"
-        for r in fold_2plane_reports:
-            assert r.tel_quality == ("combo", "combo", "golden"), r.tel_quality
-            assert r.subset_ok is True
-            assert r.subset_violations is None
-
-    def test_subset_violation_resolved_by_field(self):
-        """
-        SubsetViolation.main_resolved_by defaults to "decoded" (preserving
-        positional construction) and accepts "recovered".  The field lets the
-        summary separate the impossible case (a uniquely-decoded hit diverging)
-        from the expected one (main's two-plane fold guess differing from the
-        combinatorial χ² pick).
-        """
-        v = SubsetViolation(0, "cluster", 1.0, 2.0, "golden", 3.0, 2.0, 2.0, 0.0)
-        assert v.main_resolved_by == "decoded"
-        v2 = v._replace(main_resolved_by="recovered")
-        assert v2.main_resolved_by == "recovered"
 
 
 class TestFoldedPoseRecovery2PlaneRealisticNoise:
@@ -880,79 +814,6 @@ class TestPerAxisSigmaPropagation:
         assert np.trace(pr_hetero.cov) > np.trace(pr_scalar.cov)
 
 
-class TestDisambiguateOffsetSelection:
-    """
-    disambiguate_telescope_hits() selects candidates in the
-    *alignment-corrected* frame (DESIGN.md §6.3b/§8.2).  PoseFitter's own
-    telescope-plane recovery now goes through the combinatorial track
-    finder (reconstruct_plane_candidates + _fit_triple in _decode_cluster)
-    instead of this function, but the function itself is still used by
-    Stage 4 and the run_pipeline.py quality table, so its offset-frame
-    behaviour is tested directly here.
-    """
-
-    _Z = np.array([0.0, 400.0, 800.0])
-    _SIG = STRIP_MM / math.sqrt(12)
-
-    def _scenario(self):
-        """
-        Flat track at corrected (x, y) = (100, 50).  Outer planes carry no
-        offset, the middle plane carries delta_x = +10 mm.  The unresolved
-        middle plane offers two x candidates:
-          A: raw 110 mm -> corrected 100 mm  (ON the track)
-          B: raw  96 mm -> corrected  86 mm  (off track by 14 mm)
-        Raw-frame selection (no offset) would pick B — closer to the raw
-        prediction of 100 mm — and the resulting kinked track fails the χ²
-        cut.  Corrected-frame selection picks A, giving an on-track line.
-        """
-        h = lambda x, y, q="golden", cx=None, cy=None: Hit(  # noqa: E731
-            x, y, self._SIG, self._SIG, q, cx, cy
-        )
-        tel_hits = [
-            h(100.0, 50.0),
-            h(
-                0.0,
-                0.0,
-                "unresolved",
-                cx=[(10.5, 1), (9.1, 1)],  # raw 110, 96
-                cy=[(4.5, 1)],  # raw 50
-            ),
-            h(100.0, 50.0),
-        ]
-        prb_hit = h(10.0, 20.0)
-        alignment = AlignmentCorrection(
-            planes=[
-                PlaneCorrection(0.0, 0.0, 0.0),
-                PlaneCorrection(10.0, 0.0, 0.0),  # middle plane δx = +10 mm
-                PlaneCorrection(0.0, 0.0, 0.0),
-            ],
-            needs_correction=True,
-        )
-        return tel_hits, prb_hit, alignment
-
-    def test_offsets_change_selected_candidate(self):
-        """
-        Guard the refinement at the disambiguation level: the raw frame and
-        the corrected frame pick *different* candidates for the same hit.
-
-        Prediction at the middle plane is 100 mm (flat track through the
-        outer planes).  Raw frame: nearest raw candidate is 96 mm (Δ=4 <
-        Δ=10 for 110 mm) — the wrong one.  Corrected frame (+10 mm middle
-        offset): candidate 110 mm sits at corrected 100 mm (Δ=0) and is
-        selected; 96 mm is corrected 86 mm (Δ=14).
-        """
-        tel_hits, _, _ = self._scenario()
-        raw = disambiguate_telescope_hits(tel_hits, self._Z)
-        assert raw[1].quality == "cluster"
-        assert raw[1].x_mm == pytest.approx(96.0)  # raw frame → wrong candidate
-
-        corrected = disambiguate_telescope_hits(
-            tel_hits, self._Z, offsets=[(0.0, 0.0), (10.0, 0.0), (0.0, 0.0)]
-        )
-        assert corrected[1].quality == "cluster"
-        assert corrected[1].x_mm == pytest.approx(110.0)  # corrected → right one
-
-
 class TestDecodeReport:
     """
     DecodeReport surfaces the gate outcome (reason), the winning triple's χ²
@@ -1009,13 +870,9 @@ class TestDecodeReport:
             # Clean synthetic telescope hits are golden: exactly one candidate
             # per plane.
             assert r.cand_counts == (1, 1, 1)
-            # Every plane is resolved by main too (no fold), so the triple is
-            # all-anchor and main's hits trivially lie on the combinatorial
-            # track — the subset check passes and tel_quality is threaded
-            # through to the on_decode callback.
+            # Each plane's winning candidate carries its own golden label,
+            # threaded through to the on_decode callback.
             assert r.tel_quality == ("golden", "golden", "golden")
-            assert r.subset_ok is True
-            assert r.subset_violations is None
 
     def test_cand_counts_absent_before_candidate_enumeration(self):
         """An ambiguous cluster is rejected before any candidate is enumerated,

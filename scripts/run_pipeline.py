@@ -56,11 +56,10 @@ Expected console output (example values):
         Plane 2    invalid(0)      9   resolved(1)    462   ambiguous(2+)     52
 
       Accepted winning-triple hit quality, per plane
-        (golden/cluster = main's pipeline resolves it too; combo = recovered only by the χ² search):
-        Plane 0    golden    453   cluster     27   combo      7
-        Plane 1    golden    448   cluster     33   combo      6
-        Plane 2    golden    455   cluster     26   combo      6
-        Combinatorial-only recoveries: 18 of 487 accepted events carry >=1 combo plane (19 combo planes total).
+        (the winning candidate's own golden/cluster label):
+        Plane 0    golden    460   cluster     27
+        Plane 1    golden    454   cluster     33
+        Plane 2    golden    461   cluster     26
 
       Probe hit quality (coincidences that reached probe decode):
         golden 410   cluster 91
@@ -68,13 +67,6 @@ Expected console output (example values):
       Winning-triple line-fit χ²:
         passed cut (accepted + probe_quality-rejected): mean=0.42  std=0.61  n=491
         failed cut (chi2_track_cut, best of a noisy search): mean=182.0  std=210.4  n=20
-
-      Subset check (is every main-resolved hit on the combinatorial track?): FAIL (2 of 487 events)
-        2 event(s) where a main-resolved plane is off the winning
-        track by > 0.5 strip (5 mm) — main's hit is NOT on that track.
-        Diverging planes by main's resolution:  recovered-fold: 2
-          evt   1  χ²=    2.31  triple=(cluster,combo,cluster)
-            plane 0: main cluster(recovered) @(123.5,245.0) -> combo cluster @(155.0,245.0)  Δ=(+31.5,+0.0) mm
 
     === Stage 5: Probe pose fit ===
       t_x   =  +51.3 ±  1.2 mm
@@ -119,13 +111,9 @@ _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # plane, so the table must list them all — printing only golden/cluster
 # silently drops the unresolved/invalid rejections.
 _PRB_QUALITY_ORDER = ("golden", "cluster", "unresolved", "invalid")
-# Provenance of each plane in an accepted winning triple (stage5.tel_quality):
-# golden/cluster = main's pipeline also resolves it; combo = recovered only by
-# the combinatorial χ² search.
-_TEL_QUALITY_ORDER = ("golden", "cluster", "combo")
-# Cap on how many subset-check failures are printed per-event before the rest
-# are summarised, so a pathological run can't flood the summary.
-_SUBSET_FAIL_SHOW = 50
+# Per-plane quality of an accepted winning triple (stage5.tel_quality): the
+# winning candidate's own golden/cluster label.
+_TEL_QUALITY_ORDER = ("golden", "cluster")
 # Telescope active area (monrad.synthetic.N_TEL * monrad.synthetic.STRIP_MM), used
 # only to draw plane footprints in the 3D plot — not a pipeline parameter.
 _TEL_SIZE_MM = 99 * 10.0
@@ -238,54 +226,6 @@ def _cand_bucket(n: int) -> str:
     return "ambiguous(2+)"
 
 
-def _emit_subset_failures(lines: list[str], reports: list[DecodeReport]) -> None:
-    """
-    Print the per-event divergence for every subset-check failure: each event's
-    winning-triple χ², its per-plane provenance, and — for each plane main's
-    pipeline resolved but the combinatorial winner does not lie on — main's hit
-    vs. the combinatorial winner and their separation Δ (raw mm, the frame both
-    are stored in; the per-plane alignment δ cancels in Δ).
-    """
-    n = len(reports)
-    _emit(lines, f"    {n} event(s) where a main-resolved plane is off the winning")
-    _emit(lines, "    track by > 0.5 strip (5 mm) — main's hit is NOT on that track.")
-    # Break the violations down by HOW main fixed the diverging plane.  A
-    # "decoded" disagreement (decode_position resolved the plane uniquely) would
-    # be a real bug — that hit yields a single combinatorial candidate and so
-    # cannot diverge.  A "recovered-fold" disagreement is expected: main left
-    # the plane 'unresolved' (mirror-fold) and a two-plane predictor guessed a
-    # fold partner that the combinatorial 3-plane χ² resolved differently.
-    by_src: Counter = Counter()
-    for r in reports:
-        for v in r.subset_violations or ():
-            by_src[v.main_resolved_by] += 1
-    breakdown = "   ".join(
-        f"{label}: {by_src[key]}"
-        for key, label in (("recovered", "recovered-fold"), ("decoded", "decoded"))
-        if by_src[key]
-    )
-    _emit(lines, f"    Diverging planes by main's resolution:  {breakdown or '(none)'}")
-    for i, r in enumerate(reports[:_SUBSET_FAIL_SHOW], start=1):
-        chi2 = f"{r.chi2:.2f}" if r.chi2 is not None else "n/a"
-        triple = ",".join(r.tel_quality) if r.tel_quality is not None else "?"
-        _emit(lines, f"      evt {i:>3}  χ²={chi2:>8}  triple=({triple})")
-        for v in r.subset_violations or ():
-            _emit(
-                lines,
-                f"        plane {v.plane}: "
-                f"main {v.main_quality}({v.main_resolved_by}) "
-                f"@({v.main_x:.1f},{v.main_y:.1f}) "
-                f"-> combo {v.combo_quality} @({v.combo_x:.1f},{v.combo_y:.1f})  "
-                f"Δ=({v.dx:+.1f},{v.dy:+.1f}) mm",
-            )
-    if n > _SUBSET_FAIL_SHOW:
-        _emit(
-            lines,
-            f"      … and {n - _SUBSET_FAIL_SHOW} more (showing first "
-            f"{_SUBSET_FAIL_SHOW}).",
-        )
-
-
 def _probe_footprint(pose: PoseResult) -> tuple[float, float, float, float]:
     """
     Padded bounding box (u_lo, u_hi, v_lo, v_hi) of the inlier hits in the
@@ -366,44 +306,68 @@ def _plot_pose_3d(
         )
     )
 
-    # ── Inlier tracks, passing through each telescope plane and the probe ─
-    # Pack all disconnected segments into one trace, separated by None.
+    # ── Tracks, passing through each telescope plane and the probe ───────
+    # Inliers are drawn as faint gray lines; the LM-polish-removed outliers
+    # (Mahalanobis cut, DESIGN.md §8.7) as dashed red so the rejected tracks
+    # are visually separable.  Pack each set's disconnected segments into one
+    # trace, separated by None.
     z_pts = np.sort(np.append(z_corr, pose.z_p))  # (4,)
-    a_x = np.array([co.a_x for co in inliers])
-    b_x = np.array([co.b_x for co in inliers])
-    a_y = np.array([co.a_y for co in inliers])
-    b_y = np.array([co.b_y for co in inliers])
-    xs_all = a_x[:, None] + b_x[:, None] * z_pts[None, :]  # (n_inliers, 4)
-    ys_all = a_y[:, None] + b_y[:, None] * z_pts[None, :]
 
-    track_x: list[float | None] = []
-    track_y: list[float | None] = []
-    track_z: list[float | None] = []
-    for xs, ys in zip(xs_all, ys_all):
-        track_x.extend([*xs.tolist(), None])
-        track_y.extend([*ys.tolist(), None])
-        track_z.extend([*z_pts.tolist(), None])
-    traces.append(
-        go.Scatter3d(
-            x=track_x,
-            y=track_y,
-            z=track_z,
-            mode="lines",
-            line=dict(color="gray", width=1),
-            opacity=0.4,
-            name="Inlier tracks",
-            hoverinfo="skip",
+    def _add_track_set(
+        coincs: list,
+        line_kwargs: dict,
+        name: str,
+        marker_color: str | None,
+    ) -> None:
+        if not coincs:
+            return
+        a_x = np.array([co.a_x for co in coincs])
+        b_x = np.array([co.b_x for co in coincs])
+        a_y = np.array([co.a_y for co in coincs])
+        b_y = np.array([co.b_y for co in coincs])
+        xs_all = a_x[:, None] + b_x[:, None] * z_pts[None, :]  # (n, 4)
+        ys_all = a_y[:, None] + b_y[:, None] * z_pts[None, :]
+        track_x: list[float | None] = []
+        track_y: list[float | None] = []
+        track_z: list[float | None] = []
+        for xs, ys in zip(xs_all, ys_all):
+            track_x.extend([*xs.tolist(), None])
+            track_y.extend([*ys.tolist(), None])
+            track_z.extend([*z_pts.tolist(), None])
+        traces.append(
+            go.Scatter3d(
+                x=track_x,
+                y=track_y,
+                z=track_z,
+                mode="lines",
+                line=line_kwargs,
+                name=name,
+                hoverinfo="skip",
+            )
         )
+        if marker_color is not None:
+            traces.append(
+                go.Scatter3d(
+                    x=xs_all.ravel(),
+                    y=ys_all.ravel(),
+                    z=np.tile(z_pts, len(coincs)),
+                    mode="markers",
+                    marker=dict(color=marker_color, size=2, opacity=0.5),
+                    name="Track hits",
+                )
+            )
+
+    _add_track_set(
+        inliers,
+        dict(color="gray", width=1),
+        f"Inlier tracks ({len(inliers)})",
+        "darkorange",
     )
-    traces.append(
-        go.Scatter3d(
-            x=xs_all.ravel(),
-            y=ys_all.ravel(),
-            z=np.tile(z_pts, len(inliers)),
-            mode="markers",
-            marker=dict(color="darkorange", size=2, opacity=0.5),
-            name="Track hits",
-        )
+    _add_track_set(
+        pose.outliers,
+        dict(color="crimson", width=1, dash="dash"),
+        f"Outlier tracks — LM-polish removed ({len(pose.outliers)})",
+        None,
     )
 
     # Caption flagging the probe footprint as inferred rather than measured —
@@ -591,17 +555,10 @@ def main() -> None:
     chi2_n = {"pass": 0, "fail": 0}
     chi2_sum = {"pass": 0.0, "fail": 0.0}
     chi2_sumsq = {"pass": 0.0, "fail": 0.0}
-    # Combinatorial-only recovery + subset tracking, straight from
-    # DecodeReport.tel_quality/subset_ok (see stage5.py).  tel_q_dist[k] is the
-    # golden/cluster/combo breakdown of accepted winning triples per plane
-    # ("combo" = recovered only by the χ² search, not by main's pipeline);
-    # combo_stats counts events with >=1 combo plane.  subset_fail_reports
-    # holds the reports where a plane main resolved disagrees with the
-    # combinatorial winner (a main ⊄ combinatorial violation), kept whole so
-    # the per-event divergence can be printed below.
+    # Per-plane winning-triple quality, straight from DecodeReport.tel_quality
+    # (see stage5.py).  tel_q_dist[k] is the golden/cluster breakdown of
+    # accepted winning triples on plane k (the winning candidate's own label).
     tel_q_dist: list[Counter] = [Counter(), Counter(), Counter()]
-    combo_stats = {"events": 0, "planes": 0}
-    subset_fail_reports: list[DecodeReport] = []
 
     def _on_decode(r: DecodeReport) -> None:
         gate_counts[r.reason] += 1
@@ -618,12 +575,6 @@ def main() -> None:
         if r.accepted and r.tel_quality is not None:
             for k in range(3):
                 tel_q_dist[k][r.tel_quality[k]] += 1
-            n_combo = sum(1 for q in r.tel_quality if q == "combo")
-            if n_combo:
-                combo_stats["events"] += 1
-                combo_stats["planes"] += n_combo
-        if r.subset_ok is False:
-            subset_fail_reports.append(r)
 
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -696,25 +647,14 @@ def main() -> None:
         _emit(lines, f"    Plane {k}    {parts}")
 
     # ── Accepted winning-triple hit quality (per plane) ──
-    n_accepted = gate_counts["accepted"]
     _emit(lines)
     _emit(lines, "  Accepted winning-triple hit quality, per plane")
-    _emit(
-        lines,
-        "    (golden/cluster = main's pipeline resolves it too; "
-        "combo = recovered only by the χ² search):",
-    )
+    _emit(lines, "    (the winning candidate's own golden/cluster label):")
     for k in range(3):
         parts = "   ".join(
             f"{label} {tel_q_dist[k][label]:>6}" for label in _TEL_QUALITY_ORDER
         )
         _emit(lines, f"    Plane {k}    {parts}")
-    _emit(
-        lines,
-        f"    Combinatorial-only recoveries: {combo_stats['events']} of {n_accepted}"
-        f" accepted events carry >=1 combo plane ({combo_stats['planes']} combo"
-        f" planes total).",
-    )
 
     # ── Probe hit quality ──
     _emit(lines)
@@ -743,17 +683,6 @@ def main() -> None:
                 f"    {label}: mean={mean:.3f}  std={math.sqrt(var):.3f}  n={n}",
             )
 
-    # ── Subset check: main golden/cluster ⊆ combinatorial ──
-    _emit(lines)
-    n_fail = len(subset_fail_reports)
-    verdict = "PASS" if n_fail == 0 else f"FAIL ({n_fail} of {n_accepted} events)"
-    _emit(
-        lines,
-        f"  Subset check (is every main-resolved hit on the combinatorial "
-        f"track?): {verdict}",
-    )
-    if n_fail:
-        _emit_subset_failures(lines, subset_fail_reports)
     _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────

@@ -12,7 +12,6 @@ from .reconstruct import (
     TimedEvent as TimedEvent,
     find_file_pairs as find_file_pairs,
     load_header_params as load_header_params,
-    reconstruct as reconstruct,
     reconstruct_stream as reconstruct_stream,
     _utc_to_ns as _utc_to_ns,
 )

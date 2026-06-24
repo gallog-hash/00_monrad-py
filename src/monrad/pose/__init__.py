@@ -9,7 +9,6 @@ from .types import (
     DecodeReport as DecodeReport,
     GATE_ORDER as GATE_ORDER,
     PoseResult as PoseResult,
-    SubsetViolation as SubsetViolation,
 )
 from .optimize import (
     fit_probe_pose as fit_probe_pose,

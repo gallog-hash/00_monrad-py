@@ -4,49 +4,17 @@ Stage 5 (part) — data structures for the probe pose fit.
 Coincidence   per-coincidence telescope-line + probe-hit bundle fed to the
               optimizer.
 PoseResult    full optimizer output (fitted pose, covariance, diagnostics).
-DecodeReport / SubsetViolation / GATE_ORDER   instrumentation of the
+DecodeReport / GATE_ORDER   instrumentation of the
               PoseFitter._decode_cluster funnel.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import numpy as np
 
 
 # ── Internal data structure ───────────────────────────────────────────────
-
-
-class SubsetViolation(NamedTuple):
-    """
-    One plane where main's pipeline (decode_position +
-    disambiguate_telescope_hits) resolved a hit that the combinatorial winner
-    does *not* lie on — a `main ⊄ combinatorial` case (DESIGN.md §8.2).
-
-    Positions are raw (pre-alignment) mm, the frame both hits are stored in;
-    the per-plane δ cancels in the difference, so dx/dy are the
-    alignment-corrected divergence.  Surfaced so run_pipeline.py can show what
-    diverged rather than only counting that something did.
-    """
-
-    plane: int  # telescope column index (0..2)
-    main_quality: str  # "golden" / "cluster" — main's post-disambiguation label
-    main_x: float
-    main_y: float
-    combo_quality: str  # winning candidate's own quality
-    combo_x: float
-    combo_y: float
-    dx: float  # combo_x − main_x (mm)
-    dy: float  # combo_y − main_y (mm)
-    main_resolved_by: str = "decoded"  # how main fixed this plane's position:
-    # "decoded"   — decode_position resolved it uniquely (one fiber × one ribbon
-    #               cluster, contiguous): the combinatorial enumeration yields
-    #               that same single candidate, so such a hit CANNOT diverge.
-    # "recovered" — decode_position left it 'unresolved' (mirror-fold) and
-    #               disambiguate_telescope_hits picked a fold partner via a
-    #               two-plane prediction.  Divergence here is main's 2-plane
-    #               guess vs the combinatorial 3-plane χ² guess — expected, not
-    #               a lost hit.
 
 
 class Coincidence(NamedTuple):
@@ -65,11 +33,9 @@ class Coincidence(NamedTuple):
     v: float  # probe v-coordinate (mm)
     sigma_prb_x: float  # probe position uncertainty along x (mm)
     sigma_prb_y: float  # probe position uncertainty along y (mm)
-    # Per-plane provenance of the winning telescope triple.  "golden"/"cluster"
-    # mean main's pipeline (decode_position + disambiguate_telescope_hits) also
-    # resolved that plane; "combo" marks a plane only the combinatorial χ²
-    # search recovered (DESIGN.md §8.2).  The default keeps positional
-    # construction in tests working unchanged.
+    # Per-plane quality ("golden"/"cluster") of the winning telescope triple,
+    # taken from each winning candidate's own label (DESIGN.md §8.2).  The
+    # default keeps positional construction in tests working unchanged.
     tel_quality: tuple[str, str, str] = ("golden", "golden", "golden")
     # Telescope event time (integer ns) of this coincidence, set by
     # PoseFitter._decode_cluster from the telescope TimedEvent.t_ns.  Lets
@@ -97,15 +63,11 @@ class DecodeReport(NamedTuple):
     cand_counts: tuple[int, int, int] | None
     chi2: float | None
     prb_quality: str | None
-    # Per-plane provenance of the winning telescope triple (see Coincidence)
-    # and whether main's golden/cluster hits are a subset of the combinatorial
-    # track.  tel_quality/subset_ok are None until the cluster reaches the
+    # Per-plane quality ("golden"/"cluster") of the winning telescope triple
+    # (see Coincidence).  None until the cluster reaches the
     # telescope-classification step (i.e. on the "probe_quality" and "accepted"
-    # paths).  subset_violations carries the per-plane divergence detail when
-    # subset_ok is False (else None), so diagnostics can show what diverged.
+    # paths).
     tel_quality: tuple[str, str, str] | None = None
-    subset_ok: bool | None = None
-    subset_violations: tuple[SubsetViolation, ...] | None = None
 
 
 # The rejection gates _decode_cluster applies, in the order it checks them
@@ -149,3 +111,8 @@ class PoseResult:
     inliers: list[Coincidence]  # the n_inliers Coincidences kept after the
     # Mahalanobis cut (used for the final refit) — exposed for diagnostics
     # such as 3D track plots.
+    outliers: list[Coincidence] = field(default_factory=list)
+    # the Coincidences rejected by the Mahalanobis cut (d_i > 4) — exposed so
+    # diagnostics can render the LM-polish-removed tracks distinctly from the
+    # inliers (DESIGN.md §8.7).  Empty when the cut was bypassed (the
+    # len(inliers) < 3 fallback keeps all coincidences).

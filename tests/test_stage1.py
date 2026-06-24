@@ -15,7 +15,6 @@ from monrad.timing import (
     _utc_to_ns,
     load_header_params,
     find_file_pairs,
-    reconstruct,
     reconstruct_stream,
 )
 from monrad.synthetic import generate, F0
@@ -45,32 +44,40 @@ def synth(tmp_path_factory):
     return result, out
 
 
-# ── batch fixtures (deprecated reconstruct()) ─────────────────────
+# ── batch fixtures (materialised from reconstruct_stream()) ───────
+
+
+def _materialise(gps, pos, utc0, f0):
+    """Drain reconstruct_stream() into (events, pos_map) for the batch tests."""
+    events = []
+    pos_map = {}
+    for ev, ref in reconstruct_stream(gps, pos, utc0, f0):
+        events.append(ev)
+        pos_map[ev.evt_seq] = ref
+    return events, pos_map
 
 
 @pytest.fixture(scope="module")
 def tel_batch(synth):
-    """Run stage 1 (batch) on the telescope detector."""
-    result, out = synth
+    """Run stage 1 on the telescope detector, materialised to lists."""
+    _result, out = synth
     tel_dir = out / "telescope"
     header = next(tel_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(tel_dir)
-    with pytest.warns(DeprecationWarning):
-        events, pos_map = reconstruct(gps, pos, utc0, f0)
+    events, pos_map = _materialise(gps, pos, utc0, f0)
     return events, pos_map, utc0, f0
 
 
 @pytest.fixture(scope="module")
 def prb_batch(synth):
-    """Run stage 1 (batch) on the probe detector."""
-    result, out = synth
+    """Run stage 1 on the probe detector, materialised to lists."""
+    _result, out = synth
     prb_dir = out / "probe"
     header = next(prb_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(prb_dir)
-    with pytest.warns(DeprecationWarning):
-        events, pos_map = reconstruct(gps, pos, utc0, f0)
+    events, pos_map = _materialise(gps, pos, utc0, f0)
     return events, pos_map
 
 

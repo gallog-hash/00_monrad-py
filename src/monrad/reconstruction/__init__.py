@@ -12,6 +12,5 @@ from .hit import (
 )
 from .candidates import (
     PlaneCandidate as PlaneCandidate,
-    disambiguate_telescope_hits as disambiguate_telescope_hits,
     reconstruct_plane_candidates as reconstruct_plane_candidates,
 )

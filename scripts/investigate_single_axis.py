@@ -2,9 +2,8 @@
 
 A plane decodes as 'unresolved' if either the x OR the y axis fails
 (stage3.decode_position).  When only one axis fails, the other axis was
-cleanly resolved but its coordinate is currently discarded, so the plane
-cannot be recovered by disambiguate_telescope_hits (the recovery path needs
-both axes re-derived from candidate lists).
+cleanly resolved; this script quantifies how often that single-axis failure
+mode occurs (the axis that did resolve is retained in Hit.candidates_x/y).
 
 This script classifies, over the real coincidence telescope events, every
 'unresolved' plane as:
