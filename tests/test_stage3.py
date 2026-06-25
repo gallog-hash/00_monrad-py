@@ -8,21 +8,18 @@ correct.
 
 import math
 import pytest
-import numpy as np
 from datetime import datetime
 
-from monrad.stage1 import (
+from monrad.timing import (
     load_header_params,
     find_file_pairs,
     reconstruct_stream,
 )
-from monrad.stage3 import (
+from monrad.reconstruction import (
     decode_position,
-    disambiguate_telescope_hits,
     reconstruct_plane_candidates,
-    Hit,
 )
-from monrad.synth import generate, F0, Z_TEL, STRIP_MM
+from monrad.synthetic import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -176,7 +173,7 @@ class TestTOTThreshold:
         """A two-bit cluster where one bit fires more rows should pull
         the centroid toward the higher-TOT bit."""
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         # Build a minimal *.bin with one event where X has a 2-bit cluster.
         # Channel c_x=23 → ribbon=2, fiber=3.  Cluster = {23, 24}.
@@ -240,8 +237,8 @@ class TestTOTThreshold:
     def test_thresh_removes_single_row_noise(self, tmp_path):
         """A bit that fires in only 1 of 16 rows is removed by thresh=2."""
         import struct
-        from monrad.synth import _ch_to_u64
-        from monrad.stage1 import PosRef
+        from monrad.synthetic import _ch_to_u64
+        from monrad.timing import PosRef
 
         # Build a minimal *.bin with one event:
         # row 0: a clean golden hit (ch=5 in X, ch=3 in Y)
@@ -272,155 +269,13 @@ class TestTOTThreshold:
         assert hits2[0].y_mm == pytest.approx(3.5 * STRIP_MM)
 
 
-# ── Tests for disambiguate_telescope_hits ─────────────────────────────────
-
-_Z3 = np.array([0.0, 400.0, 800.0])
-_SIGMA = STRIP_MM / math.sqrt(12)
-
-
-def _h(x, y, quality="golden", cx=None, cy=None):
-    return Hit(x, y, _SIGMA, _SIGMA, quality, cx, cy)
-
-
-class TestDisambiguateHits:
-    """Verify disambiguate_telescope_hits() resolves candidates correctly."""
-
-    def test_all_golden_unchanged(self):
-        """Three golden hits → returned unchanged (no unresolved plane)."""
-        hits = [_h(100.0, 50.0), _h(300.0, 250.0), _h(500.0, 450.0)]
-        result = disambiguate_telescope_hits(hits, _Z3)
-        assert result == hits
-
-    def test_wrong_length_unchanged(self):
-        """Input with != 3 planes → returned unchanged."""
-        hits = [_h(100.0, 50.0), _h(300.0, 250.0)]
-        assert disambiguate_telescope_hits(hits, _Z3) == hits
-
-    def test_middle_plane_disambiguated(self):
-        """
-        Middle plane unresolved; 2 candidates — one near the track prediction,
-        one far away.  The near candidate is selected.
-
-        Track: x0=100, x2=500 → prediction at z=400 is x=300 mm.
-        Candidates: ch=29.0 → 295 mm (Δ=5 mm < tol=15 mm) ✓
-                    ch=0.0  → 5 mm   (Δ=295 mm)             ✗
-        """
-        h0 = _h(100.0, 100.0)
-        h1 = _h(
-            0.0, 0.0, "unresolved", cx=[(0.0, 1), (29.0, 1)], cy=[(0.0, 1), (29.0, 1)]
-        )
-        h2 = _h(500.0, 500.0)
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[0] == h0
-        assert result[2] == h2
-        assert result[1].quality == "cluster"
-        assert abs(result[1].x_mm - 295.0) < 1e-6
-        assert abs(result[1].y_mm - 295.0) < 1e-6
-
-    def test_outer_plane_disambiguated(self):
-        """
-        Plane 0 unresolved; planes 1 and 2 are good.
-        Prediction at z=0: extrapolated from z=400 and z=800.
-        Track: x1=300, x2=500 → slope=(500-300)/(800-400)=0.5 mm/mm
-               x_pred at z=0: t=(0-400)/(800-400)=-1.0 → x=300-1*(500-300)=100 mm.
-        """
-        h0 = _h(
-            0.0, 0.0, "unresolved", cx=[(0.0, 1), (9.0, 1)], cy=[(0.0, 1), (9.0, 1)]
-        )
-        h1 = _h(300.0, 300.0)
-        h2 = _h(500.0, 500.0)
-        # ch=9: x_mm=(9.0+0.5)*10=95 mm; |95-100|=5<15 ✓
-        # ch=0: x_mm=5 mm; |5-100|=95>15 ✗
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1] == h1
-        assert result[2] == h2
-        assert result[0].quality == "cluster"
-        assert abs(result[0].x_mm - 95.0) < 1e-6
-
-    def test_sigma_carries_cluster_width(self):
-        """Disambiguated sigma reflects each axis's cluster width, not always 1 strip."""
-        h0 = _h(100.0, 100.0)
-        # cx: width-2 cluster centroid near prediction; cy: width-1
-        h1 = _h(0.0, 0.0, "unresolved", cx=[(29.0, 2)], cy=[(29.0, 1)])
-        h2 = _h(500.0, 500.0)
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "cluster"
-        assert abs(result[1].sigma_x - STRIP_MM * 2 / math.sqrt(12)) < 1e-9
-        assert abs(result[1].sigma_y - STRIP_MM * 1 / math.sqrt(12)) < 1e-9
-
-    def test_no_match_candidate_out_of_range(self):
-        """Nearest candidate is more than 1.5 strips away → hit unchanged."""
-        h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[(0.0, 1)], cy=[(0.0, 1)])
-        h2 = _h(500.0, 500.0)
-        # x_pred at z=400: 300 mm; ch=0 → 5 mm; Δ=295 mm > 15 mm
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "unresolved"
-
-    def test_x_matches_y_does_not_unchanged(self):
-        """If only one axis resolves, the hit quality stays 'unresolved'."""
-        h0 = _h(100.0, 100.0)
-        h1 = _h(
-            0.0,
-            0.0,
-            "unresolved",
-            cx=[(29.0, 1)],  # x_mm=295 ≈ pred 300 → within tol
-            cy=[(0.0, 1)],
-        )  # y_mm=5   far from pred 300 → out of tol
-        h2 = _h(500.0, 500.0)
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "unresolved"
-
-    def test_two_unresolved_planes_unchanged(self):
-        """Two unresolved planes → can't form a 2-good-plane predictor."""
-        h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[(29.0, 1)], cy=[(29.0, 1)])
-        h2 = _h(0.0, 0.0, "unresolved", cx=[(49.0, 1)], cy=[(49.0, 1)])
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "unresolved"
-        assert result[2].quality == "unresolved"
-
-    def test_no_candidates_unchanged(self):
-        """Unresolved hit with empty candidate list → left unchanged."""
-        h0 = _h(100.0, 100.0)
-        h1 = _h(0.0, 0.0, "unresolved", cx=[], cy=[])
-        h2 = _h(500.0, 500.0)
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "unresolved"
-
-    def test_single_axis_unresolved_recovered(self):
-        """
-        Single-axis failure: x failed (two candidates), y was resolved and is
-        carried as a one-element candidate.  The failed x is filled from the
-        projection and the known y matches trivially → the plane is recovered.
-
-        Track: x0=100, x2=500 → x_pred at z=400 is 300 mm.
-               y0=100, y2=500 → y_pred at z=400 is 300 mm.
-        cx: ch=29.0 → 295 mm (Δ=5 < 15) ✓ ; ch=0.0 → 5 mm (Δ=295) ✗
-        cy: ch=29.5 → 300 mm (the resolved axis, Δ=0)            ✓
-        """
-        h0 = _h(100.0, 100.0)
-        h1 = _h(
-            0.0,
-            0.0,
-            "unresolved",
-            cx=[(0.0, 1), (29.0, 1)],  # failed axis: real hypotheses
-            cy=[(29.5, 1)],  # resolved axis: single kept candidate
-        )
-        h2 = _h(500.0, 500.0)
-        result = disambiguate_telescope_hits([h0, h1, h2], _Z3)
-        assert result[1].quality == "cluster"
-        assert abs(result[1].x_mm - 295.0) < 1e-6
-        assert abs(result[1].y_mm - 300.0) < 1e-6
-
-
 class TestCandidatesPopulated:
     """Unresolved hits from decode_position() carry non-empty candidate lists."""
 
     def test_unresolved_candidates_present(self, tmp_path):
         """An unresolved hit (multiple clusters) carries a non-empty candidate list."""
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         # X: two disconnected fiber clusters (bits 0 and 5 both set, ribbon bit 2)
         # → candidates [20, 25], which are non-contiguous → unresolved
@@ -452,7 +307,7 @@ class TestCandidatesPopulated:
         y is golden (ribbon bit 1, fiber bit 1 → channel 10*1+1 = 11).
         """
         import struct
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         x_rib = 1 << 2
         x_fib = (1 << 0) | (1 << 5)
@@ -502,7 +357,7 @@ class TestPlaneCandidates:
         ribbon×fiber combinations.  Y is golden (ribbon=1, fiber=1 → ch=11).
         Expect exactly the 4 X-candidates × 1 Y-candidate = 4 points.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -546,7 +401,7 @@ class TestPlaneCandidates:
         enumerate all 6 without crashing or dropping the true channels —
         graceful degradation (more candidates), not lost data.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -583,7 +438,7 @@ class TestPlaneCandidates:
         equal compactness (width 1 on each axis), so the cap keeps exactly
         max_per_plane of them.
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = (1 << 1) | (1 << 8)
         y_fib = (1 << 1) | (1 << 8)
@@ -599,7 +454,7 @@ class TestPlaneCandidates:
 
     def test_invalid_plane_returns_empty_list(self, tmp_path):
         """X_ribbon=0 (no ribbon channel fired) → invalid → empty list."""
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -615,7 +470,7 @@ class TestPlaneCandidates:
 
     def test_golden_plane_yields_one_candidate(self, tmp_path):
         """A clean golden hit on both axes yields exactly one candidate."""
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -647,7 +502,7 @@ class TestPlaneCandidates:
         """
         import struct
 
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -695,7 +550,7 @@ class TestPlaneCandidates:
         channels apart, so the cross-product splits into two gap-free runs,
         each a distinct 2-wide cluster candidate: [23,24] and [33,34].
         """
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1
@@ -733,7 +588,7 @@ class TestPlaneCandidates:
         """
         import struct
 
-        from monrad.stage1 import PosRef
+        from monrad.timing import PosRef
 
         y_rib = 1 << 1
         y_fib = 1 << 1

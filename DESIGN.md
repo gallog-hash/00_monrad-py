@@ -33,9 +33,9 @@ arranged in two perpendicular layers — one for X, one for Y. Each strip is
 read out as a single channel. The telescope planes have **99 channels per
 axis** spanning a nominal 100 cm × 100 cm active area (the slight excess
 reflects the optical coatings on the bars, which extend their effective width
-beyond 1 cm). Probes have a 30 cm × 30 cm active area; the channel count per
-probe depends on how many bars are used and is not currently known to the
-pipeline a priori.
+beyond 1 cm). The probes use the same plastic scintillator bars as the telescope. 
+They typically use 30 × 30 or 40 × 40 bars, providing a nominal active area of 
+30 cm² or 40 cm², respectively. 
 
 Channel 0 is at one physical edge of the active area. The three telescope
 planes are mounted with channel 0 aligned across planes — that is, the
@@ -59,10 +59,8 @@ three planes) and **a few Hz** for each probe.
 ### 2.1 The header file
 
 A small INI-like text file with bracketed module sections (`[J11]`, `[GPS]`,
-…) and `key=value` entries. The fields the pipeline needs are:
+…) and `key=value` entries. The only field the pipeline needs is:
 
-- The **clock counter frequency** `f₀`, a single integer (Hz), the same for
-  all detectors.
 - The **GPS string** in the `[GPS]` section, written as latin-1 with `\XX` hex
   escapes for non-printable bytes. This is a UBX-TIM-TM2 binary frame from
   the receiver, decoded by `decode_ubx_tm2()` in `decoders/header.py`. There is
@@ -137,8 +135,12 @@ across the 16 samples (see §6).
 
 In a clean acquisition, `*.bin` row count is a multiple of 16, and
 `*.bin row count / 16` equals the number of non-PPS records in the
-corresponding `*_GPS.bin`. The pipeline asserts this invariant on each
-file pair as a sanity check (see §4.4 for the file-boundary edge case).
+corresponding `*_GPS.bin`. The row-count-multiple-of-16 part holds
+universally; the count-equality part can be violated by ±1–2 blocks at a
+file rotation (the `.bin` and `*_GPS.bin` streams are flushed at slightly
+offset points), so the pipeline treats it as a **warning, not a hard
+assertion**, and proceeds — see §4.4 and §10 ("Cross-file 16-row block
+continuity") for the real-data behaviour.
 
 ### 2.4 Position encoding — fiber and ribbon
 
@@ -207,9 +209,11 @@ for each probe.
 ### 4.1 Anchoring with PPS
 
 The header gives one absolute UTC anchor `UTC₀` (decoded from the UBX-TIM-TM2
-GPS string) and the nominal counter frequency `f₀`. PPS records inside
-`*_GPS.bin` then provide a stream of further anchors at 1 Hz, latching the
-counter value `C_k` at each successive PPS edge.
+GPS string). The nominal counter frequency `f₀` is **not** carried in the
+header; `load_header_params` uses the fixed `F0_DEFAULT = 100 MHz` (see §10,
+"Clock frequency source"). PPS records inside `*_GPS.bin` then provide a
+stream of further anchors at 1 Hz, latching the counter value `C_k` at each
+successive PPS edge.
 
 Walk the PPS records maintaining `(C_k, N_k)` where `N_k` is the integer
 number of seconds since the run started and `N_0 = 0`. For each next PPS
@@ -303,12 +307,6 @@ PosRef      (file_idx, row_offset, split_rows)
 `PosRef` is carried inline with the `TimedEvent` and passed directly to
 stage 3 decode calls by the caller; no side-table lookup is required.
 
-A deprecated `reconstruct()` batch wrapper is retained for backward
-compatibility. It materialises the full stream into lists and returns
-`(events, pos_map)` where `pos_map[evt_seq]` equals the corresponding
-`PosRef`. Remove it once all callers have been migrated to
-`reconstruct_stream()`.
-
 
 ## 5. Stage 2 — coincidence search
 
@@ -378,15 +376,14 @@ def decode_position(
     n_cols: int,
     tot_thresh: int = 1,
     tot_weights: bool = False,
-) -> list[Hit | None]:
+) -> list[Hit]:
 ```
 
 `pos_ref` is received directly from the stream — no `pos_map` lookup is
-needed. Returns one entry per plane (`n_cols` elements). In practice every
-entry is a real `Hit`: when reconstruction fails the plane is returned with
-quality `'invalid'` or `'unresolved'` rather than `None`, so callers test on
-`quality` instead of null-checking (the `Hit | None` return type is kept for
-backward compatibility).
+needed. Returns one entry per plane (`n_cols` elements), always a real `Hit`
+(the list never contains `None`): when reconstruction fails the plane is
+returned with quality `'invalid'` or `'unresolved'`, so callers test on
+`quality` instead of null-checking.
 
 `tot_thresh` keeps only bits that fired in ≥ `tot_thresh` of the 16 block
 rows (1 = plain bitwise OR; 2–4 filters single-row noise). `tot_weights`
@@ -399,8 +396,12 @@ For the `(file_idx, row_offset)` in `pos_ref`, read 16 × `n_cols` u64s
 starting at `row_offset`. This is a single O(1) seek per event, costing at
 most 16 × 3 × 8 = 384 bytes per telescope event and 128 bytes per probe event.
 
-For each of the `n_cols` planes, compute the bitwise OR of the 16 samples'
-X and Y fields. Verify that all 16 GEN values within the block agree, and
+For each of the `n_cols` planes, collapse the 16 samples' X and Y fields to
+a single per-axis mask (`reconstruction/hit.py::_or_masks`). At the default
+`tot_thresh=1` this is a plain bitwise OR of the 16 samples; at `tot_thresh>1`
+it is **not** an OR but a per-bit count filter — a bit is kept only if it
+fired in ≥ `tot_thresh` of the 16 rows (§6.1). Verify that all 16 GEN values
+within the block agree, and
 that the GEN matches `evt_seq mod 2048` from `*_GPS.bin`. A mismatch on
 either is a structural error — the file pair is corrupted or the join is
 wrong; halt and report.
@@ -430,14 +431,14 @@ For each valid axis (X or Y separately):
 A hit is delivered to the caller only if both X and Y are reconstructed. The
 quality flag is `golden`, `cluster`, `unresolved`, or `invalid`.
 
-When a hit is `unresolved` because only **one** axis failed, the axis that
-*did* reconstruct is retained as a single candidate hypothesis (its centroid
-and width); the failed axis carries its real multi-candidate list. This lets
-the two-plane recovery (§8.2) fill only the failed axis from the projected
-track while matching the known axis trivially. On real data roughly half of
-all `unresolved` telescope readings fail on a single axis, so keeping the
-good coordinate materially increases the recovered-track yield rather than
-discarding the whole plane.
+`unresolved` means an axis did not collapse to one clean channel. When only
+**one** axis failed, the axis that *did* reconstruct is retained as a single
+candidate hypothesis (its centroid and width) and the failed axis carries its
+real multi-candidate list; these per-axis hypotheses (`Hit.candidates_x/y`)
+are kept for diagnostics (e.g. `scripts/investigate_single_axis.py`). They are
+**not** consumed by a plane-recovery step: Stage 5 enumerates its own per-plane
+candidates independently via `reconstruct_plane_candidates` (§8.2) and never
+reads these lists.
 
 ### 6.5 Channel → physical coordinate
 
@@ -450,13 +451,18 @@ is used for telescope and probes. Any per-detector edge offset (e.g. a frame
 that prevents the leftmost strip from being at exactly x = 0) is absorbed
 into the alignment fits in §7 and §8.
 
-### 6.6 Future refinement
+### 6.6 Time-over-threshold weight and future refinement
 
-The 16 per-sample bit patterns carry information that the OR discards: the
-first sample in which a strip fires gives a sub-event-window time stamp
-(useful for time-walk corrections), and the number of active samples per
-strip is a time-over-threshold quality weight. Both are noted for future
-work and are not used in the current design.
+The 16 per-sample bit patterns carry information that a plain OR discards.
+The number of active samples per strip is a **time-over-threshold (TOT)
+quality weight**, and it **is** implemented: with `tot_weights=True` (§6.1,
+`_tot_weighted_centroid`) each cluster centroid is weighted by its per-bit
+row counts (no effect on golden hits). It backs the `--tot-weights` pipeline
+flag.
+
+What remains future work is the *sub-event-window timestamp*: the first
+sample in which a strip fires gives a finer-than-80 ns time stamp useful for
+time-walk corrections. This is not yet used.
 
 
 ## 7. Stage 4 — telescope internal alignment (parallel branch)
@@ -484,12 +490,21 @@ angular and spatial coverage, for two reasons:
   coincidences from a 5 m probe configuration it would not.
 - **Lever arm.** A per-plane rotation about z manifests as a residual whose
   magnitude grows with distance from the rotation axis, and a per-plane tilt
-  manifests as a residual that grows with track angle. Both diagnostics need
-  the full angular and spatial extent of the telescope, not the narrow cone
-  selected by a coincidence with a probe.
+  (out-of-plane, about x or y) manifests as a residual that grows with track
+  angle. Both diagnostics need the full angular and spatial extent of the
+  telescope, not the narrow cone selected by a coincidence with a probe.
 
-For both reasons this stage runs on **all telescope tracks** via a dedicated
-`reconstruct_stream()`, independent of the coincidence pipeline.
+Concretely, the stage fits a **middle-plane** out-of-plane tilt about x and y
+(`tilt_x`/`tilt_y`, §7.3), the per-plane non-parallelism the telescope
+mechanics actually permit; outer-plane tilts remain degenerate with track
+slope and are left at 0 (§10, "Plane tilt detection"). Rotation about z is
+mechanically suppressed by the mounting, so `rotation_z` is fitted only as a
+quality monitor (expected ≈ 0), not as a routine correction. (This is the
+telescope's *internal* z-rotation; the probe's own orientation θ about z in
+§8.1 is a separate, legitimate parameter.)
+
+For all the above reasons this stage runs on **all telescope tracks** via a
+dedicated `reconstruct_stream()`, independent of the coincidence pipeline.
 
 ### 7.2 Inputs
 
@@ -573,11 +588,14 @@ decide whether to apply it.
 
 ### 7.6 Continuous monitoring
 
-Each flush produces a timestamped `AlignmentCorrection`. Persisting these
-to a log file indexed by the UTC timestamp of the first hit in the batch
-directly implements continuous drift monitoring: slow changes indicate
+Each flush produces a timestamped `AlignmentCorrection`. Persisting these to
+a log file indexed by the UTC timestamp of the first hit in the batch would
+directly implement continuous drift monitoring — slow changes indicate
 mechanical settling or thermal expansion; sudden jumps indicate a discrete
-physical event (apparatus bumped, DAQ restarted).
+physical event (apparatus bumped, DAQ restarted). **This log export is not
+yet implemented**; corrections are only printed to `summary.txt`. A real
+drift-log exporter remains an open item (§10, "Diagnostic plots /
+alignment drift log").
 
 
 ## 8. Stage 5 — probe pose alignment
@@ -624,34 +642,37 @@ parameters and a 4 × 4 covariance `Σ_line` derived from the per-plane
 position uncertainties (§6.4) and the corrected plane `z` values from §7.
 
 **Resolving plane ambiguity — combinatorial candidate search.** A telescope
-plane is frequently *ambiguous*: the mirror-fold fiber/ribbon readout
-(§10 Deduction #4) leaves several plausible channels per axis, and the raw
-bit pattern of a true folded hit is indistinguishable from that of two
-overlapping particles. Rather than recover one plane from the other two,
-Stage 5 enumerates candidates on **all** planes and lets the geometry choose:
+plane is frequently *ambiguous*: a too-low acquisition threshold lets extra
+adjacent strips fire, so an axis yields a wide cluster or several plausible
+channels rather than one clean hit. Such a pattern is indistinguishable from
+that of two overlapping particles. Rather than recover one plane from the
+other two, Stage 5 enumerates candidates on **all** planes and lets the
+geometry choose:
 
 - `reconstruct_plane_candidates()` (stage 3) returns, per plane, the list of
   plausible `(x, y)` positions — a single candidate when both axes resolve
   cleanly (`golden`/`cluster`), or the full ribbon × fiber cross-product
-  (capped at 16/plane) when an axis is fold-ambiguous.
+  (capped at 16/plane) when an axis is ambiguous.
 - `PoseFitter._decode_cluster` then searches the Cartesian product
   `cands₀ × cands₁ × cands₂` of the three planes' candidate lists, evaluates
   the weighted line fit above for **every** candidate triple, and keeps the
-  triple with the minimum line-fit χ². Discrete fold disambiguation is thus
-  folded into the same χ² the continuous track fit minimises.
+  triple with the minimum line-fit χ². Discrete candidate disambiguation is
+  thus folded into the same χ² the continuous track fit minimises.
 
 Two guards protect this search:
 
 - **zero-candidate plane** — if any plane yields no candidate (e.g. a
   single-half dropout), the triple cannot be formed and the coincidence is
   rejected.
-- **anchor plane required** (`no_anchor_plane`) — if *all three* planes are
-  multi-candidate, the search is refused. With no already-resolved plane to
-  anchor it, a genuine pile-up (two particles in one window) can minimise χ²
-  by coincidence just as a single fold-mirrored track does; the bit patterns
-  are identical, so the search cannot tell them apart. Requiring ≥ 1 resolved
-  anchor plane relaxes the old two-plane-recovery requirement of two clean
-  planes to one, while still rejecting unanchored pile-up.
+- **anchor plane** (`no_anchor_plane`) — by default (`min_anchor_planes=1`)
+  the search requires at least one plane that already decoded to a single
+  resolved candidate. With no resolved plane to anchor it, a genuine pile-up
+  (two particles in one window) can minimise χ² by coincidence just as a real
+  track does; the bit patterns are identical, so the search cannot tell them
+  apart. This guard is **tunable, not mandatory**: `min_anchor_planes=0`
+  disables it (every cluster is searched — more tracks, far heavier compute,
+  pile-up can fabricate a low-χ² track) and `min_anchor_planes=3` tightens it
+  to demand every plane already resolved.
 
 The winning triple is fit in the alignment-corrected frame (`coord − δ`), so
 the line fit and the χ² cut below use the corrected plane positions. A
@@ -670,47 +691,10 @@ of residual on each plane) is applied here to remove ghost tracks before
 they corrupt the alignment fit. Loose cuts are preferred over tight ones at
 this stage.
 
-**`combo` provenance flag and subset check.** The combinatorial search above
-replaces the older two-plane recovery
-(`stage3.disambiguate_telescope_hits`), which could only resolve an ambiguous
-plane when the *other two* were already clean. To verify and report that the
-new search is a strict superset of the old behaviour, each accepted triple is
-classified per plane by **replaying** the old path
-(`decode_position` + `disambiguate_telescope_hits`) for the same event in the
-same alignment-corrected frame:
-
-- a plane the old path also resolves keeps its own quality (`golden`/`cluster`)
-  — a *shared* / anchor plane;
-- a plane only the combinatorial search recovers is labelled **`combo`** (the
-  headline case being two of three planes fold-ambiguous, which the two-plane
-  predictor cannot resolve).
-
-The anchor guard above guarantees ≥ 1 non-`combo` plane per accepted event.
-A **subset violation** (`subset_ok = False`) is recorded if a plane the old
-path resolved disagrees in position with the combinatorial winner by more than
-half a strip — i.e. an old hit that is *not* on the chosen track. Each
-violation also records **how** the old path fixed that plane
-(`SubsetViolation.main_resolved_by`), because the two cases mean very different
-things:
-
-- **`decoded`** — `decode_position` resolved the plane *uniquely* (one fiber ×
-  one ribbon cluster, contiguous combined range). The combinatorial enumeration
-  re-runs the same clustering and yields that *same single* candidate, so the
-  χ² search has no alternative to pick: a `decoded` hit **cannot** diverge. A
-  `decoded` violation would therefore signal a real bug (e.g. a decode-path
-  mismatch between the two routes).
-- **`recovered`** — `decode_position` left the plane `unresolved` (a mirror
-  fold: a half has ≥ 2 bit-clusters) and `disambiguate_telescope_hits` picked a
-  fold partner using a *two-plane* linear prediction. The combinatorial
-  *three-plane* χ² fit enumerates the same fold partners and may legitimately
-  choose a different one. So `recovered` divergences are **expected** — two
-  disambiguation strategies resolving the same ambiguity — not lost hits.
-
-The strict invariant "every *uniquely-decoded* old hit lies on the
-combinatorial track" thus holds and is expected never to fire; on testLab data
-all observed violations are `recovered` folds. The flag and per-plane `combo`
-counts are surfaced by `run_pipeline.py` (Stage 3 funnel). The flag is
-diagnostic only — it is not a rejection gate.
+Each accepted triple is labelled per plane by its winning candidate's own
+quality (`golden`/`cluster`); this `tel_quality` is surfaced by
+`run_pipeline.py` (Stage 3 funnel) and carried on the `Coincidence`, but
+nothing in the fit reads it.
 
 ### 8.3 The residual
 
@@ -832,7 +816,11 @@ The fitter returns a bundle, **not just four numbers**:
 - a stratified-half consistency test — split the dataset by event-time
   parity, fit each half, and report whether the parameters agree within
   their σ; disagreement indicates either a systematic (drift, miscounted
-  coincidences, an overlooked tilt) or an underestimated covariance.
+  coincidences, an overlooked tilt) or an underestimated covariance;
+- the kept (`inliers`) and Mahalanobis-cut (`outliers`) coincidences, drawn
+  as a 3D track plot (`run_pipeline.py --plot` → `pose_3d.html`) with the
+  LM-polish-removed outlier tracks styled distinctly from the inliers, so the
+  rejected tracks are visible alongside the ones that defined the fit.
 
 These diagnostics are what tell you whether to trust the four numbers.
 
@@ -874,38 +862,46 @@ time; it is applied to telescope hits at the next refit.
 ## 9. Module layout
 
 ```
-src/monrad/
+src/monrad/                  # each stage is a domain package; the public API
+                             # listed below is re-exported from its __init__.py
     decoders/
         header.py    # parse_header(), decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder — reads *.bin, reconstructs hits
-    synth.py         # generate() — synthetic dataset for testing
-    stage1.py        # reconstruct_stream(), load_header_params(),
-                     # find_file_pairs(), reconstruct() [deprecated]
-    stage2.py        # coincidence_stream()
-    stage3.py        # Hit, GOOD_QUALITIES, decode_position(),
-                     # reconstruct_plane_candidates(), PlaneCandidate,
-                     # disambiguate_telescope_hits()
-    stage4.py        # PlaneCorrection, AlignmentCorrection,
-                     # AlignmentAccumulator, fit_telescope_alignment()
-    stage5.py        # Coincidence, DecodeReport, GATE_ORDER, PoseResult,
-                     # PoseFitter, fit_probe_pose()
+    timing/          # stage 1
+        reconstruct.py   # reconstruct_stream(), load_header_params(),
+                         # find_file_pairs()
+    coincidence/     # stage 2
+        search.py        # coincidence_stream()
+    reconstruction/  # stage 3
+        hit.py           # Hit, GOOD_QUALITIES, decode_position()
+        candidates.py    # reconstruct_plane_candidates(), PlaneCandidate
+    alignment/       # stage 4
+        accumulator.py   # PlaneCorrection, AlignmentCorrection,
+                         # AlignmentAccumulator, fit_telescope_alignment()
+    pose/            # stage 5
+        types.py         # Coincidence, DecodeReport, GATE_ORDER, PoseResult
+        optimize.py      # fit_probe_pose() + line-fit / residual helpers
+        fitter.py        # PoseFitter, _decode_cluster()
+    synthetic/       # generate() — synthetic dataset for testing
+        generate.py
+    monitor/         # probe-position monitoring drivers (Steps 1-3)
 ```
 
 Key types:
 
 | Type | Module | Description |
 |---|---|---|
-| `Quality` | `stage1` | GOOD / DEGRADED / UNTRUSTED |
-| `TimedEvent` | `stage1` | `(t_ns, evt_seq, quality)` |
-| `PosRef` | `stage1` | `(file_idx, row_offset, split_rows)` |
-| `Hit` | `stage3` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits |
-| `PlaneCandidate` | `stage3` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
-| `PlaneCorrection` | `stage4` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
-| `AlignmentCorrection` | `stage4` | list of `PlaneCorrection` + `needs_correction` |
-| `Coincidence` | `stage5` | decoded coincidence ready for pose fit |
-| `DecodeReport` | `stage5` | per-cluster decode outcome (`accepted`, `reason`, …); `GATE_ORDER` is the rejection-funnel order |
-| `PoseResult` | `stage5` | full fit bundle (params, cov, diagnostics) |
+| `Quality` | `timing` | GOOD / DEGRADED / UNTRUSTED |
+| `TimedEvent` | `timing` | `(t_ns, evt_seq, quality)` |
+| `PosRef` | `timing` | `(file_idx, row_offset, split_rows)` |
+| `Hit` | `reconstruction` | `(x_mm, y_mm, sigma_x, sigma_y, quality, candidates_x, candidates_y)`; `quality` ∈ `golden`/`cluster`/`unresolved`/`invalid`; `candidates_*` carry per-axis hypotheses on `unresolved` hits, retained for diagnostics only |
+| `PlaneCandidate` | `reconstruction` | one enumerated `(x_mm, y_mm, sigma_x, sigma_y, quality)` candidate for a plane |
+| `PlaneCorrection` | `alignment` | `(delta_x, delta_y, rotation_z, delta_z, tilt_x, tilt_y)` |
+| `AlignmentCorrection` | `alignment` | list of `PlaneCorrection` + `needs_correction` |
+| `Coincidence` | `pose` | decoded coincidence ready for pose fit |
+| `DecodeReport` | `pose` | per-cluster decode outcome (`accepted`, `reason`, `cand_counts`, `chi2`, `prb_quality`, `tel_quality`); `GATE_ORDER` is the rejection-funnel order |
+| `PoseResult` | `pose` | full fit bundle (params, cov, diagnostics) |
 
 
 ## 10. Open items and assumptions to verify
@@ -913,24 +909,63 @@ Key types:
 The following items are reasonable defaults but should be confirmed against
 real data on first inspection:
 
-- **First-PPS handling.** Whether the very first record in `*_GPS.bin` is
-  always a PPS, and whether the header's UTC₀ corresponds to acquisition
-  start, to the first PPS, or to something else. The pipeline currently
-  assumes UTC₀ corresponds to a PPS edge near the start of the run, and
-  that the first PPS record's tick value matches it.
-- **Cross-file PPS continuity.** That the PPS chain continues smoothly
-  across `*_GPS.bin` boundaries with no synthetic gap inserted by the DAQ.
-- **Cross-file 16-row block continuity.** That a 16-row block of position
-  data may occasionally be split between two `*.bin` files; the pipeline
-  detects and stitches such cases (§4.4), but the DAQ behaviour on file
-  rotation should be confirmed.
-- **GEN behaviour at acquisition start.** Whether GEN starts at 0 or at an
-  arbitrary value at run start. The pipeline does not depend on GEN's
-  absolute starting value (only its monotonicity), but it does assume the
-  GEN agreement check in §6.2 is meaningful from the first event onward.
-- **Probe channel count.** Whether this is recorded in the header or
-  determined by inspection of which bits ever fire. §6.5 needs this for
-  the channel → coordinate mapping.
+- **First-PPS handling.** *Checked against `data/0_testLab_20210723`.* The
+  first record in `*_GPS.bin` is **not** a PPS — it is an event record. Both
+  detectors open with several event records before the first PPS (telescope:
+  first PPS after 7 events, at GEN 8; probe: after 28, at GEN 29), so every
+  run begins with a block of pre-PPS_1 events. These are back-extrapolated and
+  tagged `Quality.DEGRADED` (§4.3), so the "first record is a PPS" assumption
+  is not required and not relied on. The full-run `Quality` tally corroborates
+  this (telescope 35 / probe 46 `DEGRADED` events out of 1.46 M / 1.31 M — the
+  pre-PPS_1 back-extrapolated head plus the post-last-PPS forward-extrapolated
+  tail). The pipeline still anchors UTC₀ to the first PPS edge; that produces
+  internally consistent timestamps and coincidences on this run, but the
+  absolute UTC ↔ first-PPS correspondence has not been independently
+  cross-checked against the GPS string.
+- **Cross-file PPS continuity.** *Confirmed against `data/0_testLab_20210723`.*
+  The PPS chain continues smoothly across `*_GPS.bin` boundaries with no
+  synthetic gap: at the first file boundary the last PPS of file k and the
+  first PPS of file k+1 are Δtick = 99 997 462 apart = 1.0000 s (residual
+  2.5×10⁻⁵, within τ = 10⁻⁴). The ~25 ppm shortfall below the nominal 10⁸
+  ticks/s is the local-oscillator offset that §4.2's `f_local` (not `f₀`) is
+  designed to absorb. The full run confirms this end to end: **0 `UNTRUSTED`
+  events** on either detector (1.46 M telescope / 1.31 M probe), i.e. every PPS
+  interval across all 148 files — including every file boundary — passed the
+  `res ≤ τ` acceptance.
+- **Cross-file 16-row block continuity.** *Checked against
+  `data/0_testLab_20210723` — assumption only partly holds.* Every `*.bin`
+  row count (all 148 files, both detectors) is an exact multiple of 16, so a
+  file is never truncated mid-block, and no boundary shares a GEN between the
+  last row of file k and the first row of file k+1. **But** the `.bin` and
+  `*_GPS.bin` streams are not always block-aligned per file: a file's `rows/16`
+  occasionally differs from its `*_GPS.bin` event count — **4 of 148**
+  telescope files and **16 of 148** probe files, by ±1 or ±2 blocks. The
+  offsets occur in **compensating consecutive pairs** (a `+1` file immediately
+  followed by a `−1` file; net 0 per detector), i.e. at a file rotation a whole
+  16-row block lands in the `.bin` of the adjacent file relative to where its
+  GPS event record was written. Because the misalignment is whole blocks (not a
+  partial mid-block split), §4.4's `split_rows` stitch never fires here — it is
+  a no-op when `rows % 16 == 0`. The pipeline instead detects the count
+  mismatch (`reconstruct.py` logs "N GPS events but M position blocks") and
+  continues; the affected handful of events (~0.001 %) are absorbed by the
+  downstream quality/χ² cuts. The clean "split block with shared GEN, stitched
+  via `split_rows`" case §4.4 describes is therefore **not** what this DAQ
+  produces and remains unexercised.
+- **GEN behaviour at acquisition start.** *Confirmed against
+  `data/0_testLab_20210723`.* GEN starts at **1** (the first event record has
+  GEN = 1) for both telescope and probe — not 0, and not an arbitrary value.
+  The pipeline depends only on GEN's monotonicity and the §6.2 agreement
+  check, both of which hold from the first event; the run completes with no
+  GEN-mismatch halt.
+- **Probe channel count.** *Resolved against `data/0_testLab_20210723`.* It is
+  **not** in the header (the probe header carries only module and `[GPS]`
+  sections, no channel count). It is determined by inspection of which bits
+  ever fire: across all probe position files the highest bit set is ribbon
+  bit 3 and fiber bit 9 on both axes, so the maximum channel is
+  10·3 + 9 = 39 → **40 channels per axis** (a 40 × 40 cm probe, `n_cols = 1`).
+  Per the "Probe active area inference" item below, this max-channel scan over
+  the full run is exactly how §6.5's channel → coordinate mapping should size
+  the probe.
 - **Saturation interpretation.** The `_is_valid` filter treats any 10-bit
   half equal to 1023 as invalid (saturated). Whether a partially-saturated
   event is recoverable by trusting the unsaturated half is left as future
@@ -957,10 +992,14 @@ real data on first inspection:
   individual-plane offsets, needs external survey data or a 4-plane geometry.
   The 2 cm physical thickness of each plane (two perpendicular scintillator
   layers) also introduces a z-ambiguity that is not separately modelled.
-- **Diagnostic plots.** No visualisation is currently produced.  Before first
-  real-data validation, implement residual histograms (stage 4), the χ²(θ)
-  curve (stage 5), and the alignment drift log.  These are the primary
-  human-readable outputs for deciding whether to trust the fitted parameters.
+- **Diagnostic plots.** A 3D pose plot is produced (`run_pipeline.py --plot`
+  → `pose_3d.html`) showing the telescope planes, the fitted probe plane, and
+  both the inlier and the LM-polish-removed (Mahalanobis-cut) outlier tracks,
+  styled distinctly (§8.7).  Still to implement before first real-data
+  validation: residual histograms (stage 4), a plotted χ²(θ) curve (stage 5;
+  the curve is already computed and stored in `PoseResult.chi2_curve`), and
+  the alignment drift log (§7.6).  These are the primary human-readable
+  outputs for deciding whether to trust the fitted parameters.
 - **Alignment curvature degeneracy.** `fit_telescope_alignment` uses the
   two-plane predictor (§7.3b).  For z = [0, 400, 800] mm the interpolation
   fractions are t₀ = −1, t₁ = 0.5, t₂ = 2, so the residuals satisfy
@@ -1025,14 +1064,19 @@ real data on first inspection:
      moderate fold signatures (0.71–0.86), so the fiber half of the probe
      is also likely folded.
 
-  4. *Current decoder impact.*  `BinDecoder._reconstruct_coord` treats the
-     two non-adjacent fold-pair bits as irreconcilable clusters and returns
-     `unresolved`.  This is the dominant cause of the ~83 % unresolved
-     rate in telescope coincident hits; the fold-pair decoder (§11 task 3.4)
-     addresses this directly by recognising (k, 9−k) patterns and remapping
-     to a single position before clustering.
+  4. *Current decoder impact.*  `BinDecoder._reconstruct_coord` treats two
+     non-adjacent bit-clusters per half as irreconcilable and returns
+     `unresolved`, which accounts for the high (~83 %) unresolved rate in
+     telescope coincident hits.  The fold-symmetry tables above are raw
+     measurements and stand on their own; their *causal* interpretation,
+     however, is secondary.  The primary driver of the multi-candidate
+     patterns is a **too-low acquisition threshold** that lets extra adjacent
+     strips fire — §8.2 now treats the threshold as the primary ambiguity
+     source and resolves the resulting candidates geometrically, via the
+     combinatorial line-fit χ² search, rather than by recognising a specific
+     (k, 9−k) fold pattern in the decoder.
 
-  5. *Synthetic test coverage.*  `monrad.synth.generate()`'s `fold=True` /
+  5. *Synthetic test coverage.*  `monrad.synthetic.generate()`'s `fold=True` /
      `fold_planes` path defaults to an idealised, perfectly periodic fold
      pattern (every mirror pair co-fires, no cross-talk) for backward
      compatibility with the existing fold-recovery tests.  Two additional
@@ -1110,7 +1154,7 @@ test guards the pipeline as a regression suite.
 
 **Implementation status.** All three requirements above are implemented:
 
-- `monrad.synth.generate()` produces the synthetic dataset described in
+- `monrad.synthetic.generate()` produces the synthetic dataset described in
   step 1.
 - `tests/test_pipeline_stream.py` runs the complete two-pass streaming
   pipeline and asserts that recovered parameters lie within 3σ of ground

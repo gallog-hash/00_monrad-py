@@ -19,15 +19,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from monrad.stage1 import (  # noqa: E402
+from monrad.timing import (  # noqa: E402
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream  # noqa: E402
-from monrad.stage3 import decode_position  # noqa: E402
-from monrad.stage4 import AlignmentAccumulator  # noqa: E402
-from monrad.stage5 import GATE_ORDER, DecodeReport, PoseFitter  # noqa: E402
+from monrad.coincidence import coincidence_stream  # noqa: E402
+from monrad.reconstruction import decode_position  # noqa: E402
+from monrad.alignment import AlignmentAccumulator  # noqa: E402
+from monrad.pose import GATE_ORDER, DecodeReport, PoseFitter  # noqa: E402
 
 Z_TEL = np.array([0.0, -1340.0, -670.0])
 TEL_DIR = Path("data/0_testLab_20210723/Base")

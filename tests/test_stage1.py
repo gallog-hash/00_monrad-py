@@ -1,7 +1,7 @@
 """
 Tests for stage 1 — per-detector time reconstruction.
 
-Run against the synthetic dataset produced by monrad.synth.generate().
+Run against the synthetic dataset produced by monrad.synthetic.generate().
 All events use an ideal 100 MHz clock with no drift, so every tick maps
 to an exact integer nanosecond count and all events should be GOOD.
 """
@@ -10,15 +10,14 @@ import struct
 import pytest
 from datetime import datetime
 
-from monrad.stage1 import (
+from monrad.timing import (
     Quality,
     _utc_to_ns,
     load_header_params,
     find_file_pairs,
-    reconstruct,
     reconstruct_stream,
 )
-from monrad.synth import generate, F0
+from monrad.synthetic import generate, F0
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
 _N_TRACKS = 1000
@@ -45,32 +44,40 @@ def synth(tmp_path_factory):
     return result, out
 
 
-# ── batch fixtures (deprecated reconstruct()) ─────────────────────
+# ── batch fixtures (materialised from reconstruct_stream()) ───────
+
+
+def _materialise(gps, pos, utc0, f0):
+    """Drain reconstruct_stream() into (events, pos_map) for the batch tests."""
+    events = []
+    pos_map = {}
+    for ev, ref in reconstruct_stream(gps, pos, utc0, f0):
+        events.append(ev)
+        pos_map[ev.evt_seq] = ref
+    return events, pos_map
 
 
 @pytest.fixture(scope="module")
 def tel_batch(synth):
-    """Run stage 1 (batch) on the telescope detector."""
-    result, out = synth
+    """Run stage 1 on the telescope detector, materialised to lists."""
+    _result, out = synth
     tel_dir = out / "telescope"
     header = next(tel_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(tel_dir)
-    with pytest.warns(DeprecationWarning):
-        events, pos_map = reconstruct(gps, pos, utc0, f0)
+    events, pos_map = _materialise(gps, pos, utc0, f0)
     return events, pos_map, utc0, f0
 
 
 @pytest.fixture(scope="module")
 def prb_batch(synth):
-    """Run stage 1 (batch) on the probe detector."""
-    result, out = synth
+    """Run stage 1 on the probe detector, materialised to lists."""
+    _result, out = synth
     prb_dir = out / "probe"
     header = next(prb_dir.glob("*_header.txt"))
     utc0, f0 = load_header_params(header)
     gps, pos = find_file_pairs(prb_dir)
-    with pytest.warns(DeprecationWarning):
-        events, pos_map = reconstruct(gps, pos, utc0, f0)
+    events, pos_map = _materialise(gps, pos, utc0, f0)
     return events, pos_map
 
 

@@ -49,17 +49,28 @@ Astral's recommended usage.
 ### Source layout
 
 ```
-src/monrad/
+src/monrad/                 # each stage is a domain package; its public API is
+                            # re-exported from the package __init__.py
     decoders/        # low-level format readers
         header.py    # parse_header() + decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder  — reads *.bin, reconstructs hits
-    synth.py         # generate() — synthetic test-data generator
-    stage1.py        # reconstruct_stream(), load_header_params(), find_file_pairs()
-    stage2.py        # coincidence_stream()
-    stage3.py        # Hit, decode_position(), reconstruct_plane_candidates()
-    stage4.py        # AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
-    stage5.py        # PoseFitter, PoseResult, fit_probe_pose()
+    timing/          # stage 1: reconstruct_stream(), load_header_params(), find_file_pairs()
+        reconstruct.py
+    coincidence/     # stage 2: coincidence_stream()
+        search.py
+    reconstruction/  # stage 3: Hit, decode_position(), reconstruct_plane_candidates()
+        hit.py        #   Hit, decode_position() + OR/centroid helpers
+        candidates.py #   PlaneCandidate, reconstruct_plane_candidates()
+    alignment/       # stage 4: AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
+        accumulator.py
+    pose/            # stage 5: PoseFitter, PoseResult, Coincidence, fit_probe_pose()
+        types.py      #   Coincidence, PoseResult, DecodeReport, GATE_ORDER
+        optimize.py   #   fit_probe_pose() four-step optimizer + residual helpers
+        fitter.py     #   PoseFitter streaming accumulator + _decode_cluster
+    synthetic/       # generate() — synthetic test-data generator
+        generate.py
+    monitor/         # probe-position monitoring drivers (resolution, timeseries, multiprobe)
 ```
 
 ### The five pipeline stages
@@ -68,7 +79,7 @@ src/monrad/
 |---|---|---|
 | 1 — time reconstruction | `*_GPS.bin` + header per detector | `Iterator[(TimedEvent, PosRef)]` |
 | 2 — coincidence search | n+1 `reconstruct_stream()` iterators | `Iterator[list[(det_id, TimedEvent, PosRef)]]` |
-| 3 — position decoding | `PosRef` + `*.bin` paths | `list[Hit | None]` (one per plane) |
+| 3 — position decoding | `PosRef` + `*.bin` paths | `list[Hit]` (one per plane) |
 | 4 — telescope alignment | all telescope events | per-plane offsets/rotations (parallel to stages 2–3) |
 | 5 — probe pose fit | coincidence events + `AlignmentCorrection` | `PoseResult`: `(t_x, t_y, θ, z_p)` + covariance |
 
@@ -92,7 +103,7 @@ buffer `tee` would need.
 Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 (stages 1–5 end-to-end with a 512 MB memory bound):
 `tests/test_pipeline_stream.py`. All tests use synthetic data from
-`monrad.synth.generate()`; no real detector files are required.
+`monrad.synthetic.generate()`; no real detector files are required.
 
 ### Key invariants to preserve
 

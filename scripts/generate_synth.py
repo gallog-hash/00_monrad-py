@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from monrad.synth import generate  # noqa: E402
+from monrad.synthetic import generate  # noqa: E402
 
 OUT = ROOT / "tests" / "data" / "synth"
 

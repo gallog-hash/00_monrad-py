@@ -2,9 +2,8 @@
 
 A plane decodes as 'unresolved' if either the x OR the y axis fails
 (stage3.decode_position).  When only one axis fails, the other axis was
-cleanly resolved but its coordinate is currently discarded, so the plane
-cannot be recovered by disambiguate_telescope_hits (the recovery path needs
-both axes re-derived from candidate lists).
+cleanly resolved; this script quantifies how often that single-axis failure
+mode occurs (the axis that did resolve is retained in Hit.candidates_x/y).
 
 This script classifies, over the real coincidence telescope events, every
 'unresolved' plane as:
@@ -27,13 +26,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from monrad.stage1 import (  # noqa: E402
+from monrad.timing import (  # noqa: E402
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
 )
-from monrad.stage2 import coincidence_stream  # noqa: E402
-from monrad.stage3 import decode_position  # noqa: E402
+from monrad.coincidence import coincidence_stream  # noqa: E402
+from monrad.reconstruction import decode_position  # noqa: E402
 
 TEL_DIR = Path("data/0_testLab_20210723/Base")
 PRB_DIR = Path("data/0_testLab_20210723/Probe_0")
@@ -131,8 +130,9 @@ def main() -> None:
     print(f"  - bad plane single-axis (recoverable by extension): {one_bad_single}")
     print(f"  - bad plane both-axis  (needs full re-derivation)  : {one_bad_both}")
     print(
-        "\n  (single-axis ones are the additional pool the extension targets, on top\n"
-        "   of the both-axis ones the current disambiguation already attempts.)"
+        "\n  (single-axis ones are the pool a per-axis recovery extension would\n"
+        "   target; both-axis ones need a full re-derivation. Stage 5's\n"
+        "   combinatorial χ² search currently resolves both globally.)"
     )
 
 
