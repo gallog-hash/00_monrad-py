@@ -24,6 +24,14 @@ def test_n_required_inverts_sigma_eff():
     assert math.isnan(R.n_required(float("nan"), 0.3))
 
 
+def test_resolve_n_tracks():
+    assert R._resolve_n_tracks(60000, 3) == [60000, 60000, 60000]
+    assert R._resolve_n_tracks([60000], 3) == [60000, 60000, 60000]
+    assert R._resolve_n_tracks([1, 2, 3], 3) == [1, 2, 3]
+    with pytest.raises(ValueError):
+        R._resolve_n_tracks([1, 2], 3)
+
+
 def test_pose_offset_roundtrip():
     """_pose_for_offset and _probe_center are inverses; offset lands on +x."""
     theta = 0.29671

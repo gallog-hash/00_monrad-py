@@ -762,13 +762,27 @@ def write_plots(
 # ── Driver ───────────────────────────────────────────────────────────────────
 
 
+def _resolve_n_tracks(n_tracks: int | list[int], n_z: int) -> list[int]:
+    """Broadcast a scalar track count, or validate a per-z_p list of length n_z."""
+    if isinstance(n_tracks, int):
+        return [n_tracks] * n_z
+    if len(n_tracks) == 1:
+        return list(n_tracks) * n_z
+    if len(n_tracks) == n_z:
+        return list(n_tracks)
+    raise ValueError(
+        f"n_tracks must be a single value or match the number of z_p values "
+        f"({n_z}); got {len(n_tracks)}"
+    )
+
+
 def run_resolution_study(
     out_dir: Path,
     *,
     z_p_grid: list[float],
     n_grid: list[int],
     n_repeats: int,
-    n_tracks: int,
+    n_tracks: int | list[int],
     seed: int,
     offset_grid: list[float] | None = None,
     targets: tuple[float, ...] = DEFAULT_TARGETS,
@@ -778,9 +792,16 @@ def run_resolution_study(
     tot_weights: bool = False,
     make_plots: bool = True,
 ) -> list[GeomResult]:
-    """Run the full σ(N, z_p, offset) sweep and write CSVs + plots to out_dir."""
+    """Run the full σ(N, z_p, offset) sweep and write CSVs + plots to out_dir.
+
+    ``n_tracks`` is either a single count applied to every z_p, or a list with
+    one count per z_p (far planes are coincidence-starved and need many more
+    tracks to fill the larger-N cells, so a single sweep can spend tracks where
+    they matter without rerunning the cheap near-plane geometries).
+    """
     if offset_grid is None:
         offset_grid = [0.0]
+    n_tracks_per_z = _resolve_n_tracks(n_tracks, len(z_p_grid))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     z_tel = np.array(Z_TEL)
@@ -792,11 +813,12 @@ def run_resolution_study(
     results: list[GeomResult] = []
     with tempfile.TemporaryDirectory() as tmp:
         k = 0
-        for z_p in z_p_grid:
+        for i, z_p in enumerate(z_p_grid):
+            nt = n_tracks_per_z[i]
             for offset in offset_grid:
                 print(
                     f"z_p = {z_p:g} mm  offset = {offset:g} mm  "
-                    f"(generating {n_tracks} tracks)…"
+                    f"(generating {nt} tracks)…"
                 )
                 work = Path(tmp) / f"g_{k}"
                 g = sweep_one_geometry(
@@ -805,7 +827,7 @@ def run_resolution_study(
                     offset=offset,
                     n_grid=n_grid,
                     n_repeats=n_repeats,
-                    n_tracks=n_tracks,
+                    n_tracks=nt,
                     seed=seed + k,
                     theta=theta,
                     n_probe_ch=n_probe_ch,
@@ -905,11 +927,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--n-tracks",
+        nargs="+",
         type=int,
-        default=60000,
-        help="Synthetic tracks generated per geometry (default: 60000). Must be "
-        "large enough that decoded coincidences exceed max(--n), especially at "
-        "large z_p / offset.",
+        default=[60000],
+        metavar="N",
+        help="Synthetic tracks generated per geometry (default: 60000). Either one "
+        "value for every z_p, or one value per --z entry — far planes are "
+        "coincidence-starved and need many more tracks to fill the larger-N cells, "
+        "so e.g. '--z 0 300 1000 3000 5000 --n-tracks 60000 60000 60000 300000 "
+        "600000' spends tracks only where they matter, in a single run.",
     )
     p.add_argument(
         "--targets",
@@ -942,7 +968,7 @@ def main(argv: list[str] | None = None) -> None:
         offset_grid=args.offset,
         n_grid=args.n,
         n_repeats=args.repeats,
-        n_tracks=args.n_tracks,
+        n_tracks=args.n_tracks,  # list[int]: one value, or one per --z entry
         seed=args.seed,
         targets=tuple(args.targets),
         make_plots=not args.no_plots,
