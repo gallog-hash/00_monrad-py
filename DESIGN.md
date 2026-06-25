@@ -817,6 +817,33 @@ degenerate with `(t_x, t_y)` at large distances; at 5 m, expect σ on `z_p` of
 tens of cm. If a tape-measure value is available externally it should be
 compared against the fit as a sanity check.
 
+**Geometry-independent form.** The `3 mrad` above is `σ_strip·√(2/3)/L_tel` with
+the telescope depth `L_tel = 800 mm`, so it scales as `1/L_tel`. Writing the
+probe distance as the dimensionless `ρ = z_p/L_tel` removes that dependence:
+
+```
+σ_eff / σ_strip = √(1 + C_ρ · ρ²),   C_ρ = (σ_strip·√(2/3)/L_tel · L_tel/σ_strip)² = 2/3
+```
+
+is the same curve for any plane spacing, and `N_required = (σ_eff/target)²`
+becomes a function of `ρ` alone (for a fixed strip pitch and target). A result
+measured on the 800 mm testlab telescope therefore transfers to another
+telescope by reading it at the same `z_p/L_tel`. The natural lateral coordinate
+is likewise the **normalized polar angle** `η = α/α_max = (r/z_p)·(L_tel/active)`,
+the probe's off-axis angle as a fraction of the telescope's footprint-limited
+slope acceptance `α_max ≈ active/L_tel`; polar angle alone is *not* geometry-
+independent — it must be normalized by `α_max`. `monrad-resolution` reports both
+absolute mm and these `(ρ, η)` coordinates (`sigma_eff_vs_rho.png`).
+
+**Azimuthal dependence.** For a probe offset by magnitude `r` from the axis, the
+lab-frame resolution `(σ_x, σ_y)` is nearly independent of the offset *direction*
+(azimuth `φ`): only `r` matters. The `σ_x ≠ σ_y` anisotropy is set by the fixed
+probe mounting rotation `θ`, not by `φ`. The square telescope's 4-fold symmetry
+means only one azimuth quadrant `φ ∈ [0, π/2]` need be swept (the probe's fixed
+`θ` breaks the `x↔y` diagonal reflection, so it is a quadrant, not an octant);
+the footprint's `√2×` longer diagonal reach extends the maximum usable offset
+(acceptance), not the per-`N` resolution.
+
 ### 8.7 Output and diagnostics
 
 The fitter returns a bundle, **not just four numbers**:

@@ -1,11 +1,12 @@
 """Tests for monrad.monitor.resolution (monitoring Step 1).
 
-Runs a small synthetic σ(N, z_p, offset) sweep and checks the headline
+Runs a small synthetic σ(N, z_p, r, φ) cylindrical sweep and checks the headline
 behaviours: σ falls like 1/√N, σ_eff grows with z_p, the covariance pull is
-~unit, the reconstructed probe centre matches truth, and the CSV + diagnostic
-plots (σ-vs-N, σ-vs-offset, σ_eff-vs-z_p, N_required, pull, reconstructed-vs-
-truth map, and the per-z_p χ²(θ) and residual histograms folded in from
-DESIGN.md §10) are written.
+~unit, the reconstructed probe centre matches truth, the azimuthal x↔y symmetry
+holds (quadrant reduction), the geometry-normalized ρ/η helpers behave, and the
+CSV + diagnostic plots (σ-vs-N, σ-vs-offset, σ-vs-azimuth, σ_eff-vs-z_p,
+σ_eff-vs-ρ, N_required, pull, reconstructed-vs-truth map, and the per-z_p χ²(θ)
+and residual histograms folded in from DESIGN.md §10) are written.
 """
 
 import csv
@@ -33,13 +34,27 @@ def test_resolve_n_tracks():
 
 
 def test_pose_offset_roundtrip():
-    """_pose_for_offset and _probe_center are inverses; offset lands on +x."""
+    """_pose_for_offset and _probe_center are inverses; (r, φ) lands as expected."""
     theta = 0.29671
-    for offset in (0.0, 150.0, 300.0):
-        t_x, t_y = R._pose_for_offset(offset, theta, n_probe_ch=30)
-        cx, cy = R._probe_center(t_x, t_y, theta, n_probe_ch=30)
-        assert cx == pytest.approx(R.TEL_CENTER_MM + offset)
-        assert cy == pytest.approx(R.TEL_CENTER_MM)
+    for phi in (0.0, math.pi / 4, math.pi / 2):
+        for r in (0.0, 150.0, 300.0):
+            t_x, t_y = R._pose_for_offset(r, phi, theta, n_probe_ch=30)
+            cx, cy = R._probe_center(t_x, t_y, theta, n_probe_ch=30)
+            assert cx == pytest.approx(R.TEL_CENTER_MM + r * math.cos(phi))
+            assert cy == pytest.approx(R.TEL_CENTER_MM + r * math.sin(phi))
+
+
+def test_rho_eta_helpers():
+    """ρ = z_p/L_tel and η = α/α_max are the geometry-normalized coordinates."""
+    assert R.rho(R.L_TEL) == pytest.approx(1.0)
+    assert R.rho(2 * R.L_TEL) == pytest.approx(2.0)
+    assert R.eta(0.0, 1000.0) == 0.0
+    assert R.eta(150.0, 0.0) == 0.0  # z_p ≤ 0 guard
+    # η monotonically increases with offset magnitude at fixed z_p
+    assert R.eta(300.0, 1000.0) > R.eta(150.0, 1000.0) > 0.0
+    # master curve: σ_eff/σ_strip = √(1 + C_ρ·ρ²), unit at ρ=0
+    assert R.design_sigma_eff_ratio(0.0) == pytest.approx(1.0)
+    assert R.design_sigma_eff_ratio(1.0) > 1.0
 
 
 # ── Full sweep ───────────────────────────────────────────────────────────────
@@ -52,6 +67,7 @@ def sweep(tmp_path_factory):
         out,
         z_p_grid=[300.0, 1000.0],
         offset_grid=[0.0, 150.0],
+        phi_grid=[0.0, math.pi / 2],
         n_grid=[30, 100],
         n_repeats=8,
         n_tracks=8000,
@@ -79,11 +95,19 @@ def test_csv_outputs_written(sweep):
     assert len(rows) > 0
     assert {r["axis"] for r in rows} == {"x", "y", "z"}
     assert {float(r["offset"]) for r in rows} == {0.0, 150.0}
+    # azimuth quadrant: on-axis (φ=0) plus the two off-axis directions 0°, 90°
+    assert {float(r["phi_deg"]) for r in rows} == {0.0, 90.0}
     # simulated + reconstructed position columns are present and populated
     for col in ("cx_true", "cy_true", "cx_fit", "cy_fit"):
         assert all(r[col] for r in rows)
+    # geometry-normalized + radial/tangential columns are present and sane
     for r in rows:
         assert float(r["sigma_cov"]) > 0
+        assert float(r["sigma_cov_strip"]) == pytest.approx(
+            float(r["sigma_cov"]) / R.SIGMA_STRIP, rel=1e-4
+        )
+        assert float(r["sigma_rad"]) > 0 and float(r["sigma_tan"]) > 0
+        assert float(r["rho"]) == pytest.approx(float(r["z_p"]) / R.L_TEL, rel=1e-4)
 
     with open(nreq_csv) as fh:
         nrows = list(csv.DictReader(fh))
@@ -111,6 +135,37 @@ def test_sigma_eff_grows_with_distance(sweep):
     }
     for axis in ("x", "y"):
         assert seff[1000.0][axis] > seff[300.0][axis]
+
+
+def test_azimuth_isotropy(sweep):
+    """Lab-frame σ_x, σ_y are ~independent of the offset azimuth φ.
+
+    The square telescope's 4-fold symmetry means the *lab-frame* resolution does
+    not care which direction the probe is offset — only the magnitude r matters.
+    (The σ_x ≠ σ_y anisotropy is set by the fixed probe rotation θ, not by φ; the
+    radial/tangential split merely swaps which one aligns with the offset.)  This
+    azimuthal isotropy is what justifies sweeping only one quadrant φ ∈ [0, π/2].
+    """
+    _, results = sweep
+    for z in {g.z_p for g in results}:
+        for r in {g.offset for g in results if g.offset > 0}:
+            by_phi = {
+                g.phi: {c.n: c.sigma_cov for c in g.cells}
+                for g in results
+                if g.z_p == z and abs(g.offset - r) < 1e-9
+            }
+            if 0.0 not in by_phi or not any(
+                abs(p - math.pi / 2) < 1e-9 for p in by_phi
+            ):
+                continue
+            p90 = next(p for p in by_phi if abs(p - math.pi / 2) < 1e-9)
+            for n in by_phi[0.0]:
+                if n not in by_phi[p90]:
+                    continue
+                for axis in ("x", "y"):
+                    assert by_phi[0.0][n][axis] == pytest.approx(
+                        by_phi[p90][n][axis], rel=0.2
+                    )
 
 
 def test_reconstructed_center_matches_truth(sweep):
@@ -161,7 +216,9 @@ def test_diagnostic_plots_written(sweep):
     for name in (
         "sigma_vs_N.png",
         "sigma_vs_offset.png",
+        "sigma_vs_azimuth.png",
         "sigma_eff_vs_zp.png",
+        "sigma_eff_vs_rho.png",
         "n_required_vs_zp.png",
         "recon_vs_truth.png",
         "pull_hist.png",
