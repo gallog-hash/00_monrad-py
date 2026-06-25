@@ -61,7 +61,7 @@ src/monrad/                 # each stage is a domain package; its public API is
         search.py
     reconstruction/  # stage 3: Hit, decode_position(), reconstruct_plane_candidates()
         hit.py        #   Hit, decode_position() + OR/centroid helpers
-        candidates.py #   reconstruct_plane_candidates(), disambiguate_telescope_hits()
+        candidates.py #   PlaneCandidate, reconstruct_plane_candidates()
     alignment/       # stage 4: AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
         accumulator.py
     pose/            # stage 5: PoseFitter, PoseResult, Coincidence, fit_probe_pose()

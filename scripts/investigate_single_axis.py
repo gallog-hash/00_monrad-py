@@ -130,8 +130,9 @@ def main() -> None:
     print(f"  - bad plane single-axis (recoverable by extension): {one_bad_single}")
     print(f"  - bad plane both-axis  (needs full re-derivation)  : {one_bad_both}")
     print(
-        "\n  (single-axis ones are the additional pool the extension targets, on top\n"
-        "   of the both-axis ones the current disambiguation already attempts.)"
+        "\n  (single-axis ones are the pool a per-axis recovery extension would\n"
+        "   target; both-axis ones need a full re-derivation. Stage 5's\n"
+        "   combinatorial χ² search currently resolves both globally.)"
     )
 
 

@@ -38,6 +38,13 @@ pre-existing-`Hit | None` cleanup item.
 ### A2 — Gate the diagnostic subset replay behind `on_decode`
 `src/monrad/pose/fitter.py` `_decode_cluster`
 
+> **Superseded by `4f36f55`.** The subset/combo replay this section gated has
+> since been **deleted outright** (`disambiguate_telescope_hits`,
+> `SubsetViolation`, `subset_ok`/`subset_violations`, the `"combo"` quality
+> label). The gating optimization below is therefore moot — there is no longer a
+> replay to gate. Retained as a record of the Step 0b reasoning; do not treat the
+> machinery it describes as still present.
+
 After the combinatorial χ² search has already found the winning telescope
 triple, `_decode_cluster` was unconditionally **re-decoding all three telescope
 planes** (`decode_position(n_cols=3)`) and **re-running the two-plane
@@ -127,7 +134,8 @@ agnostic to. Revisit in **Step 3 (multi-probe)**, where probe-only clusters
 become common and the pre-filter pays off (plan candidate 5).
 
 ### D5 — `_decode_cluster` recovering `unresolved` telescope hits — **out of scope**
-Optional efficiency-branch idea (handoff candidate 6) to fold
-`disambiguate_telescope_hits` recovery into the accept path. The combinatorial
-search already resolves the mirror-fold globally, so this is a behaviour question
-for the efficiency track, not a 0b cleanup. Not pursued.
+Optional efficiency-branch idea (handoff candidate 6) to fold the old
+two-plane recovery (then `disambiguate_telescope_hits`, **deleted in
+`4f36f55`**) into the accept path. The combinatorial χ² search already resolves
+ambiguous planes globally, so this was a behaviour question for the efficiency
+track, not a 0b cleanup. Not pursued.
