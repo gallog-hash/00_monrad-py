@@ -748,14 +748,19 @@ fixed at the probe-only weight (no z_p dependence yet) and solve the linear
 problem for `(t_x, t_y, z_p)`. Record `χ²_min(θ)`.
 
 **Step 2 — diagnostic plot of χ²(θ).** Inspect the full landscape before
-trusting any number. For a square probe, four equally deep minima at
-multiples of 90° are expected; **unequal minima signal a wiring or axis
-problem and should halt the fit until investigated.** This step is the most
-important consistency check in this stage.
+trusting any number. Because the `(u, v)` channels are already decoded and
+held fixed during the scan, χ²(θ) has a **single sharp global minimum at the
+true mounting orientation** — the θ±90° hypotheses fit far worse, since the
+square-probe symmetry also requires an `(u, v) → (v, L−u)` channel relabeling
+the scan does not perform (this is the relabeling ambiguity of §8.5, *not* a
+degeneracy of this fit — see the note there). A global minimum away from the
+expected orientation, or competing wells of comparable depth, **signals a
+wiring or axis problem and should halt the fit until investigated.** This step
+is the most important consistency check in this stage; it is plotted per `z_p`
+by `monrad-resolution` (`chi2_theta_z*.png`, §10).
 
-**Step 3 — fine θ scan.** Pick the global minimum (or the one nearest a
-known nominal mounting orientation, when available, to break the 4-fold
-ambiguity). Refine over ±2° at 0.01° steps with the same linear solve.
+**Step 3 — fine θ scan.** Pick the global minimum. Refine over ±2° at 0.01°
+steps with the same linear solve.
 
 **Step 4 — joint Levenberg-Marquardt polish.** Seed from the fine-scan
 optimum and run LM on all four parameters simultaneously, updating
@@ -768,16 +773,25 @@ the low accidental rate assumed, one pass is enough.
 
 ### 8.5 The 4-fold rotation ambiguity
 
-A square probe with identical X and Y strip layouts is invariant under
-rotations of 90°, 180°, and 270° from the data alone — the four θ minima
-are mathematically equivalent fits. The pipeline either:
+A square probe with identical X and Y strip layouts is physically ambiguous
+under mountings rotated by 90°, 180°, or 270°: a 90° physical rotation maps the
+X strips onto the Y strips, so it is equivalent to **relabeling the decoded
+`(u, v)` channels** (`(u, v) → (v, L−u)`) together with `θ → θ+90°`. Crucially,
+this is an ambiguity in *interpreting the hardware*, not a degeneracy the
+optimizer exhibits: any single recorded dataset already fixes one labeling, so
+the §8.4 χ²(θ) scan — which holds `(u, v)` fixed — has a unique minimum (the
+θ±90° branches, lacking the channel relabel, fit far worse). The four
+solutions are the *same fitted θ* reinterpreted under the four equivalent
+channel labelings, not four competing minima. The pipeline either:
 
-- accepts the ambiguity and reports all four solutions, or
+- accepts the ambiguity and reports all four equivalent interpretations, or
 - breaks it externally — by knowing the nominal mounting orientation to
   ±45°, by using a marked corner on the probe, or by exploiting any X/Y
   asymmetry (e.g. unequal channel counts on the two axes).
 
-This is documented in the report; it is not an algorithmic failure.
+This is documented in the report; it is not an algorithmic failure. (Because
+the χ²(θ) fit is itself unambiguous, `monrad-resolution` scores fitted poses
+directly against synthetic ground truth with no branch disambiguation.)
 
 ### 8.6 Expected precision
 
@@ -995,11 +1009,14 @@ real data on first inspection:
 - **Diagnostic plots.** A 3D pose plot is produced (`run_pipeline.py --plot`
   → `pose_3d.html`) showing the telescope planes, the fitted probe plane, and
   both the inlier and the LM-polish-removed (Mahalanobis-cut) outlier tracks,
-  styled distinctly (§8.7).  Still to implement before first real-data
-  validation: residual histograms (stage 4), a plotted χ²(θ) curve (stage 5;
-  the curve is already computed and stored in `PoseResult.chi2_curve`), and
-  the alignment drift log (§7.6).  These are the primary human-readable
-  outputs for deciding whether to trust the fitted parameters.
+  styled distinctly (§8.7).  The `monrad-resolution` study (monitoring Step 1)
+  adds the **χ²(θ) consistency curve** (§8.4 step 2) and the **probe-plane x/y
+  residual histograms** (§8.7), one of each per `z_p` (`chi2_theta_z*.png`,
+  `residuals_z*.png`).  Still to implement before first real-data validation:
+  stage-4 telescope-residual histograms and the alignment drift log (§7.6,
+  a time-series concern belonging with monitoring Step 2).  These are the
+  primary human-readable outputs for deciding whether to trust the fitted
+  parameters.
 - **Alignment curvature degeneracy.** `fit_telescope_alignment` uses the
   two-plane predictor (§7.3b).  For z = [0, 400, 800] mm the interpolation
   fractions are t₀ = −1, t₁ = 0.5, t₂ = 2, so the residuals satisfy

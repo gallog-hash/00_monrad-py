@@ -89,20 +89,17 @@ import argparse
 import math
 import sys
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from monrad.timing import (
     Quality,
-    find_file_pairs,
-    load_header_params,
     reconstruct_stream,
 )
 from monrad.coincidence import coincidence_stream
-from monrad.reconstruction import decode_position
-from monrad.alignment import AlignmentAccumulator, AlignmentCorrection
+from monrad.alignment import AlignmentCorrection
+from monrad.monitor.io import DetectorFiles, fit_alignment, load_detector
 from monrad.pose import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
 
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
@@ -191,18 +188,16 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load_detector(
-    d: Path,
-    label: str,
-) -> tuple[datetime, int, list[Path], list[Path]]:
-    headers = list(d.glob("*_header*.txt"))
-    if not headers:
-        sys.exit(f"ERROR: no *_header.txt found in {d} ({label})")
-    utc0, f0 = load_header_params(headers[0])
-    gps_paths, pos_paths = find_file_pairs(d)
-    if not gps_paths:
-        sys.exit(f"ERROR: no matching *_GPS.bin / *.bin pairs found in {d} ({label})")
-    return utc0, f0, gps_paths, pos_paths
+def _load_detector(d: Path, label: str) -> DetectorFiles:
+    """Locate a detector's files, exiting with a clear message on failure.
+
+    Thin CLI wrapper over monitor.io.load_detector: the library helper raises
+    FileNotFoundError, which this turns into the script's sys.exit contract.
+    """
+    try:
+        return load_detector(d)
+    except FileNotFoundError as exc:
+        sys.exit(f"ERROR: {exc} ({label})")
 
 
 def _fmt_q(q: Counter) -> str:
@@ -427,19 +422,15 @@ def main() -> None:
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────
-    tel_utc0, tel_f0, tel_gps, tel_pos = _load_detector(tel_dir, "telescope")
-    prb_utc0, prb_f0, prb_gps, prb_pos = _load_detector(prb_dir, "probe")
+    tel = _load_detector(tel_dir, "telescope")
+    prb = _load_detector(prb_dir, "probe")
+    tel_utc0, tel_f0, tel_gps, tel_pos = tel
+    prb_utc0, prb_f0, prb_gps, prb_pos = prb
 
     # ── Pass 1a: telescope alignment (stage 4) + telescope event quality ─
-    accum = AlignmentAccumulator(z_tel=z_tel)
-    tel_q: Counter = Counter()
-    for ev, ref in reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0):
-        tel_q[ev.quality] += 1
-        hits = decode_position(
-            ref, tel_pos, n_cols=3, tot_thresh=tot_thresh, tot_weights=tot_weights
-        )
-        accum.add(hits)
-    alignment = accum.flush()
+    alignment, tel_q = fit_alignment(
+        tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
+    )
 
     # ── Pass 1b: probe event quality (stage 1 only) ──────────────────────
     prb_q: Counter = Counter()
