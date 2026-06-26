@@ -67,6 +67,8 @@ optimum.
 done once; the pose fit is then repeated over `n_repeats` random subsamples of size
 `N` drawn from the coincidence pool. We report the covariance-derived `σ` (mean over
 repeats), the empirical scatter, and the covariance **pull** `(fit − truth)/σ_cov`.
+All in-plane (`x`, `y`) covariances are quoted at the physical probe **centre**
+(see §4.5 for the propagation).
 
 ---
 
@@ -77,7 +79,7 @@ repeats), the empirical scatter, and the covariance **pull** `(fit − truth)/σ
 | `z_p` | probe–telescope stand-off distance (mm) |
 | `r`, `φ` | probe-centre lateral offset magnitude (mm) and azimuth from the telescope axis |
 | `N` | number of inlier coincidences in a single fit |
-| `σ_x, σ_y, σ_z` | 1σ covariance uncertainty on `t_x, t_y, z_p` |
+| `σ_x, σ_y, σ_z` | 1σ covariance uncertainty on the probe centre x, y and on `z_p` |
 | `σ_strip` | single-strip resolution, `10/√12 ≈ 2.887` mm |
 | `σ_eff` | single-coincidence resolution, from the fit `σ(N) = σ_eff/√N` |
 | `ρ = z_p/L_tel` | distance in telescope-depth units (`L_tel = 800` mm) |
@@ -121,19 +123,19 @@ a curve **independent of the telescope plane spacing**.
 
 | `ρ = z_p/L_tel` | `σ_eff/σ_strip` (x) | `σ_eff/σ_strip` (y) |
 |---|---|---|
-| 0.00 | 2.45 | 1.72 |
-| 0.38 | 2.13 | 1.53 |
-| 1.25 | 2.84 | 2.06 |
-| 3.75 | 8.44 | 6.12 |
+| 0.00 | 1.37 | 1.38 |
+| 0.38 | 1.19 | 1.20 |
+| 1.25 | 1.59 | 1.58 |
+| 3.75 | 4.80 | 4.82 |
 
 **Table 1.** The measured marginal `σ_eff` follows the `ρ`-dependence of the analytic
-curve but sits a factor `≈2` above its idealized floor (which is `1` at `ρ=0`). The
+curve and sits ≈20–40% above its idealized floor (which is `1` at `ρ=0`). The
 offset arises because the marginal in-plane uncertainty from the joint four-parameter
 fit carries the `t`↔`z_p`↔`θ` correlations that the single-coordinate model omits.
-The values are reported at the physical probe **centre** (§4.5); any residual
-`σ_x ≠ σ_y` spread is within the per-geometry Monte Carlo scatter, not an apparatus
-anisotropy. The structural point stands: because the physics depends on `z_p` only
-through `ρ`, the curve transfers across telescopes.
+The values are reported at the physical probe **centre** (§4.5); `σ_x ≈ σ_y` to
+within Monte Carlo scatter, confirming the resolution is orientation-independent.
+The structural point stands: because the physics depends on `z_p` only through `ρ`,
+the curve transfers across telescopes.
 
 ![sigma_eff vs zp](sigma_eff_vs_zp.png)
 
@@ -148,10 +150,10 @@ against a tape-measure stand-off.
 
 | `z_p` | `ρ` | `N` for `σ ≤ 1` mm | `N` for `σ ≤ 0.3` mm |
 |---|---|---|---|
-| 0 | 0.00 | 37 | 415 |
-| 300 mm | 0.38 | 29 | 320 |
-| 1 m | 1.25 | 51 | 568 |
-| 3 m | 3.75 | 453 | 5036 |
+| 0 | 0.00 | 16 | 175 |
+| 300 mm | 0.38 | 12 | 132 |
+| 1 m | 1.25 | 21 | 233 |
+| 3 m | 3.75 | 193 | 2146 |
 
 **Table 2.** `N_required` is a function of `ρ` (for a fixed strip pitch and target);
 to transfer to a telescope of depth `L_tel'`, read the table at the same `z_p/L_tel`.
@@ -178,12 +180,13 @@ the fixed probe rotation `θ` breaks the `x↔y` diagonal reflection).
 
 | `z_p` | `r` | `σ_rad(0°)` | `σ_rad(45°)` | `σ_rad(90°)` |
 |---|---|---|---|---|
-| 300 mm | 300 mm | 0.357 | 0.224 | 0.258 |
-| 1 m | 300 mm | 0.493 | 0.323 | 0.358 |
-| 3 m | 300 mm | 1.493 | 1.024 | 1.118 |
+| 300 mm | 300 mm | 0.199 | 0.200 | 0.199 |
+| 1 m | 300 mm | 0.300 | 0.297 | 0.295 |
+| 3 m | 300 mm | 0.958 | 0.949 | 0.954 |
 
-**Table 3.** Radial resolution (mm, `N=300`). The lower value at `φ=45°` is the minor
-axis of the error ellipse (see §4.5), not a directional sensitivity of the apparatus.
+**Table 3.** Radial resolution at the probe centre (mm, `N=300`). The three azimuth
+values agree to within ≤1%, confirming that the resolution is truly independent of
+the offset direction.
 
 ### 4.5 Orientation dependence and centre-referenced resolution
 
@@ -290,8 +293,8 @@ Three results have direct experimental consequences:
 The probe position is reconstructed without bias and with well-calibrated
 uncertainties. The in-plane resolution improves as `1/√N` with a single-coincidence
 scale `σ_eff` that, in telescope-depth units, follows a geometry-independent curve
-`σ_eff/σ_strip = √(1 + ⅔ρ²)`; a sub-mm fix requires `O(10²–10³)` coincidences from
-near-contact out to ~1 m and `O(10³–10⁴)` at 3 m. The resolution is azimuthally
+`σ_eff/σ_strip = √(1 + ⅔ρ²)`; a sub-mm fix requires `O(10²)` coincidences from
+near-contact out to ~1 m and `O(10³)` at 3 m. The resolution is azimuthally
 isotropic, and the centre-referenced resolution is independent of the probe mounting
 orientation.
 
