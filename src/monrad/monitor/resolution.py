@@ -128,6 +128,28 @@ def _probe_center(
     return t_x + half * (c - s), t_y + half * (s + c)
 
 
+def _centre_cov_2x2(cov: np.ndarray, theta: float, n_probe_ch: int) -> np.ndarray:
+    """Propagate the 4×4 pose covariance to the 2×2 probe-centre covariance.
+
+    The probe corner sits at ``(t_x, t_y)``; the centre at
+    ``(t_x + half(cosθ − sinθ), t_y + half(sinθ + cosθ))``.  The Jacobian
+    ``J = d(cx,cy)/d(t_x,t_y,θ,z_p)`` has the leading 2×2 block equal to
+    the identity and the θ column equal to the lever-arm derivatives; the
+    z_p column is zero.
+
+    Returns a 2×2 array: ``[0,0]`` = σ²_cx, ``[1,1]`` = σ²_cy.
+    """
+    half = n_probe_ch * STRIP_MM / 2.0
+    c, s = math.cos(theta), math.sin(theta)
+    J = np.array(
+        [
+            [1.0, 0.0, -half * (s + c), 0.0],
+            [0.0, 1.0, half * (c - s), 0.0],
+        ]
+    )
+    return J @ cov @ J.T
+
+
 # ── Coincidence decoding (the expensive part — done once per geometry) ───────
 
 
@@ -247,6 +269,7 @@ def _fit_subsample(
     alignment: AlignmentCorrection,
     truth: tuple[float, float, float, float],
     phi: float,
+    n_probe_ch: int,
 ) -> tuple[
     dict[str, tuple[float, float, float]],
     tuple[float, float, float],
@@ -257,31 +280,49 @@ def _fit_subsample(
     Returns ``(per_axis, pose, radtan)`` where ``per_axis[a] = (error,
     sigma_cov, corr_with_zp)``, ``pose = (t_x_fit, t_y_fit, theta_fit)`` and
     ``radtan = (sigma_rad, sigma_tan)`` — the in-plane cov-σ resolved along and
-    perpendicular to the offset azimuth ``phi``.  The probe pose is unambiguous
-    in θ (see the module docstring), so the fitted parameters are scored
-    directly against ground truth.
+    perpendicular to the offset azimuth ``phi``.
+
+    For the x and y axes the statistics are reported at the physical **probe
+    centre**, not the corner (pose parameter origin).  The centre covariance is
+    propagated from the fitted 4×4 pose covariance via :func:`_centre_cov_2x2`.
+    The z_p axis is unchanged.  The probe pose is unambiguous in θ (see the
+    module docstring), so the fitted parameters are scored directly against
+    ground truth.
     """
     pose = fit_probe_pose(sub, z_corr, alignment)
-    t_x, t_y, _theta, z_p = truth
+    t_x_true, t_y_true, theta_true, z_p_true = truth
     cov = pose.cov
-    err = {"x": pose.t_x - t_x, "y": pose.t_y - t_y, "z": pose.z_p - z_p}
-    sig = {
-        "x": math.sqrt(abs(cov[0, 0])),
-        "y": math.sqrt(abs(cov[1, 1])),
-        "z": math.sqrt(abs(cov[3, 3])),
-    }
-    sz = sig["z"]
+
+    # Centre-referenced x/y: propagate corner→centre through the lever-arm Jacobian.
+    cov_c = _centre_cov_2x2(cov, pose.theta, n_probe_ch)
+    cx_fit, cy_fit = _probe_center(pose.t_x, pose.t_y, pose.theta, n_probe_ch)
+    cx_true, cy_true = _probe_center(t_x_true, t_y_true, theta_true, n_probe_ch)
+
+    sig_cx = math.sqrt(abs(cov_c[0, 0]))
+    sig_cy = math.sqrt(abs(cov_c[1, 1]))
+    sig_z = math.sqrt(abs(cov[3, 3]))
+
+    # Centre-z_p covariance via J @ cov[:,3]: the t_x and t_y columns pass
+    # through (J[0,0]=1, J[1,1]=1) while the θ column picks up the lever arm.
+    half = n_probe_ch * STRIP_MM / 2.0
+    ct, st = math.cos(pose.theta), math.sin(pose.theta)
+    cov_cx_zp = cov[0, 3] - half * (st + ct) * cov[2, 3]
+    cov_cy_zp = cov[1, 3] + half * (ct - st) * cov[2, 3]
+
+    err = {"x": cx_fit - cx_true, "y": cy_fit - cy_true, "z": pose.z_p - z_p_true}
+    sig = {"x": sig_cx, "y": sig_cy, "z": sig_z}
     corr = {
-        "x": cov[0, 3] / (sig["x"] * sz) if sig["x"] > 0 and sz > 0 else 0.0,
-        "y": cov[1, 3] / (sig["y"] * sz) if sig["y"] > 0 and sz > 0 else 0.0,
+        "x": cov_cx_zp / (sig_cx * sig_z) if sig_cx > 0 and sig_z > 0 else 0.0,
+        "y": cov_cy_zp / (sig_cy * sig_z) if sig_cy > 0 and sig_z > 0 else 0.0,
         "z": 1.0,
     }
     per_axis = {a: (err[a], sig[a], corr[a]) for a in AXES}
-    # Resolve the (x, y) covariance block along (radial) / perpendicular to
+
+    # Resolve the centre (x, y) block along (radial) / perpendicular to
     # (tangential) the offset direction: e_r=(cos φ, sin φ), e_t=(−sin φ, cos φ).
-    c, s = math.cos(phi), math.sin(phi)
-    var_rad = c * c * cov[0, 0] + 2 * s * c * cov[0, 1] + s * s * cov[1, 1]
-    var_tan = s * s * cov[0, 0] - 2 * s * c * cov[0, 1] + c * c * cov[1, 1]
+    cp, sp = math.cos(phi), math.sin(phi)
+    var_rad = cp * cp * cov_c[0, 0] + 2 * sp * cp * cov_c[0, 1] + sp * sp * cov_c[1, 1]
+    var_tan = sp * sp * cov_c[0, 0] - 2 * sp * cp * cov_c[0, 1] + cp * cp * cov_c[1, 1]
     radtan = (math.sqrt(abs(var_rad)), math.sqrt(abs(var_tan)))
     return per_axis, (pose.t_x, pose.t_y, pose.theta), radtan
 
@@ -360,7 +401,7 @@ def sweep_one_geometry(
             idx = rng.choice(pool, size=n, replace=False)
             sub = [coincs[i] for i in idx]
             per_axis, (tx_fit, ty_fit, th_fit), (s_rad, s_tan) = _fit_subsample(
-                sub, z_corr, alignment, truth, phi
+                sub, z_corr, alignment, truth, phi, n_probe_ch
             )
             for a in AXES:
                 e, s, c = per_axis[a]

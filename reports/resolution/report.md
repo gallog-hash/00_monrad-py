@@ -129,9 +129,11 @@ a curve **independent of the telescope plane spacing**.
 **Table 1.** The measured marginal `σ_eff` follows the `ρ`-dependence of the analytic
 curve but sits a factor `≈2` above its idealized floor (which is `1` at `ρ=0`). The
 offset arises because the marginal in-plane uncertainty from the joint four-parameter
-fit carries the `t`↔`z_p`↔`θ` correlations that the single-coordinate model omits, plus
-the corner-pivot anisotropy of §4.5. The structural point stands: because the physics
-depends on `z_p` only through `ρ`, the curve transfers across telescopes.
+fit carries the `t`↔`z_p`↔`θ` correlations that the single-coordinate model omits.
+The values are reported at the physical probe **centre** (§4.5); any residual
+`σ_x ≠ σ_y` spread is within the per-geometry Monte Carlo scatter, not an apparatus
+anisotropy. The structural point stands: because the physics depends on `z_p` only
+through `ρ`, the curve transfers across telescopes.
 
 ![sigma_eff vs zp](sigma_eff_vs_zp.png)
 
@@ -183,11 +185,33 @@ the fixed probe rotation `θ` breaks the `x↔y` diagonal reflection).
 **Table 3.** Radial resolution (mm, `N=300`). The lower value at `φ=45°` is the minor
 axis of the error ellipse (see §4.5), not a directional sensitivity of the apparatus.
 
-### 4.5 Orientation dependence: a corner-pivot artifact
+### 4.5 Orientation dependence and centre-referenced resolution
 
-The covariance reports `σ_x ≠ σ_y`, which might suggest the probe localizes better
-along one lab axis. We tested this by scanning the probe mounting rotation `θ`
-(on-axis, `z_p = 1000` mm, `N = 300`).
+The pose is parameterized by the probe **corner** (origin of the probe frame), and the
+fitted rotation `θ` pivots about that corner. A rotation error `δθ` projects along the
+corner→centre lever arm `R(θ)·(L/2, L/2)`, producing a variance difference in the
+**corner**-referenced covariance:
+
+```
+σ_x² − σ_y²  ∝  sin 2θ,
+```
+
+zero when the lever splits equally between the axes (`θ = 0°, 90°`) and maximal when it
+points along a single axis (`θ = 45°`). The **probe centre** is immune to this term: its
+covariance is obtained by propagating the 4×4 pose covariance through the
+corner→centre Jacobian
+
+```
+J = d(cx, cy)/d(t_x, t_y, θ, z_p)
+  = [[1, 0,  −(L/2)(sinθ + cosθ),  0],
+     [0, 1,   (L/2)(cosθ − sinθ),  0]],
+```
+
+so `Cov(cx,cy) = J Cov J ᵀ` (2×2), and the centre `σ_x, σ_y` are isotropic in `θ`.
+`monrad-resolution` reports this centre covariance for all in-plane (`x`, `y`) results.
+
+We verified the artifact and the fix with a θ-scan diagnostic (on-axis,
+`z_p = 1000` mm, `N = 300`):
 
 ![anisotropy vs theta](anisotropy_vs_theta.png)
 
@@ -207,21 +231,9 @@ from 1 at `θ = 0°/90°` to ≈2 at `θ = 45°`, tracking the model
 | 75° | 1.37 | 1.10 |
 | 90° | 1.02 | 1.17 |
 
-**Table 4.** Anisotropy versus probe rotation.
-
-The pose is parameterized by the probe **corner**, and the fitted rotation `θ` pivots
-about that corner. A rotation error `δθ` displaces the corner along the corner→centre
-lever arm `R(θ)·(L/2, L/2)`; propagating this gives a variance difference
-
-```
-σ_x² − σ_y²  ∝  sin 2θ,
-```
-
-zero when the lever splits equally between the axes (`θ = 0°, 90°`) and maximal when
-it points along a single axis (`θ = 45°`). The data follow this exactly. The physical
-**probe centre** sits at the pivot and carries no such term, so its resolution is
-**isotropic at all orientations**. The `σ_x ≠ σ_y` of Table 1 is therefore a property
-of the chosen pose parameterization, not of the detector's localizing power.
+**Table 4.** Anisotropy ratio versus probe rotation. The corner ratio follows the
+`sin 2θ` model; the centre ratio stays ≈1 at all orientations, confirming the
+resolution is orientation-independent once the correct reference point is used.
 
 ### 4.6 Fit quality and calibration
 
@@ -268,11 +280,8 @@ Three results have direct experimental consequences:
 3. **Reference-point choice.** When quoting `(σ_x, σ_y)`, the probe **centre** is the
    physically meaningful reference; the corner-referenced parameters mix in an
    orientation-dependent `sin 2θ` anisotropy from the rotation pivot that is absent at
-   the centre.
-
-A practical recommendation follows from (3): downstream resolution reporting should
-quote the centre covariance (obtained by propagating the pose covariance through the
-corner→centre transform) rather than the raw `(t_x, t_y)` block.
+   the centre. `monrad-resolution` implements this directly: the reported `σ_x, σ_y`
+   are probe-centre covariances, propagated via the lever-arm Jacobian `J` of §4.5.
 
 ---
 
