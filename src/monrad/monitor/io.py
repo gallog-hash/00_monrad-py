@@ -7,6 +7,7 @@ pass.  Extracting them here keeps the drivers (and the script) from each
 carrying their own copy.
 """
 
+import math
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,9 @@ from ..timing import (
     load_header_params,
     reconstruct_stream,
 )
+
+# Physical strip pitch (mm) — coord = (ch + 0.5) × STRIP_MM (CLAUDE.md geometry).
+STRIP_MM = 10.0
 
 
 class DetectorFiles(NamedTuple):
@@ -49,6 +53,27 @@ def load_detector(d: Path) -> DetectorFiles:
     if not gps_paths:
         raise FileNotFoundError(f"no *_GPS.bin / *.bin pairs found in {d}")
     return DetectorFiles(utc0, f0, gps_paths, pos_paths)
+
+
+def centre_cov_2x2(cov: np.ndarray, theta: float, n_probe_ch: int) -> np.ndarray:
+    """Propagate a 4×4 pose covariance to the 2×2 probe-centre covariance.
+
+    The probe corner sits at ``(t_x, t_y)``; the centre at
+    ``(t_x + half(cosθ − sinθ), t_y + half(sinθ + cosθ))``.  The Jacobian
+    ``J = d(cx,cy)/d(t_x,t_y,θ,z_p)`` has the leading 2×2 block equal to the
+    identity, the θ column as the lever-arm derivatives, and the z_p column zero.
+
+    Returns a 2×2 array: ``[0,0]`` = σ²_cx, ``[1,1]`` = σ²_cy.
+    """
+    half = n_probe_ch * STRIP_MM / 2.0
+    c, s = math.cos(theta), math.sin(theta)
+    J = np.array(
+        [
+            [1.0, 0.0, -half * (s + c), 0.0],
+            [0.0, 1.0, half * (c - s), 0.0],
+        ]
+    )
+    return J @ cov @ J.T
 
 
 def fit_alignment(

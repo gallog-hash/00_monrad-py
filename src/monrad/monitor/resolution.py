@@ -62,7 +62,7 @@ from ..pose import Coincidence, PoseFitter, PoseResult, fit_probe_pose
 from ..synthetic import generate
 from ..synthetic.generate import N_TEL, STRIP_MM, Z_TEL
 from ..timing import reconstruct_stream
-from .io import load_detector
+from .io import centre_cov_2x2, load_detector
 
 # Telescope angular resolution used in the DESIGN §8.6 σ_eff overlay:
 # σ_eff² = σ_strip² + (TEL_ANG_SIGMA·z_p)².  3 mrad = σ_strip·√(2/3)/800 mm.
@@ -126,28 +126,6 @@ def _probe_center(
     half = n_probe_ch * STRIP_MM / 2.0
     c, s = math.cos(theta), math.sin(theta)
     return t_x + half * (c - s), t_y + half * (s + c)
-
-
-def _centre_cov_2x2(cov: np.ndarray, theta: float, n_probe_ch: int) -> np.ndarray:
-    """Propagate the 4×4 pose covariance to the 2×2 probe-centre covariance.
-
-    The probe corner sits at ``(t_x, t_y)``; the centre at
-    ``(t_x + half(cosθ − sinθ), t_y + half(sinθ + cosθ))``.  The Jacobian
-    ``J = d(cx,cy)/d(t_x,t_y,θ,z_p)`` has the leading 2×2 block equal to
-    the identity and the θ column equal to the lever-arm derivatives; the
-    z_p column is zero.
-
-    Returns a 2×2 array: ``[0,0]`` = σ²_cx, ``[1,1]`` = σ²_cy.
-    """
-    half = n_probe_ch * STRIP_MM / 2.0
-    c, s = math.cos(theta), math.sin(theta)
-    J = np.array(
-        [
-            [1.0, 0.0, -half * (s + c), 0.0],
-            [0.0, 1.0, half * (c - s), 0.0],
-        ]
-    )
-    return J @ cov @ J.T
 
 
 # ── Coincidence decoding (the expensive part — done once per geometry) ───────
@@ -284,7 +262,7 @@ def _fit_subsample(
 
     For the x and y axes the statistics are reported at the physical **probe
     centre**, not the corner (pose parameter origin).  The centre covariance is
-    propagated from the fitted 4×4 pose covariance via :func:`_centre_cov_2x2`.
+    propagated from the fitted 4×4 pose covariance via :func:`centre_cov_2x2`.
     The z_p axis is unchanged.  The probe pose is unambiguous in θ (see the
     module docstring), so the fitted parameters are scored directly against
     ground truth.
@@ -294,7 +272,7 @@ def _fit_subsample(
     cov = pose.cov
 
     # Centre-referenced x/y: propagate corner→centre through the lever-arm Jacobian.
-    cov_c = _centre_cov_2x2(cov, pose.theta, n_probe_ch)
+    cov_c = centre_cov_2x2(cov, pose.theta, n_probe_ch)
     cx_fit, cy_fit = _probe_center(pose.t_x, pose.t_y, pose.theta, n_probe_ch)
     cx_true, cy_true = _probe_center(t_x_true, t_y_true, theta_true, n_probe_ch)
 
