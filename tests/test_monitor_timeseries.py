@@ -8,6 +8,7 @@ Two tiers:
   real data).
 """
 
+import csv
 import math
 from pathlib import Path
 
@@ -103,6 +104,111 @@ def test_synthetic_csv_rows(synth_run):
 def test_synthetic_plot_written(synth_run):
     _, out = synth_run
     assert (out / "pose_timeseries.png").exists()
+
+
+# ── Adaptive-mode (resolution-driven window) test ────────────────────────────
+
+
+def _write_resolution_csv(path: Path, *, z_p: float, sigma_eff_z: float) -> None:
+    """Minimal n_required.csv with one on-axis z node, for window sizing."""
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(
+            [
+                "z_p",
+                "offset",
+                "phi_deg",
+                "rho",
+                "eta",
+                "axis",
+                "sigma_eff",
+                "sigma_eff_strip",
+                "target_sigma",
+                "N_required",
+            ]
+        )
+        for tgt in (0.3, 1.0):
+            w.writerow([z_p, 0, 0, 0, 0, "z", sigma_eff_z, 0, tgt, 0])
+
+
+def test_adaptive_window_sizes_and_fits(tmp_path_factory):
+    """Omitting window_s sizes the window from target_zp and fits ≥1 window."""
+    src = tmp_path_factory.mktemp("ts_adaptive")
+    info = generate(
+        src,
+        t_x=300.0,
+        t_y=350.0,
+        theta=0.29671,
+        z_p=300.0,
+        n_probe_ch=30,
+        n_tracks=5000,
+        seed=42,
+    )
+    out = tmp_path_factory.mktemp("ts_adaptive_out")
+    # Generous σ_eff,z so N_req is large → window spans much of the acquisition.
+    res_csv = out / "n_required.csv"
+    _write_resolution_csv(res_csv, z_p=300.0, sigma_eff_z=50.0)
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=30,
+        out_dir=out,
+        target_zp=0.5,
+        resolution_csv=res_csv,
+        inspect_coinc=100,
+        make_plots=False,
+    )
+    assert len(results) >= 1
+    meta = out / "window_meta.txt"
+    assert meta.exists()
+    text = meta.read_text()
+    assert "window_s=" in text and "N_req=" in text
+
+
+def test_adaptive_window_too_sparse_raises(tmp_path_factory):
+    """Adaptive sizing raises a clear error when too few coincidences are seen."""
+    src = tmp_path_factory.mktemp("ts_sparse")
+    info = generate(
+        src,
+        t_x=300.0,
+        t_y=350.0,
+        theta=0.29671,
+        z_p=300.0,
+        n_probe_ch=30,
+        n_tracks=5000,
+        seed=42,
+    )
+    out = tmp_path_factory.mktemp("ts_sparse_out")
+    res_csv = out / "n_required.csv"
+    _write_resolution_csv(res_csv, z_p=300.0, sigma_eff_z=50.0)
+    with pytest.raises(RuntimeError, match="not enough coincidences"):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            out_dir=out,
+            resolution_csv=res_csv,
+            inspect_coinc=2,  # below MIN_FIT — too few to size a window
+            make_plots=False,
+        )
+
+
+def test_adaptive_missing_study_raises(tmp_path):
+    """Adaptive mode fails fast (before alignment) when the σ(N) study is absent."""
+    missing = tmp_path / "no_such_n_required.csv"
+    with pytest.raises(FileNotFoundError, match="resolution study not found"):
+        monitor_probe(
+            tmp_path / "tel",  # never loaded — guard fires first
+            tmp_path / "prb",
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            resolution_csv=missing,
+            make_plots=False,
+        )
 
 
 # ── centre_cov_2x2 unit tests ─────────────────────────────────────────────────

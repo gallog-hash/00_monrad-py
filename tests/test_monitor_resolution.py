@@ -25,6 +25,46 @@ def test_n_required_inverts_sigma_eff():
     assert math.isnan(R.n_required(float("nan"), 0.3))
 
 
+def test_interp_sigma_eff(tmp_path):
+    """interp_sigma_eff reads n_required.csv, filters axis/offset, and interpolates."""
+    csv_path = tmp_path / "n_required.csv"
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(
+            [
+                "z_p",
+                "offset",
+                "phi_deg",
+                "rho",
+                "eta",
+                "axis",
+                "sigma_eff",
+                "sigma_eff_strip",
+                "target_sigma",
+                "N_required",
+            ]
+        )
+        # Two z_p nodes for the on-axis z baseline; σ_eff repeats across targets.
+        for z, seff in ((300.0, 5.0), (1000.0, 12.0)):
+            for tgt in (0.3, 1.0):
+                w.writerow([z, 0, 0, 0, 0, "z", seff, 0, tgt, 0])
+            # A decoy off-axis row and a decoy axis the lookup must ignore.
+            w.writerow([z, 150, 0, 0, 0, "z", 99.0, 0, 0.3, 0])
+            w.writerow([z, 0, 0, 0, 0, "x", 99.0, 0, 0.3, 0])
+
+    # Exact value at a grid node.
+    assert R.interp_sigma_eff(csv_path, 300.0) == pytest.approx(5.0)
+    assert R.interp_sigma_eff(csv_path, 1000.0) == pytest.approx(12.0)
+    # Linear interpolation halfway between nodes.
+    assert R.interp_sigma_eff(csv_path, 650.0) == pytest.approx(8.5)
+    # Clamps past the grid ends (np.interp behaviour).
+    assert R.interp_sigma_eff(csv_path, 0.0) == pytest.approx(5.0)
+    assert R.interp_sigma_eff(csv_path, 5000.0) == pytest.approx(12.0)
+    # No matching rows → clear error.
+    with pytest.raises(ValueError):
+        R.interp_sigma_eff(csv_path, 300.0, axis="nope")
+
+
 def test_resolve_n_tracks():
     assert R._resolve_n_tracks(60000, 3) == [60000, 60000, 60000]
     assert R._resolve_n_tracks([60000], 3) == [60000, 60000, 60000]

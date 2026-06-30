@@ -460,6 +460,39 @@ def n_required(sigma_eff: float, target: float) -> float:
     return (sigma_eff / target) ** 2
 
 
+def interp_sigma_eff(
+    csv_path: Path | str,
+    z_p: float,
+    *,
+    axis: str = "z",
+    offset: float = 0.0,
+) -> float:
+    """Interpolate ``σ_eff(z_p)`` from a previously written ``n_required.csv``.
+
+    Reads the resolution-study table (schema owned by this module — see
+    :func:`write_n_required_csv`) with the :mod:`csv` reader, keeps the rows for
+    the requested ``axis`` and lateral ``offset`` (the on-axis baseline,
+    ``offset≈0``, by default), dedupes to one ``σ_eff`` per ``z_p`` (the value
+    repeats across the ``target_sigma`` rows), and linearly interpolates with
+    :func:`numpy.interp` (which clamps at the grid ends).
+
+    Uses the on-axis baseline only; the offset dependence present in the table
+    is ignored for this first cut.  A 2-D ``(z_p, offset)`` interpolation is the
+    obvious later refinement.
+    """
+    by_zp: dict[float, float] = {}
+    with open(csv_path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if row["axis"] != axis or abs(float(row["offset"]) - offset) > 1e-9:
+                continue
+            by_zp[float(row["z_p"])] = float(row["sigma_eff"])
+    if not by_zp:
+        raise ValueError(f"no rows for axis={axis!r} offset={offset} in {csv_path}")
+    z_grid = np.array(sorted(by_zp))
+    seff_grid = np.array([by_zp[z] for z in z_grid])
+    return float(np.interp(z_p, z_grid, seff_grid))
+
+
 def design_sigma_eff(z_p: float) -> float:
     """DESIGN.md §8.6 overlay: σ_eff = √(σ_strip² + (3 mrad·z_p)²)."""
     return math.sqrt(SIGMA_STRIP**2 + (TEL_ANG_SIGMA * z_p) ** 2)
