@@ -57,12 +57,10 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import AlignmentCorrection
-from ..coincidence import coincidence_stream
-from ..pose import Coincidence, PoseFitter, PoseResult, fit_probe_pose
+from ..pose import Coincidence, PoseResult, fit_probe_pose
 from ..synthetic import generate
 from ..synthetic.generate import N_TEL, STRIP_MM, Z_TEL
-from ..timing import reconstruct_stream
-from .io import centre_cov_2x2, load_detector
+from .io import centre_jacobian, load_detector, stream_coincidences
 
 # Telescope angular resolution used in the DESIGN §8.6 σ_eff overlay:
 # σ_eff² = σ_strip² + (TEL_ANG_SIGMA·z_p)².  3 mrad = σ_strip·√(2/3)/800 mm.
@@ -165,24 +163,16 @@ def decode_coincidences(
     tel = load_detector(info["tel_dir"])
     prb = load_detector(info["probe_dir"])
 
-    fitter = PoseFitter(
-        tel_z=z_tel,
-        alignment=alignment,
-        tel_id=0,
-        prb_id=1,
-        tel_pos_paths=tel.pos_paths,
-        prb_pos_paths=prb.pos_paths,
-        tot_thresh=tot_thresh,
-        tot_weights=tot_weights,
+    coincs = list(
+        stream_coincidences(
+            tel,
+            prb,
+            z_tel=z_tel,
+            alignment=alignment,
+            tot_thresh=tot_thresh,
+            tot_weights=tot_weights,
+        )
     )
-    tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
-    prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
-
-    coincs: list[Coincidence] = []
-    for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
-        co = fitter.decode_cluster(cluster)
-        if co is not None:
-            coincs.append(co)
     return coincs, info
 
 
@@ -238,54 +228,54 @@ class GeomResult:
     pool: int
     truth: tuple[float, float, float, float]  # (t_x, t_y, theta, z_p)
     cells: list[CellResult]
-    ref_pose: PoseResult  # full-statistics fit, for the §10 diagnostic plots
+    # Full-statistics fit for the §10 diagnostic plots; None off the on-axis
+    # baseline, where write_plots renders no χ²(θ)/residual figure.
+    ref_pose: PoseResult | None
 
 
 def _fit_subsample(
     sub: list[Coincidence],
     z_corr: np.ndarray,
     alignment: AlignmentCorrection,
-    truth: tuple[float, float, float, float],
+    cx_true: float,
+    cy_true: float,
+    z_p_true: float,
     phi: float,
     n_probe_ch: int,
 ) -> tuple[
     dict[str, tuple[float, float, float]],
-    tuple[float, float, float],
+    tuple[float, float],
     tuple[float, float],
 ]:
     """Fit one subsample.
 
-    Returns ``(per_axis, pose, radtan)`` where ``per_axis[a] = (error,
-    sigma_cov, corr_with_zp)``, ``pose = (t_x_fit, t_y_fit, theta_fit)`` and
-    ``radtan = (sigma_rad, sigma_tan)`` — the in-plane cov-σ resolved along and
-    perpendicular to the offset azimuth ``phi``.
+    Returns ``(per_axis, centre, radtan)`` where ``per_axis[a] = (error,
+    sigma_cov, corr_with_zp)``, ``centre = (cx_fit, cy_fit)`` is the fitted
+    probe centre, and ``radtan = (sigma_rad, sigma_tan)`` — the in-plane cov-σ
+    resolved along and perpendicular to the offset azimuth ``phi``.
 
     For the x and y axes the statistics are reported at the physical **probe
     centre**, not the corner (pose parameter origin).  The centre covariance is
-    propagated from the fitted 4×4 pose covariance via :func:`centre_cov_2x2`.
-    The z_p axis is unchanged.  The probe pose is unambiguous in θ (see the
-    module docstring), so the fitted parameters are scored directly against
-    ground truth.
+    propagated from the fitted 4×4 pose covariance through the corner→centre
+    Jacobian :func:`centre_jacobian`.  The z_p axis is unchanged.  The probe
+    pose is unambiguous in θ (see the module docstring), so the fitted
+    parameters are scored directly against ground truth (``cx_true``,
+    ``cy_true``, ``z_p_true`` are precomputed by the caller).
     """
     pose = fit_probe_pose(sub, z_corr, alignment)
-    t_x_true, t_y_true, theta_true, z_p_true = truth
     cov = pose.cov
-
-    # Centre-referenced x/y: propagate corner→centre through the lever-arm Jacobian.
-    cov_c = centre_cov_2x2(cov, pose.theta, n_probe_ch)
     cx_fit, cy_fit = _probe_center(pose.t_x, pose.t_y, pose.theta, n_probe_ch)
-    cx_true, cy_true = _probe_center(t_x_true, t_y_true, theta_true, n_probe_ch)
+
+    # Centre-referenced x/y: a single corner→centre Jacobian J supplies both the
+    # 2×2 centre covariance (J cov Jᵀ) and the centre↔z_p cross-covariance
+    # (J cov[:,3]), so the lever-arm convention lives only in centre_jacobian.
+    J = centre_jacobian(pose.theta, n_probe_ch)
+    cov_c = J @ cov @ J.T
+    cov_cx_zp, cov_cy_zp = J @ cov[:, 3]
 
     sig_cx = math.sqrt(abs(cov_c[0, 0]))
     sig_cy = math.sqrt(abs(cov_c[1, 1]))
     sig_z = math.sqrt(abs(cov[3, 3]))
-
-    # Centre-z_p covariance via J @ cov[:,3]: the t_x and t_y columns pass
-    # through (J[0,0]=1, J[1,1]=1) while the θ column picks up the lever arm.
-    half = n_probe_ch * STRIP_MM / 2.0
-    ct, st = math.cos(pose.theta), math.sin(pose.theta)
-    cov_cx_zp = cov[0, 3] - half * (st + ct) * cov[2, 3]
-    cov_cy_zp = cov[1, 3] + half * (ct - st) * cov[2, 3]
 
     err = {"x": cx_fit - cx_true, "y": cy_fit - cy_true, "z": pose.z_p - z_p_true}
     sig = {"x": sig_cx, "y": sig_cy, "z": sig_z}
@@ -302,7 +292,7 @@ def _fit_subsample(
     var_rad = cp * cp * cov_c[0, 0] + 2 * sp * cp * cov_c[0, 1] + sp * sp * cov_c[1, 1]
     var_tan = sp * sp * cov_c[0, 0] - 2 * sp * cp * cov_c[0, 1] + cp * cp * cov_c[1, 1]
     radtan = (math.sqrt(abs(var_rad)), math.sqrt(abs(var_tan)))
-    return per_axis, (pose.t_x, pose.t_y, pose.theta), radtan
+    return per_axis, (cx_fit, cy_fit), radtan
 
 
 def sweep_one_geometry(
@@ -357,8 +347,9 @@ def sweep_one_geometry(
         )
         return None
 
-    # Reference full-statistics fit, reused for the §10 χ²(θ) and residual plots.
-    ref_pose = fit_probe_pose(coincs, z_corr, alignment)
+    # Reference full-statistics fit for the §10 χ²(θ) and residual plots, which
+    # write_plots renders only for the on-axis baseline; skip it off-axis.
+    ref_pose = fit_probe_pose(coincs, z_corr, alignment) if abs(offset) < 1e-9 else None
 
     cells: list[CellResult] = []
     for n in n_grid:
@@ -378,15 +369,14 @@ def sweep_one_geometry(
         for _ in range(n_repeats):
             idx = rng.choice(pool, size=n, replace=False)
             sub = [coincs[i] for i in idx]
-            per_axis, (tx_fit, ty_fit, th_fit), (s_rad, s_tan) = _fit_subsample(
-                sub, z_corr, alignment, truth, phi, n_probe_ch
+            per_axis, (cx_f, cy_f), (s_rad, s_tan) = _fit_subsample(
+                sub, z_corr, alignment, cx_true, cy_true, truth[3], phi, n_probe_ch
             )
             for a in AXES:
                 e, s, c = per_axis[a]
                 errs[a].append(e)
                 sigs[a].append(s)
                 corrs[a].append(c)
-            cx_f, cy_f = _probe_center(tx_fit, ty_fit, th_fit, n_probe_ch)
             cx_fits.append(cx_f)
             cy_fits.append(cy_f)
             rads.append(s_rad)
@@ -899,6 +889,7 @@ def _plot_chi2_theta(g: GeomResult, path: Path) -> None:
     """
     import matplotlib.pyplot as plt
 
+    assert g.ref_pose is not None  # only called for on-axis baseline geometries
     curve = g.ref_pose.chi2_curve
     theta_true = math.degrees(g.truth[2])
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -924,6 +915,7 @@ def _plot_residuals(g: GeomResult, path: Path) -> None:
     """DESIGN §8.7/§10: probe-plane x/y inlier residual histograms."""
     import matplotlib.pyplot as plt
 
+    assert g.ref_pose is not None  # only called for on-axis baseline geometries
     pose = g.ref_pose
     fig, axs = plt.subplots(1, 2, figsize=(11, 4.5))
     for ax, res, lbl in (

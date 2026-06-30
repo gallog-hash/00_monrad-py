@@ -24,14 +24,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ..coincidence import coincidence_stream
 from ..pose import Coincidence, PoseFitter, PoseResult, fit_probe_pose
-from ..timing import reconstruct_stream
-from .io import centre_cov_2x2, fit_alignment, load_detector
+from .io import centre_cov_2x2, fit_alignment, load_detector, stream_coincidences
 
-# Minimum decoded coincidences in a window to attempt a pose fit.
-# Mirrors PoseFitter.MIN_FIT so windowed fits use the same floor.
-MIN_FIT = 30
+# Minimum decoded coincidences in a window to attempt a pose fit — the same
+# floor the streaming PoseFitter applies, so windowed fits never diverge from it.
+MIN_FIT = PoseFitter.MIN_FIT
 
 
 @dataclass
@@ -99,20 +97,6 @@ def monitor_probe(
     )
     z_corr = alignment.corrected_z_tel(z_tel)
 
-    fitter = PoseFitter(
-        tel_z=z_tel,
-        alignment=alignment,
-        tel_id=0,
-        prb_id=1,
-        tel_pos_paths=tel.pos_paths,
-        prb_pos_paths=prb.pos_paths,
-        tot_thresh=tot_thresh,
-        tot_weights=tot_weights,
-    )
-
-    tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
-    prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
-
     window_ns = int(window_s * 1e9)
     current_win: int | None = None
     win_coincs: list[Coincidence] = []
@@ -142,10 +126,14 @@ def monitor_probe(
             )
         )
 
-    for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
-        co = fitter.decode_cluster(cluster)
-        if co is None:
-            continue
+    for co in stream_coincidences(
+        tel,
+        prb,
+        z_tel=z_tel,
+        alignment=alignment,
+        tot_thresh=tot_thresh,
+        tot_weights=tot_weights,
+    ):
         win = co.t_ns // window_ns
         if current_win is None:
             current_win = win
