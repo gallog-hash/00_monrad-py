@@ -130,14 +130,17 @@ Two console scripts build on the pipeline to characterize and track the probe
 # N_required tables, and diagnostic plots written under the output directory.
 monrad-resolution --out reports/resolution
 
-# Time-windowed monitoring of a real acquisition: stream coincidences, fit one
-# probe pose per time window, and report per-window centre uncertainty
-# (writes pose_timeseries.csv + .png).
+# Monitoring of a real acquisition: stream coincidences, fit one probe pose per
+# batch, and report per-batch centre uncertainty (writes pose_timeseries.csv +
+# .png).  By default batches are count-based: one fit per --min-fit
+# coincidences.  Pass --window-s for hybrid windows: each spans at least
+# --window-s seconds AND holds at least --min-fit coincidences (whichever is
+# longer), so sparse windows stretch to reach the count.
 monrad-monitor \
     --telescope data/telescope \
     --probe     data/probe \
     --z-tel     0 400 800 \
-    --window-s  1800 \
+    --min-fit   30 \
     --out       pipeline_out/monitor
 ```
 

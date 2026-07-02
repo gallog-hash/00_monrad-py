@@ -8,7 +8,6 @@ Two tiers:
   real data).
 """
 
-import csv
 import math
 from pathlib import Path
 
@@ -106,34 +105,13 @@ def test_synthetic_plot_written(synth_run):
     assert (out / "pose_timeseries.png").exists()
 
 
-# ── Adaptive-mode (resolution-driven window) test ────────────────────────────
+# ── Count-based mode (default, --min-fit driven) tests ───────────────────────
 
 
-def _write_resolution_csv(path: Path, *, z_p: float, sigma_eff_z: float) -> None:
-    """Minimal n_required.csv with one on-axis z node, for window sizing."""
-    with open(path, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(
-            [
-                "z_p",
-                "offset",
-                "phi_deg",
-                "rho",
-                "eta",
-                "axis",
-                "sigma_eff",
-                "sigma_eff_strip",
-                "target_sigma",
-                "N_required",
-            ]
-        )
-        for tgt in (0.3, 1.0):
-            w.writerow([z_p, 0, 0, 0, 0, "z", sigma_eff_z, 0, tgt, 0])
-
-
-def test_adaptive_window_sizes_and_fits(tmp_path_factory):
-    """Omitting window_s sizes the window from target_zp and fits ≥1 window."""
-    src = tmp_path_factory.mktemp("ts_adaptive")
+@pytest.fixture(scope="module")
+def count_run(tmp_path_factory):
+    """Run monitor_probe in count-based mode (window_s omitted) on synthetic data."""
+    src = tmp_path_factory.mktemp("ts_count")
     info = generate(
         src,
         t_x=300.0,
@@ -144,71 +122,138 @@ def test_adaptive_window_sizes_and_fits(tmp_path_factory):
         n_tracks=5000,
         seed=42,
     )
-    out = tmp_path_factory.mktemp("ts_adaptive_out")
-    # Generous σ_eff,z so N_req is large → window spans much of the acquisition.
-    res_csv = out / "n_required.csv"
-    _write_resolution_csv(res_csv, z_p=300.0, sigma_eff_z=50.0)
+    out = tmp_path_factory.mktemp("ts_count_out")
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,  # count-based mode
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=30,
+        out_dir=out,
+        min_fit=30,
+        make_plots=True,
+    )
+    return results, out, info
 
+
+def test_count_based_produces_windows(count_run):
+    results, _, _ = count_run
+    assert len(results) >= 1
+
+
+def test_count_based_batch_size_respected(count_run):
+    """Each batch fits exactly min_fit coincidences, so inliers never exceed it."""
+    results, _, _ = count_run
+    for r in results:
+        assert 0 < r.n_inliers <= 30
+
+
+def test_count_based_times_strictly_ordered(count_run):
+    """Batch timestamps come from the coincidences and advance monotonically."""
+    results, _, _ = count_run
+    for i, r in enumerate(results):
+        assert r.utc_start < r.utc_end, f"batch {i}: start not before end"
+    for i in range(1, len(results)):
+        assert results[i].utc_start >= results[i - 1].utc_end
+
+
+def test_count_based_sigmas_finite_positive(count_run):
+    results, _, _ = count_run
+    for r in results:
+        for s in (r.sigma_tx, r.sigma_ty, r.sigma_zp, r.sigma_theta):
+            assert math.isfinite(s) and s > 0
+
+
+def test_count_based_csv_and_plot_written(count_run):
+    results, out, _ = count_run
+    csv_path = out / "pose_timeseries.csv"
+    assert csv_path.exists()
+    assert len(csv_path.read_text().splitlines()) == len(results) + 1
+    assert (out / "pose_timeseries.png").exists()
+
+
+def test_min_fit_controls_window_count(count_run):
+    """Smaller min_fit yields at least as many batches on the same stream."""
+    _, _, info = count_run
+
+    def _n_windows(min_fit: int) -> int:
+        return len(
+            monitor_probe(
+                info["tel_dir"],
+                info["probe_dir"],
+                window_s=None,
+                z_tel=np.array(Z_TEL, dtype=float),
+                min_fit=min_fit,
+                make_plots=False,
+            )
+        )
+
+    n_small = _n_windows(15)
+    n_large = _n_windows(45)
+    assert n_small >= n_large
+    assert n_small >= 1
+
+
+def test_min_fit_above_total_yields_no_windows(count_run):
+    """A min_fit larger than the whole stream produces no fits."""
+    _, _, info = count_run
     results = monitor_probe(
         info["tel_dir"],
         info["probe_dir"],
         window_s=None,
         z_tel=np.array(Z_TEL, dtype=float),
-        n_probe_ch=30,
-        out_dir=out,
-        target_zp=0.5,
-        resolution_csv=res_csv,
-        inspect_coinc=100,
+        min_fit=10_000_000,
         make_plots=False,
     )
-    assert len(results) >= 1
-    meta = out / "window_meta.txt"
-    assert meta.exists()
-    text = meta.read_text()
-    assert "window_s=" in text and "N_req=" in text
+    assert results == []
 
 
-def test_adaptive_window_too_sparse_raises(tmp_path_factory):
-    """Adaptive sizing raises a clear error when too few coincidences are seen."""
-    src = tmp_path_factory.mktemp("ts_sparse")
-    info = generate(
-        src,
-        t_x=300.0,
-        t_y=350.0,
-        theta=0.29671,
-        z_p=300.0,
-        n_probe_ch=30,
-        n_tracks=5000,
-        seed=42,
+# ── Hybrid mode (both --window-s and --min-fit) tests ────────────────────────
+
+
+def _run_hybrid(info, *, window_s, min_fit):
+    return monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=window_s,
+        z_tel=np.array(Z_TEL, dtype=float),
+        min_fit=min_fit,
+        make_plots=False,
     )
-    out = tmp_path_factory.mktemp("ts_sparse_out")
-    res_csv = out / "n_required.csv"
-    _write_resolution_csv(res_csv, z_p=300.0, sigma_eff_z=50.0)
-    with pytest.raises(RuntimeError, match="not enough coincidences"):
-        monitor_probe(
-            info["tel_dir"],
-            info["probe_dir"],
-            window_s=None,
-            z_tel=np.array(Z_TEL, dtype=float),
-            out_dir=out,
-            resolution_csv=res_csv,
-            inspect_coinc=2,  # below MIN_FIT — too few to size a window
-            make_plots=False,
-        )
 
 
-def test_adaptive_missing_study_raises(tmp_path):
-    """Adaptive mode fails fast (before alignment) when the σ(N) study is absent."""
-    missing = tmp_path / "no_such_n_required.csv"
-    with pytest.raises(FileNotFoundError, match="resolution study not found"):
-        monitor_probe(
-            tmp_path / "tel",  # never loaded — guard fires first
-            tmp_path / "prb",
-            window_s=None,
-            z_tel=np.array(Z_TEL, dtype=float),
-            resolution_csv=missing,
-            make_plots=False,
-        )
+def test_hybrid_window_spans_at_least_window_s(count_run):
+    """With --window-s given, every emitted window spans at least window_s."""
+    _, _, info = count_run
+    window_s = 150.0
+    results = _run_hybrid(info, window_s=window_s, min_fit=30)
+    assert len(results) >= 1
+    for i, r in enumerate(results):
+        span = (r.utc_end - r.utc_start).total_seconds()
+        assert span >= window_s - 1e-6, f"window {i}: span {span:.3f}s < {window_s}s"
+
+
+def test_hybrid_stretches_past_window_s_to_reach_min_fit(count_run):
+    """A negligible window_s lets --min-fit drive the boundaries (windows stretch).
+
+    With a 1 ms floor — far shorter than the time to gather ``min_fit`` sparse
+    coincidences — the count bound binds, so the run reduces to count-based
+    batching and every window spans far longer than window_s.
+    """
+    _, _, info = count_run
+    tiny = 1e-3
+    hybrid = _run_hybrid(info, window_s=tiny, min_fit=30)
+    count_based = _run_hybrid(info, window_s=None, min_fit=30)
+    assert len(hybrid) == len(count_based)
+    assert len(hybrid) >= 1
+    assert all((r.utc_end - r.utc_start).total_seconds() > tiny for r in hybrid)
+
+
+def test_hybrid_min_fit_above_total_yields_no_windows(count_run):
+    """A min_fit above the whole stream never closes a window, even with window_s."""
+    _, _, info = count_run
+    results = _run_hybrid(info, window_s=150.0, min_fit=10_000_000)
+    assert results == []
 
 
 # ── centre_cov_2x2 unit tests ─────────────────────────────────────────────────

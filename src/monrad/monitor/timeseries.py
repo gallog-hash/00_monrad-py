@@ -1,13 +1,24 @@
-"""Time-windowed probe monitoring (monitoring Step 2).
+"""Probe pose monitoring over an acquisition (monitoring Step 2).
 
 Console script ``monrad-monitor``.  Streams an acquisition and emits one
-probe pose per time window, tracking the probe's position over time with
-per-window uncertainty.
+probe pose per batch, tracking the probe's position over time with
+per-batch uncertainty.
 
-The streaming loop buckets decoded :class:`~monrad.pose.Coincidence` objects
-by ``t_ns // window_ns``; on window close it calls
-:func:`~monrad.pose.fit_probe_pose` on that window's coincidences and records
-a :class:`WindowResult`.  Only the open window is ever buffered in RAM.
+Two batching modes, both driven by ``min_fit`` (the minimum decoded
+coincidences fed to :func:`~monrad.pose.fit_probe_pose`):
+
+* **Count-based (default, ``window_s`` omitted).**  Buffer decoded
+  :class:`~monrad.pose.Coincidence` objects until exactly ``min_fit`` are
+  collected, fit once, emit a :class:`WindowResult`, then reset.  Each point
+  is an independent fit over ``min_fit`` coincidences; the trailing remainder
+  (``< min_fit``) is dropped.  The batch timestamps come from the first and
+  last coincidence in the batch.
+* **Hybrid (``window_s`` given).**  Each window grows until it spans at least
+  ``window_s`` seconds *and* holds at least ``min_fit`` coincidences, whichever
+  bound takes longer; a sparse window stretches past ``window_s`` to reach the
+  count.  Batch timestamps are the first and last coincidence in the window.
+
+Only the open batch is ever buffered in RAM.
 
 In-plane uncertainties ``sigma_tx`` / ``sigma_ty`` are reported at the probe
 **centre** (not the fit-parameter corner), consistent with the resolution
@@ -24,27 +35,18 @@ from pathlib import Path
 
 import numpy as np
 
-from ..alignment import AlignmentCorrection
 from ..pose import Coincidence, PoseFitter, PoseResult, fit_probe_pose
 from .io import (
-    DetectorFiles,
     centre_cov_2x2,
     fit_alignment,
     load_detector,
     stream_coincidences,
 )
-from .resolution import interp_sigma_eff, n_required
 
-# Minimum decoded coincidences in a window to attempt a pose fit — the same
-# floor the streaming PoseFitter applies, so windowed fits never diverge from it.
+# Default minimum decoded coincidences fed to a pose fit — the same floor the
+# streaming PoseFitter applies, so monitored fits never diverge from it.  Used
+# both as the count-based batch size and as the time-window floor.
 MIN_FIT = PoseFitter.MIN_FIT
-
-# Default location of the synthetic resolution study's σ_eff table (Step 1
-# output), used to size adaptive windows.  Repo-relative: src/monrad/monitor →
-# parents[3] is the repo root.
-_DEFAULT_RESOLUTION_CSV = (
-    Path(__file__).resolve().parents[3] / "reports" / "resolution" / "n_required.csv"
-)
 
 
 @dataclass
@@ -65,77 +67,6 @@ class WindowResult:
     pose: PoseResult = field(repr=False)
 
 
-def _size_window(
-    tel: DetectorFiles,
-    prb: DetectorFiles,
-    *,
-    z_tel: np.ndarray,
-    z_corr: np.ndarray,
-    alignment: AlignmentCorrection,
-    target_zp: float,
-    resolution_csv: Path,
-    inspect_coinc: int,
-    tot_thresh: int,
-    tot_weights: bool,
-) -> tuple[float, dict]:
-    """Derive a monitoring window from a target z_p resolution.
-
-    Buffers up to ``inspect_coinc`` accepted coincidences from a short prefix of
-    the stream, measures the accepted-coincidence rate over their time span, and
-    fits an approximate probe pose.  The fitted ``z_p`` selects ``σ_eff,z`` from
-    the synthetic resolution study (:func:`interp_sigma_eff`), which inverts via
-    the ``σ_eff/√N`` law (:func:`n_required`) to the inlier budget ``N_req`` for
-    the target σ.  The window is then ``N_req / rate``.
-
-    Returns ``(window_s, diag)`` where ``diag`` carries the inspection inputs for
-    reporting.  Raises when fewer than :data:`MIN_FIT` coincidences are
-    collected (too sparse to size a window — pass ``window_s`` explicitly).
-    """
-    buffer: list[Coincidence] = []
-    for co in stream_coincidences(
-        tel,
-        prb,
-        z_tel=z_tel,
-        alignment=alignment,
-        tot_thresh=tot_thresh,
-        tot_weights=tot_weights,
-    ):
-        buffer.append(co)
-        if len(buffer) >= inspect_coinc:
-            break
-
-    n_collected = len(buffer)
-    if n_collected < MIN_FIT:
-        raise RuntimeError(
-            f"not enough coincidences to size a window (collected {n_collected}, "
-            f"need ≥ {MIN_FIT}) — pass --window-s explicitly"
-        )
-    span_s = (buffer[-1].t_ns - buffer[0].t_ns) / 1e9
-    if span_s <= 0:
-        raise RuntimeError(
-            "inspection coincidences span zero time — pass --window-s explicitly"
-        )
-    coinc_rate = n_collected / span_s
-
-    pose = fit_probe_pose(buffer, z_corr, alignment)
-    sigma_eff_z = interp_sigma_eff(resolution_csv, pose.z_p)
-    n_req = n_required(sigma_eff_z, target_zp)
-    window_s = n_req / coinc_rate
-
-    diag = {
-        "window_s": window_s,
-        "target_zp": target_zp,
-        "z_p_approx": pose.z_p,
-        "coinc_rate": coinc_rate,
-        "n_collected": n_collected,
-        "span_s": span_s,
-        "sigma_eff_z": sigma_eff_z,
-        "N_req": n_req,
-        "pose_n_inliers": pose.n_inliers,
-    }
-    return window_s, diag
-
-
 def monitor_probe(
     tel_dir: Path,
     prb_dir: Path,
@@ -144,30 +75,29 @@ def monitor_probe(
     z_tel: np.ndarray,
     n_probe_ch: int = 30,
     out_dir: Path | None = None,
-    target_zp: float = 0.5,
-    resolution_csv: Path = _DEFAULT_RESOLUTION_CSV,
-    inspect_coinc: int = 300,
+    min_fit: int = MIN_FIT,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
 ) -> list[WindowResult]:
-    """Stream an acquisition and fit the probe pose in successive time windows.
+    """Stream an acquisition and fit the probe pose in successive batches.
 
-    Yields one :class:`WindowResult` per window that accumulates at least
-    :data:`MIN_FIT` decoded coincidences.  The final (possibly shorter)
-    window is included if it meets the minimum.  Only the open window is
-    buffered — RAM usage is bounded to roughly ``MIN_FIT`` coincidences.
+    Emits one :class:`WindowResult` per batch of at least ``min_fit`` decoded
+    coincidences.  Only the open batch is buffered — RAM usage is bounded to
+    roughly ``min_fit`` coincidences.
 
     Parameters
     ----------
     tel_dir, prb_dir:
         Acquisition directories for the telescope and probe.
     window_s:
-        Window duration in seconds.  When ``None`` (the default), the window is
-        sized adaptively from ``target_zp`` via :func:`_size_window`: inspect a
-        short prefix of the stream, measure the coincidence rate and an
-        approximate ``z_p``, and pick the window that reaches the target z_p
-        resolution.  Pass an explicit value to override (manual mode).
+        Window duration in seconds.  When ``None`` (the default), batches are
+        count-based: each batch holds exactly ``min_fit`` coincidences and its
+        timestamps come from the first and last coincidence.  When given, the
+        mode is hybrid: each window grows until it spans at least ``window_s``
+        seconds *and* holds at least ``min_fit`` coincidences (whichever bound
+        takes longer), so a sparse window stretches past ``window_s`` to reach
+        the count.
     z_tel:
         Telescope plane z-positions (mm).
     n_probe_ch:
@@ -175,29 +105,15 @@ def monitor_probe(
         physical probe centre (see :func:`~monrad.monitor.io.centre_cov_2x2`).
     out_dir:
         If given, write ``pose_timeseries.csv`` and (when ``make_plots``)
-        ``pose_timeseries.png`` here, plus ``window_meta.txt`` in adaptive mode.
-    target_zp:
-        Target z_p σ (mm) used to size the window in adaptive mode; ignored when
-        ``window_s`` is given.
-    resolution_csv:
-        ``n_required.csv`` from the synthetic resolution study, providing
-        ``σ_eff,z(z_p)`` for the window sizing.
-    inspect_coinc:
-        Number of accepted coincidences to buffer from the stream prefix when
-        sizing the window adaptively.
+        ``pose_timeseries.png`` here.
+    min_fit:
+        Minimum decoded coincidences fed to a pose fit.  In count-based mode it
+        is the batch size; in time-window mode it is the per-window floor.
+        Defaults to :data:`MIN_FIT`.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
     z_tel = np.asarray(z_tel, dtype=float)
-
-    # Adaptive mode needs the σ(N) study to size the window; fail fast with a
-    # clear message before the (slow) alignment pass rather than with a bare
-    # FileNotFoundError from interp_sigma_eff deep in _size_window.
-    if window_s is None and not Path(resolution_csv).exists():
-        raise FileNotFoundError(
-            f"resolution study not found at {resolution_csv}. Run `monrad-resolution` "
-            f"to generate it, or pass --window-s to size the window manually."
-        )
 
     tel = load_detector(tel_dir)
     prb = load_detector(prb_dir)
@@ -207,47 +123,19 @@ def monitor_probe(
     )
     z_corr = alignment.corrected_z_tel(z_tel)
 
-    window_diag: dict | None = None
-    if window_s is None:
-        window_s, window_diag = _size_window(
-            tel,
-            prb,
-            z_tel=z_tel,
-            z_corr=z_corr,
-            alignment=alignment,
-            target_zp=target_zp,
-            resolution_csv=resolution_csv,
-            inspect_coinc=inspect_coinc,
-            tot_thresh=tot_thresh,
-            tot_weights=tot_weights,
-        )
-        print(
-            f"Adaptive window: {window_s:.1f} s  (target σ_zp={target_zp:g} mm)\n"
-            f"  inspected {window_diag['n_collected']} coincidences over "
-            f"{window_diag['span_s']:.1f} s → rate "
-            f"{window_diag['coinc_rate']:.4g}/s\n"
-            f"  z_p≈{window_diag['z_p_approx']:.1f} mm (pose n_inliers="
-            f"{window_diag['pose_n_inliers']}) → σ_eff,z="
-            f"{window_diag['sigma_eff_z']:.3f} mm → N_req="
-            f"{window_diag['N_req']:.0f}"
-        )
-
-    window_ns = int(window_s * 1e9)
-    current_win: int | None = None
-    win_coincs: list[Coincidence] = []
     results: list[WindowResult] = []
 
-    def _close_window(win_idx: int, coincs: list[Coincidence]) -> None:
-        if len(coincs) < MIN_FIT:
+    def _emit(
+        coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
+    ) -> None:
+        if len(coincs) < min_fit:
             return
         pose = fit_probe_pose(coincs, z_corr, alignment)
         cov_c = centre_cov_2x2(pose.cov, pose.theta, n_probe_ch)
-        utc_s = datetime.fromtimestamp(win_idx * window_ns / 1e9, tz=timezone.utc)
-        utc_e = datetime.fromtimestamp((win_idx + 1) * window_ns / 1e9, tz=timezone.utc)
         results.append(
             WindowResult(
-                utc_start=utc_s,
-                utc_end=utc_e,
+                utc_start=utc_start,
+                utc_end=utc_end,
                 n_inliers=pose.n_inliers,
                 t_x=pose.t_x,
                 sigma_tx=math.sqrt(abs(cov_c[0, 0])),
@@ -261,41 +149,48 @@ def monitor_probe(
             )
         )
 
-    for co in stream_coincidences(
+    def _utc(t_ns: float) -> datetime:
+        return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+
+    stream = stream_coincidences(
         tel,
         prb,
         z_tel=z_tel,
         alignment=alignment,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
-    ):
-        win = co.t_ns // window_ns
-        if current_win is None:
-            current_win = win
-        if win != current_win:
-            _close_window(current_win, win_coincs)
-            win_coincs = []
-            current_win = win
-        win_coincs.append(co)
+    )
 
-    if current_win is not None:
-        _close_window(current_win, win_coincs)
+    if window_s is None:
+        # Count-based: a fresh fit every ``min_fit`` coincidences.  The trailing
+        # remainder (< min_fit) is dropped by construction.
+        batch: list[Coincidence] = []
+        for co in stream:
+            batch.append(co)
+            if len(batch) >= min_fit:
+                _emit(batch, _utc(batch[0].t_ns), _utc(batch[-1].t_ns))
+                batch = []
+    else:
+        # Hybrid: each window spans at least ``window_s`` seconds AND holds at
+        # least ``min_fit`` coincidences — whichever bound takes longer.  The
+        # window opens at its first coincidence and closes on the first one that
+        # satisfies both bounds; the trailing remainder is dropped.
+        window_ns = int(window_s * 1e9)
+        win_coincs: list[Coincidence] = []
+        win_start_ns: int | None = None
+        for co in stream:
+            if win_start_ns is None:
+                win_start_ns = co.t_ns
+            win_coincs.append(co)
+            spanned = co.t_ns - win_start_ns >= window_ns
+            if spanned and len(win_coincs) >= min_fit:
+                _emit(win_coincs, _utc(win_start_ns), _utc(co.t_ns))
+                win_coincs = []
+                win_start_ns = None
 
     if out_dir is not None:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        if window_diag is not None:
-            (out_dir / "window_meta.txt").write_text(
-                f"window_s={window_diag['window_s']:.1f}  "
-                f"target_zp={window_diag['target_zp']:g} mm  "
-                f"z_p_approx={window_diag['z_p_approx']:.1f} mm  "
-                f"sigma_eff_z={window_diag['sigma_eff_z']:.3f} mm  "
-                f"N_req={window_diag['N_req']:.0f}  "
-                f"coinc_rate={window_diag['coinc_rate']:.4g}/s  "
-                f"n_inspect={window_diag['n_collected']}  "
-                f"span_s={window_diag['span_s']:.1f}  "
-                f"pose_n_inliers={window_diag['pose_n_inliers']}\n"
-            )
         _write_csv(results, out_dir / "pose_timeseries.csv")
         if make_plots and results:
             _plot_timeseries(results, out_dir / "pose_timeseries.png")
@@ -384,7 +279,7 @@ def _plot_timeseries(results: list[WindowResult], path: Path) -> None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="monrad-monitor",
-        description="Time-windowed probe pose monitoring.",
+        description="Probe pose monitoring over an acquisition.",
     )
     p.add_argument(
         "--telescope",
@@ -409,36 +304,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Telescope plane z-positions (mm).",
     )
     p.add_argument(
+        "--min-fit",
+        type=int,
+        default=MIN_FIT,
+        metavar="N",
+        help="Minimum coincidences fed to a pose fit.  Without --window-s this "
+        "is the count-based batch size; with --window-s each window must reach "
+        f"this count (stretching past --window-s if needed) (default: {MIN_FIT}).",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
         metavar="SECS",
-        help="Window duration in seconds.  Omit to size adaptively from "
-        "--target-zp (the coincidence rate sets the window).",
-    )
-    p.add_argument(
-        "--target-zp",
-        type=float,
-        default=0.5,
-        metavar="MM",
-        help="Required z_p σ in mm; sizes the adaptive window.  Ignored when "
-        "--window-s is given (default: 0.5).",
-    )
-    p.add_argument(
-        "--resolution-csv",
-        type=Path,
-        default=_DEFAULT_RESOLUTION_CSV,
-        metavar="CSV",
-        help="Resolution-study n_required.csv supplying σ_eff,z(z_p) for adaptive "
-        f"window sizing (default: {_DEFAULT_RESOLUTION_CSV}).",
-    )
-    p.add_argument(
-        "--inspect-coinc",
-        type=int,
-        default=300,
-        metavar="N",
-        help="Coincidences to buffer from the stream prefix when sizing the "
-        "adaptive window (default: 300).",
+        help="Minimum window duration in seconds.  Omit for count-based batches "
+        "of --min-fit coincidences.  When given, each window spans at least this "
+        "long AND holds at least --min-fit coincidences (whichever is longer).",
     )
     p.add_argument(
         "--n-probe-ch",
@@ -468,9 +349,7 @@ def main(argv: list[str] | None = None) -> None:
         z_tel=np.array(args.z_tel),
         n_probe_ch=args.n_probe_ch,
         out_dir=args.out,
-        target_zp=args.target_zp,
-        resolution_csv=args.resolution_csv,
-        inspect_coinc=args.inspect_coinc,
+        min_fit=args.min_fit,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
