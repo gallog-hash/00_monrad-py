@@ -121,6 +121,7 @@ def stream_coincidences(
     alignment: AlignmentCorrection,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    min_anchor_planes: int = 1,
 ) -> Iterator[Coincidence]:
     """Yield decoded probe–telescope coincidences for one acquisition.
 
@@ -140,6 +141,7 @@ def stream_coincidences(
         prb_pos_paths=prb.pos_paths,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        min_anchor_planes=min_anchor_planes,
     )
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)

@@ -76,6 +76,7 @@ def monitor_probe(
     n_probe_ch: int = 30,
     out_dir: Path | None = None,
     min_fit: int = MIN_FIT,
+    min_anchor_planes: int = 1,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
@@ -110,6 +111,10 @@ def monitor_probe(
         Minimum decoded coincidences fed to a pose fit.  In count-based mode it
         is the batch size; in time-window mode it is the per-window floor.
         Defaults to :data:`MIN_FIT`.
+    min_anchor_planes:
+        Minimum telescope planes with an unambiguous (single-candidate) hit for
+        a cluster to survive the ``no_anchor_plane`` gate.  ``0`` disables the
+        gate.  Defaults to ``1`` (matches :class:`~monrad.pose.PoseFitter`).
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -159,6 +164,7 @@ def monitor_probe(
         alignment=alignment,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        min_anchor_planes=min_anchor_planes,
     )
 
     if window_s is None:
@@ -313,6 +319,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"this count (stretching past --window-s if needed) (default: {MIN_FIT}).",
     )
     p.add_argument(
+        "--min-anchor-planes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Minimum telescope planes with an unambiguous hit for a cluster to "
+        "pass the no_anchor_plane gate.  0 disables the gate (default: 1).",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
@@ -350,6 +364,7 @@ def main(argv: list[str] | None = None) -> None:
         n_probe_ch=args.n_probe_ch,
         out_dir=args.out,
         min_fit=args.min_fit,
+        min_anchor_planes=args.min_anchor_planes,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
