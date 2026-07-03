@@ -28,6 +28,7 @@ study (``monrad-resolution``).  The propagation uses
 
 import argparse
 import csv
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,10 +44,38 @@ from .io import (
     stream_coincidences,
 )
 
+logger = logging.getLogger(__name__)
+
 # Default minimum decoded coincidences fed to a pose fit — the same floor the
 # streaming PoseFitter applies, so monitored fits never diverge from it.  Used
 # both as the count-based batch size and as the time-window floor.
 MIN_FIT = PoseFitter.MIN_FIT
+
+
+def _window_resid_rms(pose: PoseResult) -> float:
+    """Combined absolute-mm residual RMS over *all* coincidences fed to the fit.
+
+    The honest window-quality signal.  ``pose.residuals_x/y`` cover only the
+    inliers kept after the fit's Mahalanobis ``d>4`` cut, so a window
+    contaminated by wide-angle "wild" telescope tracks looks clean there — the
+    cut rejects the wild tracks, and the surviving good core has a normal RMS.
+    The contamination shows up only when the *rejected* tracks are counted back
+    in: their raw residual against the fitted pose is large.  This recomputes
+    the residual of every inlier **and** outlier against the fitted pose
+    (matching :func:`~monrad.pose.optimize._weighted_residuals`, without the
+    per-point normalisation), so a burst of wild tracks lifts the RMS even
+    though it evaded the outlier cut in the reported inlier residuals.
+    """
+    coincs = pose.inliers + pose.outliers
+    if not coincs:
+        return math.inf
+    c, s = math.cos(pose.theta), math.sin(pose.theta)
+    sq = 0.0
+    for co in coincs:
+        rx = (co.a_x + co.b_x * pose.z_p) - (pose.t_x + co.u * c - co.v * s)
+        ry = (co.a_y + co.b_y * pose.z_p) - (pose.t_y + co.u * s + co.v * c)
+        sq += rx * rx + ry * ry
+    return math.sqrt(sq / len(coincs))
 
 
 @dataclass
@@ -64,6 +93,8 @@ class WindowResult:
     sigma_zp: float
     theta: float
     sigma_theta: float
+    resid_rms: float  # combined absolute-mm residual RMS over all coincidences
+    # fed to the fit (inliers + Mahalanobis-cut outliers); see _window_resid_rms
     pose: PoseResult = field(repr=False)
 
 
@@ -77,6 +108,7 @@ def monitor_probe(
     out_dir: Path | None = None,
     min_fit: int = MIN_FIT,
     min_anchor_planes: int = 1,
+    max_resid_rms_mm: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
@@ -115,6 +147,19 @@ def monitor_probe(
         Minimum telescope planes with an unambiguous (single-candidate) hit for
         a cluster to survive the ``no_anchor_plane`` gate.  ``0`` disables the
         gate.  Defaults to ``1`` (matches :class:`~monrad.pose.PoseFitter`).
+    max_resid_rms_mm:
+        Window quality gate.  When given, a window whose ``resid_rms`` (the
+        combined absolute-mm residual RMS over *all* coincidences fed to the
+        fit; see :func:`_window_resid_rms`) exceeds this value is flagged,
+        logged, and **dropped** (not emitted).  This catches windows
+        contaminated by an excess of wide-angle "wild" telescope tracks.  Note
+        the RMS is dominated by the ever-present wild-track baseline the fit
+        correctly ignores, so its absolute scale is large and setup-dependent
+        (~150 mm in the testLab data, with a contaminated window near ~280 mm) —
+        tune the threshold per setup from the whole-run RMS distribution printed
+        at the end of a run, not from a universal constant.  ``None`` (the
+        default) disables the gate; ``resid_rms`` is recorded on every emitted
+        window regardless.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -136,6 +181,26 @@ def monitor_probe(
         if len(coincs) < min_fit:
             return
         pose = fit_probe_pose(coincs, z_corr, alignment)
+
+        # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
+        # honest window-quality signal.  The inlier-only residuals the fit
+        # reports look clean even for a contaminated window, because the
+        # Mahalanobis cut rejects the wild tracks; counting the rejected tracks
+        # back in is what exposes the contamination (see _window_resid_rms).
+        rms = _window_resid_rms(pose)
+
+        if max_resid_rms_mm is not None and rms > max_resid_rms_mm:
+            logger.warning(
+                "Dropping window %s–%s: residual RMS %.1f mm > %.1f mm "
+                "(n_inliers=%d) — likely wide-angle track contamination.",
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                rms,
+                max_resid_rms_mm,
+                pose.n_inliers,
+            )
+            return
+
         cov_c = centre_cov_2x2(pose.cov, pose.theta, n_probe_ch)
         results.append(
             WindowResult(
@@ -150,6 +215,7 @@ def monitor_probe(
                 sigma_zp=math.sqrt(abs(pose.cov[3, 3])),
                 theta=pose.theta,
                 sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
+                resid_rms=rms,
                 pose=pose,
             )
         )
@@ -194,6 +260,15 @@ def monitor_probe(
                 win_coincs = []
                 win_start_ns = None
 
+    # Whole-run residual-RMS distribution — helps set --max-resid-rms per setup.
+    if results:
+        rms_vals = np.array([r.resid_rms for r in results])
+        print(
+            f"Residual RMS over {len(results)} window(s): "
+            f"min={rms_vals.min():.1f}  median={np.median(rms_vals):.1f}  "
+            f"max={rms_vals.max():.1f} mm"
+        )
+
     if out_dir is not None:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -224,6 +299,7 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                 "sigma_zp",
                 "theta",
                 "sigma_theta",
+                "resid_rms",
             ]
         )
         for r in results:
@@ -240,6 +316,7 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                     f"{r.sigma_zp:.6g}",
                     f"{r.theta:.6g}",
                     f"{r.sigma_theta:.6g}",
+                    f"{r.resid_rms:.6g}",
                 ]
             )
 
@@ -327,6 +404,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "pass the no_anchor_plane gate.  0 disables the gate (default: 1).",
     )
     p.add_argument(
+        "--max-resid-rms",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Window quality gate (mm).  Drop (and log) any window whose "
+        "all-coincidence residual RMS (the resid_rms column) exceeds this — "
+        "catches an excess of wide-angle 'wild' track contamination.  The RMS "
+        "scale is large and setup-dependent (typical windows ~150 mm in the "
+        "testLab data, a contaminated one ~280 mm); set the threshold from the "
+        "whole-run RMS distribution printed at the end of a run, not a fixed "
+        "value.  Off by default.",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
@@ -365,6 +455,7 @@ def main(argv: list[str] | None = None) -> None:
         out_dir=args.out,
         min_fit=args.min_fit,
         min_anchor_planes=args.min_anchor_planes,
+        max_resid_rms_mm=args.max_resid_rms,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
@@ -377,6 +468,7 @@ def main(argv: list[str] | None = None) -> None:
             f"  t_x={r.t_x:.1f}±{r.sigma_tx:.2f}"
             f"  t_y={r.t_y:.1f}±{r.sigma_ty:.2f}"
             f"  z_p={r.z_p:.1f}±{r.sigma_zp:.2f} mm"
+            f"  rms={r.resid_rms:.1f}"
         )
 
 

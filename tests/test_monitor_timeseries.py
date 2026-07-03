@@ -256,6 +256,114 @@ def test_hybrid_min_fit_above_total_yields_no_windows(count_run):
     assert results == []
 
 
+# ── Residual-RMS window gate tests ───────────────────────────────────────────
+
+
+def test_resid_rms_populated(count_run):
+    """Every emitted window carries a finite, positive resid_rms (gate off)."""
+    results, _, _ = count_run
+    assert results
+    for r in results:
+        assert math.isfinite(r.resid_rms) and r.resid_rms > 0
+
+
+def test_gate_high_threshold_keeps_all(count_run):
+    """A threshold above the whole run's RMS drops nothing (== gate off)."""
+    _, _, info = count_run
+    gated = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        min_fit=30,
+        max_resid_rms_mm=1000.0,
+        make_plots=False,
+    )
+    ungated = _run_hybrid(info, window_s=None, min_fit=30)
+    assert len(gated) == len(ungated)
+
+
+def test_gate_drops_high_rms_keeps_low(count_run):
+    """A threshold inside the run's RMS spread drops the high-RMS windows only.
+
+    The clean synthetic windows span a modest RMS range; a mid-range cut is a
+    faithful stand-in for the contaminated-vs-clean split the gate exists for:
+    every emitted window sits at or below the threshold, and at least one window
+    is dropped.
+    """
+    results, _, info = count_run
+    rms_vals = sorted(r.resid_rms for r in results)
+    # A threshold between the min and max clean RMS: some pass, some are cut.
+    thresh = (rms_vals[0] + rms_vals[-1]) / 2.0
+    gated = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        min_fit=30,
+        max_resid_rms_mm=thresh,
+        make_plots=False,
+    )
+    assert 0 < len(gated) < len(results), "gate should drop some but not all"
+    for r in gated:
+        assert r.resid_rms <= thresh
+
+
+def test_gate_drops_all_below_min(count_run):
+    """A threshold below the lowest window RMS drops every window."""
+    results, _, info = count_run
+    min_rms = min(r.resid_rms for r in results)
+    gated = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        min_fit=30,
+        max_resid_rms_mm=min_rms * 0.5,
+        make_plots=False,
+    )
+    assert gated == []
+
+
+def test_gate_logs_warning_on_drop(count_run, caplog):
+    """Dropped windows emit a warning naming the window and its RMS."""
+    results, _, info = count_run
+    min_rms = min(r.resid_rms for r in results)
+    with caplog.at_level("WARNING", logger="monrad.monitor.timeseries"):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            min_fit=30,
+            max_resid_rms_mm=min_rms * 0.5,
+            make_plots=False,
+        )
+    assert any("residual RMS" in rec.message for rec in caplog.records)
+
+
+def test_gate_csv_has_resid_rms_column(count_run, tmp_path):
+    """The CSV carries a resid_rms column with a numeric value per window."""
+    _, _, info = count_run
+    out = tmp_path / "gate_csv"
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        min_fit=30,
+        out_dir=out,
+        make_plots=False,
+    )
+    lines = (out / "pose_timeseries.csv").read_text().splitlines()
+    header = lines[0].split(",")
+    assert "resid_rms" in header
+    col = header.index("resid_rms")
+    assert len(lines) == len(results) + 1
+    for line in lines[1:]:
+        assert math.isfinite(float(line.split(",")[col]))
+
+
 # ── centre_cov_2x2 unit tests ─────────────────────────────────────────────────
 
 
