@@ -109,6 +109,7 @@ def monitor_probe(
     min_fit: int = MIN_FIT,
     min_anchor_planes: int = 1,
     max_resid_rms_mm: float | None = None,
+    max_abs_resid_mm: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
@@ -160,6 +161,14 @@ def monitor_probe(
         at the end of a run, not from a universal constant.  ``None`` (the
         default) disables the gate; ``resid_rms`` is recorded on every emitted
         window regardless.
+    max_abs_resid_mm:
+        Opt-in absolute-mm residual cut passed through to
+        :func:`~monrad.pose.fit_probe_pose` (see there).  Unlike
+        ``max_resid_rms_mm`` — which *drops the whole window* — this rejects the
+        individual wide-angle "wild" coincidences *inside* the fit and refits on
+        the survivors, recovering the good core rather than discarding the
+        window.  The recovery path when the probe is far and good coincidences
+        are scarce.  ``None`` (the default) ⇒ Mahalanobis-only, no change.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -180,7 +189,9 @@ def monitor_probe(
     ) -> None:
         if len(coincs) < min_fit:
             return
-        pose = fit_probe_pose(coincs, z_corr, alignment)
+        pose = fit_probe_pose(
+            coincs, z_corr, alignment, max_abs_resid_mm=max_abs_resid_mm
+        )
 
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
         # honest window-quality signal.  The inlier-only residuals the fit
@@ -417,6 +428,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "value.  Off by default.",
     )
     p.add_argument(
+        "--max-abs-resid",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Opt-in absolute-mm residual cut applied INSIDE each window's pose "
+        "fit (on top of the Mahalanobis cut): reject any coincidence whose "
+        "combined residual magnitude exceeds this and refit on the survivors. "
+        "Unlike --max-resid-rms (which drops the whole window), this recovers "
+        "the good core of a window contaminated by wide-angle 'wild' tracks — "
+        "the far-probe recovery path. Tune per setup. Off by default.",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
@@ -456,6 +479,7 @@ def main(argv: list[str] | None = None) -> None:
         min_fit=args.min_fit,
         min_anchor_planes=args.min_anchor_planes,
         max_resid_rms_mm=args.max_resid_rms,
+        max_abs_resid_mm=args.max_abs_resid,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,

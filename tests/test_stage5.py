@@ -896,3 +896,138 @@ class TestDecodeReport:
         assert r.reason == "ambiguous_cluster"
         assert r.cand_counts is None
         assert r.chi2 is None
+
+
+# ── opt-in absolute-mm residual cut ─────────────────────────────────────────
+
+
+class TestAbsResidCut:
+    """The opt-in ``max_abs_resid_mm`` third robust stage in fit_probe_pose.
+
+    Complements the Mahalanobis cut: wide-angle "wild" telescope tracks have an
+    inflated σ_tel(z_p) (large var_b·z_p²), so their Mahalanobis distance stays
+    small and they survive the d>4 cut while still pulling z_p off.  An absolute
+    cut on the combined residual magnitude catches exactly those.
+    """
+
+    _ABS_ZP = 840.0  # far probe — z_p is the soft direction (DESIGN §8.6)
+
+    def _core(self, n, seed):
+        """Clean coincidences at the known pose (small telescope σ)."""
+        rng = np.random.default_rng(seed)
+        c, s = math.cos(_TRUE_THETA), math.sin(_TRUE_THETA)
+        coincs = []
+        for _ in range(n):
+            ax, bx = rng.uniform(100, 800), rng.uniform(-0.15, 0.15)
+            ay, by = rng.uniform(100, 800), rng.uniform(-0.15, 0.15)
+            xp = ax + bx * self._ABS_ZP
+            yp = ay + by * self._ABS_ZP
+            u = (xp - _TRUE_TX) * c + (yp - _TRUE_TY) * s
+            v = -(xp - _TRUE_TX) * s + (yp - _TRUE_TY) * c
+            u += rng.normal(0, _SIGMA_STRIP)
+            v += rng.normal(0, _SIGMA_STRIP)
+            cov = (_SIGMA_STRIP**2, 0.0, _SIGMA_STRIP**2 / 1e4)
+            coincs.append(
+                Coincidence(ax, bx, ay, by, cov, cov, u, v, _SIGMA_STRIP, _SIGMA_STRIP)
+            )
+        return coincs
+
+    def _wild(self, n, seed, offset_mm=60.0):
+        """Wide-angle tracks: large slope + inflated var_b (so they clear the
+        Mahalanobis cut) with the probe hit displaced far (large abs residual)."""
+        rng = np.random.default_rng(seed)
+        c, s = math.cos(_TRUE_THETA), math.sin(_TRUE_THETA)
+        coincs = []
+        for _ in range(n):
+            ax, bx = rng.uniform(100, 800), rng.uniform(0.4, 0.7)
+            ay, by = rng.uniform(100, 800), rng.uniform(0.4, 0.7)
+            xp = ax + bx * self._ABS_ZP
+            yp = ay + by * self._ABS_ZP
+            u = (xp - _TRUE_TX) * c + (yp - _TRUE_TY) * s
+            v = -(xp - _TRUE_TX) * s + (yp - _TRUE_TY) * c
+            u += offset_mm
+            v += offset_mm
+            big = (_SIGMA_STRIP**2, 0.0, 0.15**2)  # inflated var_b → large σ_tel
+            coincs.append(
+                Coincidence(ax, bx, ay, by, big, big, u, v, _SIGMA_STRIP, _SIGMA_STRIP)
+            )
+        return coincs
+
+    def _maha(self, co, pr):
+        c, s = math.cos(pr.theta), math.sin(pr.theta)
+        xm = pr.t_x + co.u * c - co.v * s
+        ym = pr.t_y + co.u * s + co.v * c
+        xp = co.a_x + co.b_x * pr.z_p
+        yp = co.a_y + co.b_y * pr.z_p
+        vx = max(co.sigma_prb_x**2 + _sigma_tel_at_z(co.cov_ab_x, pr.z_p), 1e-12)
+        vy = max(co.sigma_prb_y**2 + _sigma_tel_at_z(co.cov_ab_y, pr.z_p), 1e-12)
+        return math.sqrt((xm - xp) ** 2 / vx + (ym - yp) ** 2 / vy)
+
+    def test_none_is_noop(self):
+        """max_abs_resid_mm=None reproduces the Mahalanobis-only result exactly."""
+        coincs = self._core(120, 1) + self._wild(30, 2)
+        base = fit_probe_pose(coincs, Z_TEL, AlignmentCorrection.identity())
+        same = fit_probe_pose(
+            coincs, Z_TEL, AlignmentCorrection.identity(), max_abs_resid_mm=None
+        )
+        assert same.t_x == base.t_x
+        assert same.t_y == base.t_y
+        assert same.theta == base.theta
+        assert same.z_p == base.z_p
+        assert same.n_inliers == base.n_inliers
+        assert np.array_equal(same.cov, base.cov, equal_nan=True)
+        assert np.array_equal(same.residuals_x, base.residuals_x)
+        assert np.array_equal(same.residuals_y, base.residuals_y)
+
+    def test_no_over_trim_on_clean_window(self):
+        """A clean window with a reasonable threshold trims nothing and leaves
+        z_p / n_inliers untouched — the default path must not be perturbed."""
+        coincs = self._core(120, 5)
+        ident = AlignmentCorrection.identity()
+        ungated = fit_probe_pose(coincs, Z_TEL, ident)
+        gated = fit_probe_pose(coincs, Z_TEL, ident, max_abs_resid_mm=20.0)
+        assert gated.n_inliers == ungated.n_inliers
+        assert abs(gated.z_p - ungated.z_p) < 1e-6
+
+    def test_wild_tracks_survive_mahalanobis(self):
+        """Document the failure mode: every wild track clears the d>4 cut, so
+        the Mahalanobis-only fit keeps them all and z_p lands biased high."""
+        core = self._core(120, 1)
+        wild = self._wild(30, 2)
+        ident = AlignmentCorrection.identity()
+        pr = fit_probe_pose(core + wild, Z_TEL, ident)
+        survivors = sum(1 for co in wild if self._maha(co, pr) <= 4.0)
+        assert survivors == len(wild)  # none rejected by Mahalanobis
+        clean = fit_probe_pose(core, Z_TEL, ident)
+        # The surviving wild tracks pull z_p well away from the clean value.
+        assert pr.z_p - clean.z_p > 15.0
+
+    def test_recovery_from_wild_contamination(self):
+        """The abs-mm cut removes the Mahalanobis-surviving wild tracks and
+        recovers z_p to the clean value, with σ_zp only mildly inflated."""
+        core = self._core(120, 1)
+        wild = self._wild(30, 2)
+        ident = AlignmentCorrection.identity()
+        clean = fit_probe_pose(core, Z_TEL, ident)
+        ungated = fit_probe_pose(core + wild, Z_TEL, ident)
+        gated = fit_probe_pose(core + wild, Z_TEL, ident, max_abs_resid_mm=20.0)
+
+        # z_p pulled back from the contaminated value toward the clean core.
+        assert abs(gated.z_p - clean.z_p) < abs(ungated.z_p - clean.z_p)
+        assert abs(gated.z_p - clean.z_p) < 2.0
+        # The wild tracks are gone from the inliers and land in outliers.
+        assert gated.n_inliers == len(core)
+        assert len(gated.outliers) >= len(wild)
+        # σ_zp inflated only mildly by dropping the (down-weighted) wild tracks.
+        sig_ungated = math.sqrt(abs(ungated.cov[3, 3]))
+        sig_gated = math.sqrt(abs(gated.cov[3, 3]))
+        assert sig_gated < 1.5 * sig_ungated
+
+    def test_tight_threshold_falls_back(self):
+        """A threshold so tight that <3 would survive is a no-op (keeps the
+        Mahalanobis inliers) rather than breaching the 3-coincidence floor."""
+        coincs = self._core(120, 5)
+        ident = AlignmentCorrection.identity()
+        ungated = fit_probe_pose(coincs, Z_TEL, ident)
+        gated = fit_probe_pose(coincs, Z_TEL, ident, max_abs_resid_mm=1e-6)
+        assert gated.n_inliers == ungated.n_inliers  # fell back, no crash

@@ -109,3 +109,44 @@ from data.
   to make the pose fit ignore the wild tracks, not to track a probe move.
 - **Absolute-time anchoring**: stream from run start; do not front-slice the file
   list to restrict the interval.
+
+## Execution outcome (2026-07-06)
+
+**Shipped.** `max_abs_resid_mm` implemented as the third robust stage in
+`fit_probe_pose` (bounded ≤3-pass loop, guards as designed), threaded through
+`PoseFitter`, `scripts/run_pipeline.py` (`--max-abs-resid`), and
+`monrad-monitor` (`--max-abs-resid`). `monitor/resolution.py` left at default.
+Tests added: `TestAbsResidCut` (no-op, no-over-trim, wild-survives-Mahalanobis,
+recovery, tight-threshold fallback) in `tests/test_stage5.py`, plus two
+plumb-through tests in `tests/test_monitor_timeseries.py`. Full synthetic
+suites (`test_stage5`, `test_corner_probe_edge_cases`, `test_monitor_timeseries`
+minus real-data) pass; Ruff clean.
+
+**Synthetic recovery is strong and clean:** 30 wild wide-angle tracks all
+survive the Mahalanobis cut and pull z_p 843.9→875.6; the abs cut removes all
+30 and recovers z_p to 843.9 with σ_zp only ~1.14× inflated.
+
+**Real-data repro (testLab 20210723, `--z-tel 0 -1340 -670`, 30-min windows,
+DEFAULT anchor gate `min_anchor_planes=1`, not 0 — the 0 run is ~25 min/config
+and was abandoned as too slow for a verify step):** the anomaly windows are
+17:08–17:38 (z_p=874.9, rms=300), 18:08–18:38 (859.3, rms=254), 18:38–19:09
+(863.5, rms=156), vs ~835–845 baseline elsewhere.
+  - Shipped `--max-resid-rms 220`: **drops** 17:08 and 18:08 entirely (rms>220);
+    18:38 survives unchanged at 863.5.
+  - New `--max-abs-resid 20`: **keeps all windows**, pulls z_p down only modestly
+    (874.9→868.6, 859.3→852.4, 863.5→857.8), trimming ~5–20 coincidences/window.
+  - `--max-abs-resid 40`: essentially no effect (17:08 unchanged at 874.9).
+
+**Key real-data caveat / open item:** on this anomaly the Mahalanobis cut has
+*already* moved the large-residual wild tracks to outliers (that's why the
+all-coincidence rms is ~300 while the surviving inliers have modest residuals),
+so the abs cut — which only sees the Mahalanobis inliers — has little left to
+remove at 20–40 mm and the z_p pullback is partial. A **tighter** threshold
+(<20 mm) would pull harder but risks the good core (inlier-only RMS ~14 mm; see
+[[testlab-20210723-anomalous-window-telescope-side]]). The feature behaves
+exactly as designed (opt-in, recovers rather than drops, never drops a window),
+but the testLab anomaly is not dramatically fixed at the investigation's 20 mm;
+tuning per setup is required. The **optional tuning aid** (monitor printing the
+per-window abs-residual distribution, like the RMS distribution) was *not*
+implemented and is now clearly worth doing to pick the mm from data — recommended
+next step.

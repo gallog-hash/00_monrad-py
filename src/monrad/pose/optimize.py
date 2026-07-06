@@ -3,7 +3,8 @@ Stage 5 (part) — the probe pose optimizer.
 
 fit_probe_pose(coincidences, tel_z, alignment) -> PoseResult
     Implements DESIGN.md §8.4 four-step optimizer plus the Mahalanobis outlier
-    cut and stratified-half consistency test.
+    cut and stratified-half consistency test, with an opt-in absolute-mm
+    residual cut layered after the Mahalanobis refit.
 """
 
 import math
@@ -246,6 +247,8 @@ def fit_probe_pose(
     coincidences: list[Coincidence],
     tel_z: np.ndarray,
     alignment: AlignmentCorrection,
+    *,
+    max_abs_resid_mm: float | None = None,
 ) -> PoseResult:
     """
     Four-step probe pose optimizer.  Implements DESIGN.md §8.4.
@@ -257,6 +260,8 @@ def fit_probe_pose(
               with full σ²(z_p) weights.
 
     After step 4: Mahalanobis outlier cut at d > 4, one-pass refit.
+    When ``max_abs_resid_mm`` is given, a further absolute-mm residual cut
+    runs on top of the Mahalanobis inliers (see below).
 
     Parameters
     ----------
@@ -264,6 +269,19 @@ def fit_probe_pose(
     tel_z        : telescope plane z-coordinates (mm), shape (3,)
     alignment    : applied before building coincidences in PoseFitter;
                    carried here for API completeness
+    max_abs_resid_mm :
+        Opt-in absolute-mm residual rejection layered *after* the Mahalanobis
+        cut + refit.  ``None`` (default) ⇒ byte-for-byte the Mahalanobis-only
+        behaviour.  When set, any inlier whose combined residual magnitude
+        ``hypot(r_x, r_y)`` against the current pose exceeds this value is
+        rejected and the pose refit on the survivors, repeated for up to three
+        passes (early-stopping once the surviving set stabilises).  This
+        complements the Mahalanobis cut: wide-angle "wild" telescope tracks
+        have an inflated σ_tel(z_p) (large ``var_b·z_p²``), so their Mahalanobis
+        distance stays small and they survive the ``d>4`` cut while still
+        pulling the pose off — an absolute-mm cut catches exactly those.  There
+        is no universal mm; tune per setup (same philosophy as the
+        ``--max-resid-rms`` window gate).
     """
     coincs = coincidences
     if len(coincs) < 3:
@@ -355,6 +373,49 @@ def fit_probe_pose(
             cov = np.linalg.inv(JtJ2)
         except np.linalg.LinAlgError:
             cov = np.full((4, 4), np.nan)
+
+    # ── Absolute-mm residual cut (opt-in) ─────────────────────────
+    # A third robust stage, layered on top of the Mahalanobis inliers.  Wide-
+    # angle "wild" telescope tracks have an inflated σ_tel(z_p) (large
+    # var_b·z_p²), so their Mahalanobis distance stays small and they survive
+    # the d>4 cut while still pulling the pose off.  An absolute cut on the
+    # combined residual magnitude catches exactly those.  Cut against the best
+    # available (post-Mahalanobis-refit) pose, refit on the survivors, and
+    # repeat: in a contaminated window the reference pose starts landed-wrong,
+    # so one pass may not surface every wild track.  Bounded to three passes
+    # and deterministic; early-stops once the surviving set stabilises.  Only
+    # applied when it removes something AND ≥3 survive, so it never drops below
+    # the 3-coincidence floor and is a no-op on a clean window.
+    if max_abs_resid_mm is not None:
+        for _ in range(3):
+            c_a, s_a = math.cos(theta_lm), math.sin(theta_lm)
+            keep: list[Coincidence] = []
+            drop: list[Coincidence] = []
+            for co in inliers:
+                rx = (tx_lm + co.u * c_a - co.v * s_a) - (co.a_x + co.b_x * zp_lm)
+                ry = (ty_lm + co.u * s_a + co.v * c_a) - (co.a_y + co.b_y * zp_lm)
+                if math.hypot(rx, ry) <= max_abs_resid_mm:
+                    keep.append(co)
+                else:
+                    drop.append(co)
+            if not drop or len(keep) < 3:
+                break  # nothing to remove, or would breach the 3-coinc floor
+            inliers = keep
+            outliers = outliers + drop
+            n_inliers = len(inliers)
+            x0_abs = np.array([tx_lm, ty_lm, theta_lm, zp_lm])
+            opt3 = least_squares(
+                _weighted_residuals,
+                x0_abs,
+                args=(inliers,),
+                method="lm",
+            )
+            tx_lm, ty_lm, theta_lm, zp_lm = opt3.x
+            JtJ3 = opt3.jac.T @ opt3.jac
+            try:
+                cov = np.linalg.inv(JtJ3)
+            except np.linalg.LinAlgError:
+                cov = np.full((4, 4), np.nan)
 
     # ── Final residuals ───────────────────────────────────────────
     c_f, s_f = math.cos(theta_lm), math.sin(theta_lm)
