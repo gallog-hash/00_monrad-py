@@ -4,19 +4,28 @@ Console script ``monrad-monitor``.  Streams an acquisition and emits one
 probe pose per batch, tracking the probe's position over time with
 per-batch uncertainty.
 
-Two batching modes, both driven by ``min_fit`` (the minimum decoded
-coincidences fed to :func:`~monrad.pose.fit_probe_pose`):
+Two batching modes, both driven by ``min_fit`` — the minimum number of
+coincidences *surviving the configured geometric gates* fed to
+:func:`~monrad.pose.fit_probe_pose`:
 
 * **Count-based (default, ``window_s`` omitted).**  Buffer decoded
-  :class:`~monrad.pose.Coincidence` objects until exactly ``min_fit`` are
-  collected, fit once, emit a :class:`WindowResult`, then reset.  Each point
-  is an independent fit over ``min_fit`` coincidences; the trailing remainder
-  (``< min_fit``) is dropped.  The batch timestamps come from the first and
-  last coincidence in the batch.
+  :class:`~monrad.pose.Coincidence` objects until at least ``min_fit`` are
+  collected, fit once, emit a :class:`WindowResult`, then reset.  The batch
+  timestamps come from the first and last coincidence in the batch.
 * **Hybrid (``window_s`` given).**  Each window grows until it spans at least
   ``window_s`` seconds *and* holds at least ``min_fit`` coincidences, whichever
-  bound takes longer; a sparse window stretches past ``window_s`` to reach the
-  count.  Batch timestamps are the first and last coincidence in the window.
+  bound takes longer.  Batch timestamps are the first and last coincidence in
+  the window.
+
+In both modes, once the raw batch reaches ``min_fit`` (and, in hybrid mode,
+spans ``window_s``), the configured geometric gates (``max_rigidity_resid_mm``,
+``max_off_probe_mm``) run against it.  A gate only ever removes coincidences,
+so a raw batch sized to exactly ``min_fit`` can drop below the floor after
+gating; when that happens the batch keeps growing — pulling in more raw
+coincidences and re-gating — until the *survivor* count clears ``min_fit``.
+If the raw batch grows past ``RAW_CAP_MULTIPLIER * min_fit`` coincidences
+without enough survivors, the window is abandoned as contaminated and
+dropped; the trailing remainder at end-of-stream is dropped the same way.
 
 Only the open batch is ever buffered in RAM.
 
@@ -57,6 +66,12 @@ logger = logging.getLogger(__name__)
 # streaming PoseFitter applies, so monitored fits never diverge from it.  Used
 # both as the count-based batch size and as the time-window floor.
 MIN_FIT = PoseFitter.MIN_FIT
+
+# A raw batch that still hasn't cleared min_fit survivors after growing to
+# this many multiples of min_fit is treated as contaminated and dropped,
+# rather than growing indefinitely chasing a floor a bad stretch will never
+# reach.
+RAW_CAP_MULTIPLIER = 5
 
 
 def _window_resid_rms(pose: PoseResult) -> float:
@@ -123,9 +138,9 @@ def monitor_probe(
 ) -> list[WindowResult]:
     """Stream an acquisition and fit the probe pose in successive batches.
 
-    Emits one :class:`WindowResult` per batch of at least ``min_fit`` decoded
-    coincidences.  Only the open batch is buffered — RAM usage is bounded to
-    roughly ``min_fit`` coincidences.
+    Emits one :class:`WindowResult` per batch of at least ``min_fit``
+    gate-surviving coincidences.  Only the open batch is buffered — RAM usage
+    is bounded to roughly ``RAW_CAP_MULTIPLIER * min_fit`` coincidences.
 
     Parameters
     ----------
@@ -133,12 +148,13 @@ def monitor_probe(
         Acquisition directories for the telescope and probe.
     window_s:
         Window duration in seconds.  When ``None`` (the default), batches are
-        count-based: each batch holds exactly ``min_fit`` coincidences and its
-        timestamps come from the first and last coincidence.  When given, the
-        mode is hybrid: each window grows until it spans at least ``window_s``
-        seconds *and* holds at least ``min_fit`` coincidences (whichever bound
-        takes longer), so a sparse window stretches past ``window_s`` to reach
-        the count.
+        count-based: the timestamps come from the first and last coincidence
+        in the batch.  When given, the mode is hybrid: each window grows
+        until it spans at least ``window_s`` seconds *and* holds at least
+        ``min_fit`` gate-surviving coincidences, whichever bound takes
+        longer.  In both modes a raw batch that hasn't yet cleared
+        ``min_fit`` survivors keeps growing past its nominal size — see
+        ``min_fit`` below.
     z_tel:
         Telescope plane z-positions (mm).
     n_probe_ch:
@@ -148,9 +164,17 @@ def monitor_probe(
         If given, write ``pose_timeseries.csv`` and (when ``make_plots``)
         ``pose_timeseries.png`` here.
     min_fit:
-        Minimum decoded coincidences fed to a pose fit.  In count-based mode it
-        is the batch size; in time-window mode it is the per-window floor.
-        Defaults to :data:`MIN_FIT`.
+        Minimum coincidences *surviving the configured geometric gates*
+        required to fit a window.  The raw batch is first filled to
+        ``min_fit`` (count-based mode) or to ``window_s`` and ``min_fit``
+        (hybrid mode), then gated.  A gate only ever removes coincidences, so
+        if survivors fall short, the raw batch keeps growing — pulling in one
+        more raw coincidence and re-gating — until survivors clear
+        ``min_fit`` or the raw batch reaches ``RAW_CAP_MULTIPLIER * min_fit``,
+        at which point the window is dropped as contaminated (see
+        :data:`RAW_CAP_MULTIPLIER`).  Without a gate, gating is a no-op and
+        this reduces to the original fixed-size batching.  Defaults to
+        :data:`MIN_FIT`.
     min_anchor_planes:
         Minimum telescope planes with an unambiguous (single-candidate) hit for
         a cluster to survive the ``no_anchor_plane`` gate.  ``0`` disables the
@@ -167,10 +191,14 @@ def monitor_probe(
         ``mean(z_corr)`` is NOT used, since the rigidity residual scales with
         ``|z_ref - z_p|`` and the telescope-stack mean can sit over 1000 mm
         from a probe far off-stack, e.g. the testLab setup).  Can drop a
-        window down to 0 survivors when none of its coincidences are genuine
-        (the ``min_fit`` check below then skips it) — this is intentional;
-        the gate does not preserve a floor.  ``None`` (the default) disables
-        the gate.
+        window down to 0 survivors when none of its coincidences are genuine,
+        in which case the raw batch keeps growing until it hits
+        ``RAW_CAP_MULTIPLIER * min_fit`` and is dropped — this is intentional;
+        the gate does not preserve a floor.  Note this re-runs the cold-start
+        bootstrap fit on every growth step until the very first window closes
+        (``prev_pose`` is still ``None``), which is the one place this can get
+        noticeably slower than before.  ``None`` (the default) disables the
+        gate.
     max_off_probe_mm:
         Pre-fit geometric gate (see :func:`~monrad.pose.filter_off_probe`),
         applied after the rigidity gate.  Extrapolates each track to the
@@ -196,13 +224,15 @@ def monitor_probe(
     results: list[WindowResult] = []
     prev_pose: PoseResult | None = None
 
-    def _emit(
+    def _run_gates(
         coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
-    ) -> None:
-        nonlocal prev_pose
-        if len(coincs) < min_fit:
-            return
+    ) -> list[Coincidence]:
+        """Apply the configured geometric gates once; return the survivors.
 
+        Read-only w.r.t. ``prev_pose`` — callers decide whether/when to
+        actually commit a fit from the result, so this can be called
+        repeatedly on a growing raw batch without side effects.
+        """
         working = coincs
         if max_rigidity_resid_mm is not None:
             if prev_pose is not None:
@@ -246,18 +276,12 @@ def monitor_probe(
                     len(dropped_fp),
                     n_before,
                 )
+        return working
 
-        if len(working) < min_fit:
-            logger.warning(
-                "Dropping window %s–%s: only %d coincidence(s) survive the "
-                "geometric gates (< min_fit=%d).",
-                utc_start.isoformat(),
-                utc_end.isoformat(),
-                len(working),
-                min_fit,
-            )
-            return
-
+    def _fit_and_record(
+        working: list[Coincidence], utc_start: datetime, utc_end: datetime
+    ) -> None:
+        nonlocal prev_pose
         pose = fit_probe_pose(working, z_corr, alignment)
 
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
@@ -300,32 +324,49 @@ def monitor_probe(
         min_anchor_planes=min_anchor_planes,
     )
 
-    if window_s is None:
-        # Count-based: a fresh fit every ``min_fit`` coincidences.  The trailing
-        # remainder (< min_fit) is dropped by construction.
-        batch: list[Coincidence] = []
-        for co in stream:
-            batch.append(co)
-            if len(batch) >= min_fit:
-                _emit(batch, _utc(batch[0].t_ns), _utc(batch[-1].t_ns))
-                batch = []
-    else:
-        # Hybrid: each window spans at least ``window_s`` seconds AND holds at
-        # least ``min_fit`` coincidences — whichever bound takes longer.  The
-        # window opens at its first coincidence and closes on the first one that
-        # satisfies both bounds; the trailing remainder is dropped.
-        window_ns = int(window_s * 1e9)
-        win_coincs: list[Coincidence] = []
-        win_start_ns: int | None = None
-        for co in stream:
-            if win_start_ns is None:
-                win_start_ns = co.t_ns
-            win_coincs.append(co)
-            spanned = co.t_ns - win_start_ns >= window_ns
-            if spanned and len(win_coincs) >= min_fit:
-                _emit(win_coincs, _utc(win_start_ns), _utc(co.t_ns))
-                win_coincs = []
-                win_start_ns = None
+    # A geometric gate only ever removes coincidences, so a raw batch sized to
+    # exactly min_fit can never yield >= min_fit survivors unless the gate
+    # happens to drop nothing. Grow the raw batch past its nominal size,
+    # re-gating on every new coincidence, until the *survivor* count clears
+    # min_fit or the raw batch reaches RAW_CAP_MULTIPLIER * min_fit, at which
+    # point the window is abandoned as contaminated. Without a gate, _run_gates
+    # is a no-op and this reduces to the original fixed-size batching (first
+    # check point == min_fit raw coincidences, always passes, same as before).
+    window_ns = None if window_s is None else int(window_s * 1e9)
+    raw_cap = min_fit * RAW_CAP_MULTIPLIER
+    batch: list[Coincidence] = []
+    win_start_ns: int | None = None
+    for co in stream:
+        if win_start_ns is None:
+            win_start_ns = co.t_ns
+        batch.append(co)
+
+        spanned = window_ns is None or (co.t_ns - win_start_ns >= window_ns)
+        if not spanned or len(batch) < min_fit:
+            continue
+
+        utc_start, utc_end = _utc(win_start_ns), _utc(co.t_ns)
+        working = _run_gates(batch, utc_start, utc_end)
+        if len(working) >= min_fit:
+            _fit_and_record(working, utc_start, utc_end)
+            batch = []
+            win_start_ns = None
+        elif len(batch) >= raw_cap:
+            logger.warning(
+                "Dropping window %s–%s: only %d/%d raw coincidence(s) survive "
+                "the geometric gates after reaching the %dx raw cap "
+                "(< min_fit=%d).",
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                len(working),
+                len(batch),
+                RAW_CAP_MULTIPLIER,
+                min_fit,
+            )
+            batch = []
+            win_start_ns = None
+        # else: not enough survivors yet — keep growing the raw batch and
+        # re-gate on the next coincidence.
 
     # Whole-run residual-RMS distribution — a diagnostic of window quality.
     if results:
@@ -458,9 +499,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=MIN_FIT,
         metavar="N",
-        help="Minimum coincidences fed to a pose fit.  Without --window-s this "
-        "is the count-based batch size; with --window-s each window must reach "
-        f"this count (stretching past --window-s if needed) (default: {MIN_FIT}).",
+        help="Minimum coincidences, after any geometric gates, fed to a pose "
+        "fit.  The raw batch grows past this count (and past --window-s, if "
+        "given) whenever a gate strips it below the floor, up to "
+        f"{RAW_CAP_MULTIPLIER}x --min-fit raw coincidences before the window "
+        f"is dropped as contaminated (default: {MIN_FIT}).",
     )
     p.add_argument(
         "--min-anchor-planes",

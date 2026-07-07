@@ -406,3 +406,52 @@ def test_real_csv_written(real_run):
 def test_real_plot_written(real_run):
     _, out = real_run
     assert (out / "pose_timeseries.png").exists()
+
+
+# ── Real-data: geometric gate + count-based min_fit interaction ──────────────
+
+
+@pytest.fixture(scope="module")
+def real_gated_run(tmp_path_factory):
+    """Count-based mode with a lossy rigidity gate active.
+
+    Regression for the raw-batch-growth fix: a raw batch sized to exactly
+    ``min_fit`` can never clear ``min_fit`` survivors once a gate removes even
+    one coincidence, so prior to the fix this exact combination (mirrors a
+    real repro on this dataset) produced zero windows over the whole
+    acquisition.
+    """
+    out = tmp_path_factory.mktemp("ts_real_gated_out")
+    results = monitor_probe(
+        _TEL_DIR,
+        _PRB_DIR,
+        window_s=None,
+        z_tel=np.array(_Z_TEL_REAL, dtype=float),
+        n_probe_ch=40,
+        min_fit=100,
+        max_rigidity_resid_mm=100.0,
+        out_dir=out,
+        make_plots=False,
+    )
+    return results, out
+
+
+@pytest.mark.skipif(not _TEL_DIR.exists(), reason="testlab data not available")
+def test_real_gated_count_based_produces_windows(real_gated_run):
+    results, _ = real_gated_run
+    assert len(results) >= 1
+
+
+@pytest.mark.skipif(not _TEL_DIR.exists(), reason="testlab data not available")
+def test_real_gated_window_times_ordered(real_gated_run):
+    results, _ = real_gated_run
+    for i in range(1, len(results)):
+        assert results[i].utc_start >= results[i - 1].utc_end
+
+
+@pytest.mark.skipif(not _TEL_DIR.exists(), reason="testlab data not available")
+def test_real_gated_sufficient_inliers(real_gated_run):
+    # Mahalanobis cut can reduce inliers below min_fit; 3 is the optimizer minimum.
+    results, _ = real_gated_run
+    for r in results:
+        assert r.n_inliers >= 3
