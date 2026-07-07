@@ -178,18 +178,6 @@ def _parse_args() -> argparse.Namespace:
         "can fabricate tracks); 3 demands every plane already resolved.",
     )
     p.add_argument(
-        "--max-abs-resid",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Opt-in absolute-mm residual cut in the stage-5 pose fit. Any "
-        "coincidence whose combined residual magnitude hypot(r_x, r_y) against "
-        "the fitted pose exceeds this (mm) is rejected and the pose refit, on "
-        "top of the Mahalanobis cut. Catches wide-angle 'wild' telescope tracks "
-        "that evade the Mahalanobis cut (inflated sigma keeps their distance "
-        "small). Tune per setup. Off by default.",
-    )
-    p.add_argument(
         "--plot",
         action="store_true",
         default=False,
@@ -589,7 +577,6 @@ def main() -> None:
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
-        max_abs_resid_mm=args.max_abs_resid,
         on_decode=_on_decode,
     )
 

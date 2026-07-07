@@ -364,51 +364,6 @@ def test_gate_csv_has_resid_rms_column(count_run, tmp_path):
         assert math.isfinite(float(line.split(",")[col]))
 
 
-# ── absolute-mm residual cut plumb-through ────────────────────────────────────
-
-
-def test_abs_resid_high_threshold_is_noop(count_run):
-    """A threshold above the run's residual scale changes nothing — same
-    windows and same per-window z_p as the ungated fit."""
-    results, _, info = count_run
-    gated = monitor_probe(
-        info["tel_dir"],
-        info["probe_dir"],
-        window_s=None,
-        z_tel=np.array(Z_TEL, dtype=float),
-        min_fit=30,
-        max_abs_resid_mm=1000.0,
-        make_plots=False,
-    )
-    assert len(gated) == len(results)
-    for g, r in zip(gated, results):
-        assert g.n_inliers == r.n_inliers
-        assert g.z_p == pytest.approx(r.z_p)
-
-
-def test_abs_resid_tight_threshold_trims_without_dropping_windows(count_run):
-    """The flag reaches fit_probe_pose and applies inside each window: a tight
-    threshold trims inliers (recovery) yet never drops a window — unlike the RMS
-    gate, which drops whole windows."""
-    results, _, info = count_run
-    gated = monitor_probe(
-        info["tel_dir"],
-        info["probe_dir"],
-        window_s=None,
-        z_tel=np.array(Z_TEL, dtype=float),
-        min_fit=30,
-        max_abs_resid_mm=10.0,
-        make_plots=False,
-    )
-    # No window is dropped — the abs cut recovers the core rather than discarding.
-    assert len(gated) == len(results)
-    # But it did fire: fewer total inliers than the ungated run.
-    assert sum(g.n_inliers for g in gated) < sum(r.n_inliers for r in results)
-    # And it never breaches the 3-coincidence optimizer floor.
-    for g in gated:
-        assert g.n_inliers >= 3
-
-
 # ── centre_cov_2x2 unit tests ─────────────────────────────────────────────────
 
 

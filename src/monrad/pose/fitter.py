@@ -47,7 +47,6 @@ class PoseFitter:
         tot_thresh: int = 1,
         tot_weights: bool = False,
         min_anchor_planes: int = 1,
-        max_abs_resid_mm: float | None = None,
         on_decode: Callable[[DecodeReport], None] | None = None,
     ) -> None:
         if not 0 <= min_anchor_planes <= N_TEL_PLANES:
@@ -71,9 +70,6 @@ class PoseFitter:
         # tracks, far heavier compute, and pile-up can fabricate a low-χ²
         # track); N_TEL_PLANES requires every plane already resolved.
         self.min_anchor_planes = min_anchor_planes
-        # Opt-in absolute-mm residual cut applied inside fit_probe_pose, on top
-        # of its Mahalanobis cut (see fit_probe_pose).  None ⇒ Mahalanobis-only.
-        self.max_abs_resid_mm = max_abs_resid_mm
         self.on_decode = on_decode
         self._coincs: list[Coincidence] = []
         self._since_last = 0
@@ -290,7 +286,6 @@ class PoseFitter:
             self._coincs,
             self.alignment.corrected_z_tel(self.tel_z),
             self.alignment,
-            max_abs_resid_mm=self.max_abs_resid_mm,
         )
         self._since_last = 0
         self.result = result
