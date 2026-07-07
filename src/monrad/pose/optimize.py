@@ -17,6 +17,7 @@ from ..alignment import AlignmentCorrection
 from .types import Coincidence, PoseResult
 
 _MAHAL_CUT = 4.0  # Mahalanobis distance outlier threshold — DESIGN.md §8.4
+_MIN_COINCS = 3  # floor fit_probe_pose requires; pre-filters never cut below it
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -238,6 +239,103 @@ def _weighted_residuals(
         res[2 * i] = (x_meas - x_pred) / math.sqrt(max(var_x, 1e-12))
         res[2 * i + 1] = (y_meas - y_pred) / math.sqrt(max(var_y, 1e-12))
     return res
+
+
+# ── Pre-fit geometric gates ──────────────────────────────────────────────
+#
+# Both gates reject coincidences *before* fit_probe_pose sees them, targeting
+# cross-particle telescope tracks that time-match a probe hit but land
+# geometrically inconsistent with it (docs/handoffs/
+# 2026-07-07-off-probe-track-gate-strategy.md).  Neither rejects on track
+# slope |b| — a steep-but-consistent track keeps its z_p leverage.
+
+
+def filter_rigidity(
+    coincs: list[Coincidence],
+    z_ref: float,
+    max_resid_mm: float,
+) -> tuple[list[Coincidence], list[Coincidence]]:
+    """Drop coincidences whose track-vs-probe pairwise distances are inconsistent.
+
+    Probe hits (u, v) and track projections (X, Y) = (a_x + b_x·z_ref,
+    a_y + b_y·z_ref) are the same physical points related by a rigid
+    transform, which preserves pairwise distances.  For each coincidence i,
+    score it by the median over all other coincidences j of
+    ``|D_track(i,j) - D_probe(i,j)|``.  A genuine track scores ~0; a
+    cross-particle track that landed far from its time-matched probe hit
+    scores large regardless of which other coincidence it is paired with.
+
+    Relative (O(N^2) pairwise), not absolute — needs >= 3 coincidences to
+    vote: with fewer, a bad pair doesn't say which of the two is wrong, so
+    this is a no-op (returns everything as kept) when ``len(coincs) < 3``.
+    Above that floor, every coincidence whose score exceeds ``max_resid_mm``
+    is dropped, including down to 0 survivors in a fully-contaminated window
+    — callers that need >= 3 coincidences for a downstream fit (e.g.
+    :func:`fit_probe_pose`) must check the *kept* count themselves; this
+    function does not preserve one.
+
+    Returns (kept, dropped).
+    """
+    n = len(coincs)
+    if n < _MIN_COINCS:
+        return list(coincs), []
+
+    x = np.array([co.a_x + co.b_x * z_ref for co in coincs])
+    y = np.array([co.a_y + co.b_y * z_ref for co in coincs])
+    u = np.array([co.u for co in coincs])
+    v = np.array([co.v for co in coincs])
+
+    d_track = np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :])
+    d_probe = np.hypot(u[:, None] - u[None, :], v[:, None] - v[None, :])
+    resid = np.abs(d_track - d_probe)
+    np.fill_diagonal(resid, np.nan)
+    score = np.nanmedian(resid, axis=1)
+
+    mask = score <= max_resid_mm
+    kept = [co for co, m in zip(coincs, mask) if m]
+    dropped = [co for co, m in zip(coincs, mask) if not m]
+    return kept, dropped
+
+
+def filter_off_probe(
+    coincs: list[Coincidence],
+    ref_pose: PoseResult,
+    probe_size_mm: float,
+    max_off_probe_mm: float,
+) -> tuple[list[Coincidence], list[Coincidence]]:
+    """Drop coincidences whose track projects off the probe's physical footprint.
+
+    Extrapolates each track to ``ref_pose.z_p`` and maps it into probe-frame
+    coordinates via the inverse of the pose's rigid transform; rejects
+    coincidences landing more than ``max_off_probe_mm`` outside the
+    ``[0, probe_size_mm]^2`` footprint.  ``ref_pose`` is the previous accepted
+    window's pose (the probe moves slowly) — the caller skips this gate on the
+    first window, when no reference pose exists yet.
+
+    Every coincidence landing outside the tolerance is dropped, including
+    down to 0 survivors in a window with no genuine on-probe tracks left;
+    callers that need >= 3 coincidences for a downstream fit (e.g.
+    :func:`fit_probe_pose`) must check the *kept* count themselves.
+
+    Returns (kept, dropped).
+    """
+    c, s = math.cos(ref_pose.theta), math.sin(ref_pose.theta)
+    kept: list[Coincidence] = []
+    dropped: list[Coincidence] = []
+    for co in coincs:
+        x = co.a_x + co.b_x * ref_pose.z_p
+        y = co.a_y + co.b_y * ref_pose.z_p
+        dx, dy = x - ref_pose.t_x, y - ref_pose.t_y
+        u_pred = c * dx + s * dy
+        v_pred = -s * dx + c * dy
+        off_u = max(-u_pred, u_pred - probe_size_mm, 0.0)
+        off_v = max(-v_pred, v_pred - probe_size_mm, 0.0)
+        if math.hypot(off_u, off_v) <= max_off_probe_mm:
+            kept.append(co)
+        else:
+            dropped.append(co)
+
+    return kept, dropped
 
 
 # ── Main fit function ─────────────────────────────────────────────────────

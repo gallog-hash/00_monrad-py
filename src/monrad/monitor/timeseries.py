@@ -36,7 +36,14 @@ from pathlib import Path
 
 import numpy as np
 
-from ..pose import Coincidence, PoseFitter, PoseResult, fit_probe_pose
+from ..pose import (
+    Coincidence,
+    PoseFitter,
+    PoseResult,
+    filter_off_probe,
+    filter_rigidity,
+    fit_probe_pose,
+)
 from .io import (
     centre_cov_2x2,
     fit_alignment,
@@ -110,6 +117,8 @@ def monitor_probe(
     min_anchor_planes: int = 1,
     max_resid_rms_mm: float | None = None,
     max_abs_resid_mm: float | None = None,
+    max_rigidity_resid_mm: float | None = None,
+    max_off_probe_mm: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
@@ -169,6 +178,30 @@ def monitor_probe(
         the survivors, recovering the good core rather than discarding the
         window.  The recovery path when the probe is far and good coincidences
         are scarce.  ``None`` (the default) ⇒ Mahalanobis-only, no change.
+    max_rigidity_resid_mm:
+        Pre-fit geometric gate (see :func:`~monrad.pose.filter_rigidity`),
+        applied to a window's coincidences *before* ``fit_probe_pose``.  Probe
+        hits and track projections are the same physical points related by a
+        rigid transform, which preserves pairwise distances; a cross-particle
+        telescope track that time-matched an unrelated probe hit violates this
+        invariant and is dropped.  Pose-free — needs only ``z_ref`` (the
+        previous accepted window's ``z_p``; for the first window, an ungated
+        ``fit_probe_pose`` bootstrap on the window's own coincidences —
+        ``mean(z_corr)`` is NOT used, since the rigidity residual scales with
+        ``|z_ref - z_p|`` and the telescope-stack mean can sit over 1000 mm
+        from a probe far off-stack, e.g. the testLab setup).  Can drop a
+        window down to 0 survivors when none of its coincidences are genuine
+        (the ``min_fit`` check below then skips it) — this is intentional;
+        the gate does not preserve a floor.  ``None`` (the default) disables
+        the gate.
+    max_off_probe_mm:
+        Pre-fit geometric gate (see :func:`~monrad.pose.filter_off_probe`),
+        applied after the rigidity gate.  Extrapolates each track to the
+        *previous accepted window's* pose and drops it if it lands more than
+        this far outside the probe's physical footprint
+        (``n_probe_ch * 10`` mm on a side).  Skipped on the first window (no
+        reference pose yet).  Like the rigidity gate, can drop a window to 0
+        survivors.  ``None`` (the default) disables the gate.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -181,16 +214,75 @@ def monitor_probe(
         tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
     )
     z_corr = alignment.corrected_z_tel(z_tel)
+    probe_size_mm = n_probe_ch * 10.0
 
     results: list[WindowResult] = []
+    prev_pose: PoseResult | None = None
 
     def _emit(
         coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
     ) -> None:
+        nonlocal prev_pose
         if len(coincs) < min_fit:
             return
+
+        working = coincs
+        if max_rigidity_resid_mm is not None:
+            if prev_pose is not None:
+                z_ref = prev_pose.z_p
+            else:
+                # Cold start: no previous accepted pose to anchor z_ref. The
+                # rigidity residual scales with |z_ref - z_p|, so a probe far
+                # from the telescope stack's mean z (~1500 mm in the testLab
+                # setup: mean(z_corr)=-670 vs true z_p=+840) makes mean(z_corr)
+                # useless and would flag every genuine coincidence, dropping
+                # window 0 entirely and permanently starving prev_pose (it
+                # never updates from None, so every later window inherits the
+                # same bad z_ref). Bootstrap a quick ungated fit on this
+                # window's own coincidences instead — its z_p is a much better
+                # anchor even though the window may itself be contaminated.
+                z_ref = fit_probe_pose(working, z_corr, alignment).z_p
+            working, dropped_rigid = filter_rigidity(
+                working, z_ref, max_rigidity_resid_mm
+            )
+            if dropped_rigid:
+                logger.info(
+                    "Window %s–%s: rigidity gate dropped %d/%d coincidence(s) "
+                    "(z_ref=%.1f mm).",
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(dropped_rigid),
+                    len(coincs),
+                    z_ref,
+                )
+
+        if max_off_probe_mm is not None and prev_pose is not None:
+            n_before = len(working)
+            working, dropped_fp = filter_off_probe(
+                working, prev_pose, probe_size_mm, max_off_probe_mm
+            )
+            if dropped_fp:
+                logger.info(
+                    "Window %s–%s: footprint gate dropped %d/%d coincidence(s).",
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(dropped_fp),
+                    n_before,
+                )
+
+        if len(working) < min_fit:
+            logger.warning(
+                "Dropping window %s–%s: only %d coincidence(s) survive the "
+                "geometric gates (< min_fit=%d).",
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                len(working),
+                min_fit,
+            )
+            return
+
         pose = fit_probe_pose(
-            coincs, z_corr, alignment, max_abs_resid_mm=max_abs_resid_mm
+            working, z_corr, alignment, max_abs_resid_mm=max_abs_resid_mm
         )
 
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
@@ -230,6 +322,7 @@ def monitor_probe(
                 pose=pose,
             )
         )
+        prev_pose = pose
 
     def _utc(t_ns: float) -> datetime:
         return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
@@ -440,6 +533,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the far-probe recovery path. Tune per setup. Off by default.",
     )
     p.add_argument(
+        "--max-rigidity-resid-mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Pre-fit geometric gate (mm).  Drop coincidences whose track-vs-"
+        "probe pairwise distances are inconsistent with a rigid transform — "
+        "catches cross-particle wide-angle tracks that time-matched an "
+        "unrelated probe hit, before they reach the pose fit.  Pose-free "
+        "(z_ref = previous accepted window's z_p, or mean(z_corr) for the "
+        "first window); tune from the whole-run pairwise-residual "
+        "distribution. Off by default.",
+    )
+    p.add_argument(
+        "--max-off-probe-mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Pre-fit geometric gate (mm), applied after --max-rigidity-resid-"
+        "mm.  Extrapolate each track to the previous accepted window's pose "
+        "and drop it if it lands more than this far outside the probe's "
+        "physical footprint.  Skipped on the first window (no reference pose "
+        "yet). Off by default.",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
@@ -480,6 +597,8 @@ def main(argv: list[str] | None = None) -> None:
         min_anchor_planes=args.min_anchor_planes,
         max_resid_rms_mm=args.max_resid_rms,
         max_abs_resid_mm=args.max_abs_resid,
+        max_rigidity_resid_mm=args.max_rigidity_resid_mm,
+        max_off_probe_mm=args.max_off_probe_mm,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
