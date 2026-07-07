@@ -115,7 +115,6 @@ def monitor_probe(
     out_dir: Path | None = None,
     min_fit: int = MIN_FIT,
     min_anchor_planes: int = 1,
-    max_resid_rms_mm: float | None = None,
     max_rigidity_resid_mm: float | None = None,
     max_off_probe_mm: float | None = None,
     tot_thresh: int = 1,
@@ -156,19 +155,6 @@ def monitor_probe(
         Minimum telescope planes with an unambiguous (single-candidate) hit for
         a cluster to survive the ``no_anchor_plane`` gate.  ``0`` disables the
         gate.  Defaults to ``1`` (matches :class:`~monrad.pose.PoseFitter`).
-    max_resid_rms_mm:
-        Window quality gate.  When given, a window whose ``resid_rms`` (the
-        combined absolute-mm residual RMS over *all* coincidences fed to the
-        fit; see :func:`_window_resid_rms`) exceeds this value is flagged,
-        logged, and **dropped** (not emitted).  This catches windows
-        contaminated by an excess of wide-angle "wild" telescope tracks.  Note
-        the RMS is dominated by the ever-present wild-track baseline the fit
-        correctly ignores, so its absolute scale is large and setup-dependent
-        (~150 mm in the testLab data, with a contaminated window near ~280 mm) —
-        tune the threshold per setup from the whole-run RMS distribution printed
-        at the end of a run, not from a universal constant.  ``None`` (the
-        default) disables the gate; ``resid_rms`` is recorded on every emitted
-        window regardless.
     max_rigidity_resid_mm:
         Pre-fit geometric gate (see :func:`~monrad.pose.filter_rigidity`),
         applied to a window's coincidences *before* ``fit_probe_pose``.  Probe
@@ -281,18 +267,6 @@ def monitor_probe(
         # back in is what exposes the contamination (see _window_resid_rms).
         rms = _window_resid_rms(pose)
 
-        if max_resid_rms_mm is not None and rms > max_resid_rms_mm:
-            logger.warning(
-                "Dropping window %s–%s: residual RMS %.1f mm > %.1f mm "
-                "(n_inliers=%d) — likely wide-angle track contamination.",
-                utc_start.isoformat(),
-                utc_end.isoformat(),
-                rms,
-                max_resid_rms_mm,
-                pose.n_inliers,
-            )
-            return
-
         cov_c = centre_cov_2x2(pose.cov, pose.theta, n_probe_ch)
         results.append(
             WindowResult(
@@ -353,7 +327,7 @@ def monitor_probe(
                 win_coincs = []
                 win_start_ns = None
 
-    # Whole-run residual-RMS distribution — helps set --max-resid-rms per setup.
+    # Whole-run residual-RMS distribution — a diagnostic of window quality.
     if results:
         rms_vals = np.array([r.resid_rms for r in results])
         print(
@@ -497,19 +471,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "pass the no_anchor_plane gate.  0 disables the gate (default: 1).",
     )
     p.add_argument(
-        "--max-resid-rms",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Window quality gate (mm).  Drop (and log) any window whose "
-        "all-coincidence residual RMS (the resid_rms column) exceeds this — "
-        "catches an excess of wide-angle 'wild' track contamination.  The RMS "
-        "scale is large and setup-dependent (typical windows ~150 mm in the "
-        "testLab data, a contaminated one ~280 mm); set the threshold from the "
-        "whole-run RMS distribution printed at the end of a run, not a fixed "
-        "value.  Off by default.",
-    )
-    p.add_argument(
         "--max-rigidity-resid-mm",
         type=float,
         default=None,
@@ -572,7 +533,6 @@ def main(argv: list[str] | None = None) -> None:
         out_dir=args.out,
         min_fit=args.min_fit,
         min_anchor_planes=args.min_anchor_planes,
-        max_resid_rms_mm=args.max_resid_rms,
         max_rigidity_resid_mm=args.max_rigidity_resid_mm,
         max_off_probe_mm=args.max_off_probe_mm,
         tot_thresh=args.tot_thresh,
