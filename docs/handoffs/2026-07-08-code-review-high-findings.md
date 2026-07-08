@@ -148,7 +148,7 @@ with bounded per-window scalars. Added
 which asserts no `WindowResult` field is typed `PoseResult` and every stored
 value is a plain scalar or datetime.
 
-### 5. [CONFIRMED] Cold-start rigidity gate reruns full O(n²)/O(n³) fit on every appended coincidence
+### 5. [FIXED] Cold-start rigidity gate reruns full O(n²)/O(n³) fit on every appended coincidence
 **File:** `src/monrad/monitor/timeseries.py:251` (`_run_gates`, cold-start
 branch), docstring at `:196-200` (self-acknowledges the issue); `_run_gates`
 called from the batching loop at `:339-368`; `filter_rigidity` at
@@ -168,6 +168,23 @@ total work for one window. The code's own docstring already admits this is
 within the same cold-start window (only recompute periodically, or use a
 cheap closed-form estimator instead of the full nonlinear fit for this
 throwaway anchor value).
+**Fix applied (2026-07-08):** Added `COLD_START_REFIT_STRIDE = 10` and cached
+the cold-start bootstrap `z_ref` (`cold_start_z_ref`/`cold_start_n`, closed
+over by `_run_gates`) across growth steps, only recomputing the full
+`fit_probe_pose` bootstrap once the raw batch has grown by
+`COLD_START_REFIT_STRIDE` coincidences since the last recompute — an ~10x cut
+in bootstrap-fit calls during a contaminated first window, rather than one
+call per appended coincidence. The cache is reset whenever a window closes
+(committed fit or raw-cap contamination drop) so the next cold-start window
+bootstraps fresh. `filter_rigidity`'s own O(n²) pairwise rebuild is
+unchanged — it's driven by the batch size, not a caching problem, and still
+runs once per growth step. Updated the `max_rigidity_resid_mm` docstring,
+which had documented the old O(raw_cap) behavior as a known slow path. Added
+`test_cold_start_bootstrap_fit_is_throttled` (`tests/test_monitor_timeseries.py`),
+which forces worst-case growth via an unsatisfiable `max_rigidity_resid_mm=0.0`
+and asserts the recorded `fit_probe_pose` call sizes within each growth
+stretch are at least `COLD_START_REFIT_STRIDE` apart, rather than one call
+per append.
 
 ### 6. [CONFIRMED] `rng.choice` crash on small population (diagnostic script)
 **File:** `scripts/diagnostics/wide_block_inspect.py:30`

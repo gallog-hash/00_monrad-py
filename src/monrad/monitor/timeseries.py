@@ -74,6 +74,14 @@ MIN_FIT = PoseFitter.MIN_FIT
 # reach.
 RAW_CAP_MULTIPLIER = 5
 
+# During cold start (no prev_pose yet), the rigidity gate's z_ref anchor is
+# bootstrapped from a full fit_probe_pose call on the growing raw batch (see
+# _run_gates). That's a throwaway anchor, not the committed pose, so refitting
+# it on every single newly-appended coincidence is wasted work — it's instead
+# cached and only refreshed once the raw batch has grown by this many
+# coincidences since the last recompute.
+COLD_START_REFIT_STRIDE = 10
+
 
 def _window_resid_rms(pose: PoseResult) -> float:
     """Combined absolute-mm residual RMS over *all* coincidences fed to the fit.
@@ -194,10 +202,11 @@ def monitor_probe(
         window down to 0 survivors when none of its coincidences are genuine,
         in which case the raw batch keeps growing until it hits
         ``RAW_CAP_MULTIPLIER * min_fit`` and is dropped — this is intentional;
-        the gate does not preserve a floor.  Note this re-runs the cold-start
-        bootstrap fit on every growth step until the very first window closes
-        (``prev_pose`` is still ``None``), which is the one place this can get
-        noticeably slower than before.  ``None`` (the default) disables the
+        the gate does not preserve a floor.  During cold start (``prev_pose``
+        still ``None``), the bootstrap fit is a throwaway anchor, not the
+        committed pose, so it's cached across growth steps and only
+        recomputed every :data:`COLD_START_REFIT_STRIDE` raw coincidences
+        rather than on every single one.  ``None`` (the default) disables the
         gate.
     max_off_probe_mm:
         Pre-fit geometric gate (see :func:`~monrad.pose.filter_off_probe`),
@@ -223,6 +232,8 @@ def monitor_probe(
 
     results: list[WindowResult] = []
     prev_pose: PoseResult | None = None
+    cold_start_z_ref: float | None = None
+    cold_start_n = 0
 
     def _run_gates(
         coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
@@ -233,6 +244,7 @@ def monitor_probe(
         actually commit a fit from the result, so this can be called
         repeatedly on a growing raw batch without side effects.
         """
+        nonlocal cold_start_z_ref, cold_start_n
         working = coincs
         if max_rigidity_resid_mm is not None:
             if prev_pose is not None:
@@ -248,7 +260,18 @@ def monitor_probe(
                 # same bad z_ref). Bootstrap a quick ungated fit on this
                 # window's own coincidences instead — its z_p is a much better
                 # anchor even though the window may itself be contaminated.
-                z_ref = fit_probe_pose(working, z_corr, alignment).z_p
+                # It's a throwaway anchor, not the committed pose, so the
+                # (expensive, four-step) bootstrap fit is cached and only
+                # recomputed every COLD_START_REFIT_STRIDE raw coincidences
+                # rather than on every single growth step (see the module
+                # docstring for the cost this avoids).
+                if (
+                    cold_start_z_ref is None
+                    or len(coincs) - cold_start_n >= COLD_START_REFIT_STRIDE
+                ):
+                    cold_start_z_ref = fit_probe_pose(working, z_corr, alignment).z_p
+                    cold_start_n = len(coincs)
+                z_ref = cold_start_z_ref
             working, dropped_rigid = filter_rigidity(
                 working, z_ref, max_rigidity_resid_mm
             )
@@ -350,6 +373,8 @@ def monitor_probe(
             _fit_and_record(working, utc_start, utc_end)
             batch = []
             win_start_ns = None
+            cold_start_z_ref = None
+            cold_start_n = 0
         elif len(batch) >= raw_cap:
             logger.warning(
                 "Dropping window %s–%s: only %d/%d raw coincidence(s) survive "
@@ -364,6 +389,8 @@ def monitor_probe(
             )
             batch = []
             win_start_ns = None
+            cold_start_z_ref = None
+            cold_start_n = 0
         # else: not enough survivors yet — keep growing the raw batch and
         # re-gate on the next coincidence.
 

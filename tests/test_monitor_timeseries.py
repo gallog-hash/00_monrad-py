@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from monrad.monitor import timeseries as timeseries_mod
 from monrad.monitor.io import centre_cov_2x2
 from monrad.monitor.timeseries import WindowResult, _parse_args, monitor_probe
 from monrad.pose import _MIN_COINCS
@@ -508,3 +509,72 @@ def test_real_gated_sufficient_inliers(real_gated_run):
     results, _ = real_gated_run
     for r in results:
         assert r.n_inliers >= 3
+
+
+# ── Cold-start rigidity-gate bootstrap: throttled, not re-run every step ─────
+
+
+def test_cold_start_bootstrap_fit_is_throttled(tmp_path, monkeypatch):
+    """The rigidity gate's cold-start z_ref anchor is cached, not refit on
+    every appended coincidence.
+
+    Regression for the O(raw_cap) cold-start bootstrap-fit fan-out: before the
+    fix, every single coincidence appended while growing a raw batch past
+    ``min_fit`` (chasing gate survivors, with ``prev_pose`` still ``None``)
+    triggered a full ``fit_probe_pose`` call just to get a throwaway z_ref
+    anchor. An impossibly strict ``max_rigidity_resid_mm`` (drops everything)
+    forces every window in this run to keep growing — the worst case for that
+    fan-out — so the sequence of raw batch sizes at which fit_probe_pose was
+    actually called directly reveals whether caching is in effect: with
+    caching, consecutive calls within the same growth stretch must be at least
+    COLD_START_REFIT_STRIDE coincidences apart, rather than one per append.
+    """
+    min_fit = 5
+    stride = timeseries_mod.COLD_START_REFIT_STRIDE
+
+    src = tmp_path / "src"
+    info = generate(src, n_tracks=150, seed=7)
+
+    real_fit_probe_pose = timeseries_mod.fit_probe_pose
+    call_sizes = []
+
+    def _counting_fit_probe_pose(coincs, *args, **kwargs):
+        call_sizes.append(len(coincs))
+        return real_fit_probe_pose(coincs, *args, **kwargs)
+
+    monkeypatch.setattr(timeseries_mod, "fit_probe_pose", _counting_fit_probe_pose)
+
+    monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=None,
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=30,
+        min_fit=min_fit,
+        max_rigidity_resid_mm=0.0,  # drops every coincidence: worst-case growth
+        make_plots=False,
+    )
+
+    assert call_sizes, "expected the cold-start bootstrap fit to run at least once"
+
+    # Split the recorded call sizes into growth stretches: each stretch is one
+    # contaminated window's raw batch growing from min_fit upward: a batch
+    # reset (committed fit, raw-cap drop, or end-of-stream) starts a new
+    # stretch, visible as the next recorded size dropping back to ~min_fit.
+    stretches: list[list[int]] = []
+    for size in call_sizes:
+        if stretches and size > stretches[-1][-1]:
+            stretches[-1].append(size)
+        else:
+            stretches.append([size])
+
+    for stretch in stretches:
+        assert stretch[0] == min_fit, (
+            f"expected each growth stretch's first bootstrap call at "
+            f"min_fit={min_fit} raw coincidences, got {stretch[0]}"
+        )
+        for prev, nxt in zip(stretch, stretch[1:]):
+            assert nxt - prev >= stride, (
+                f"cold-start bootstrap refit at {prev} -> {nxt} raw "
+                f"coincidences, only {nxt - prev} apart (< stride={stride})"
+            )
