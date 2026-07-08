@@ -39,7 +39,7 @@ import argparse
 import csv
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -118,7 +118,6 @@ class WindowResult:
     sigma_theta: float
     resid_rms: float  # combined absolute-mm residual RMS over all coincidences
     # fed to the fit (inliers + Mahalanobis-cut outliers); see _window_resid_rms
-    pose: PoseResult = field(repr=False)
 
 
 def monitor_probe(
@@ -307,7 +306,6 @@ def monitor_probe(
                 theta=pose.theta,
                 sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
                 resid_rms=rms,
-                pose=pose,
             )
         )
         prev_pose = pose

@@ -116,7 +116,7 @@ warning. Added `test_trailing_batch_logs_warning`
 never-closing trailing batch) and asserts a "trailing window" warning is
 captured via `caplog`.
 
-### 4. [CONFIRMED] `monitor_probe` retains full `PoseResult` per closed window, unbounded RAM growth
+### 4. [FIXED] `monitor_probe` retains full `PoseResult` per closed window, unbounded RAM growth
 **File:** `src/monrad/monitor/timeseries.py:295` (append into `results`),
 `:224` (`results` init), `:388` (return); `WindowResult` fields at
 `:103-120` (esp. `pose: PoseResult` at `:120`); `PoseResult` definition at
@@ -135,6 +135,18 @@ bounded-RAM design and the project's streaming-architecture invariant.
 t_x, t_y, z_p, theta, sigmas, resid_rms) and drop `inliers`/`outliers`
 before appending, or turn `monitor_probe` into a generator so callers can
 choose whether to retain history.
+**Fix applied (2026-07-08):** Removed the `pose: PoseResult` field from
+`WindowResult` (`src/monrad/monitor/timeseries.py`) — nothing outside its own
+construction ever read it, since all consumers (CSV writer, plotter, CLI
+summary, tests) already used the scalar fields duplicated alongside it.
+`_fit_and_record` no longer passes `pose=pose` into the stored result, so a
+window's `PoseResult` (and its `inliers`/`outliers` coincidence lists plus
+the `(360,2)` `chi2_curve`) is now garbage-collected once that window's
+scalars are extracted, leaving `results: list[WindowResult]` growing only
+with bounded per-window scalars. Added
+`test_window_result_holds_only_scalars` (`tests/test_monitor_timeseries.py`),
+which asserts no `WindowResult` field is typed `PoseResult` and every stored
+value is a plain scalar or datetime.
 
 ### 5. [CONFIRMED] Cold-start rigidity gate reruns full O(n²)/O(n³) fit on every appended coincidence
 **File:** `src/monrad/monitor/timeseries.py:251` (`_run_gates`, cold-start

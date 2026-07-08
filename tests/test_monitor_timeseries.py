@@ -8,6 +8,7 @@ Two tiers:
   real data).
 """
 
+import dataclasses
 import math
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import numpy as np
 import pytest
 
 from monrad.monitor.io import centre_cov_2x2
-from monrad.monitor.timeseries import _parse_args, monitor_probe
+from monrad.monitor.timeseries import WindowResult, _parse_args, monitor_probe
 from monrad.pose import _MIN_COINCS
 from monrad.synthetic.generate import Z_TEL, generate
 
@@ -91,6 +92,22 @@ def test_synthetic_zp_within_5sigma(synth_run):
             f"window {i}: z_p={r.z_p:.2f} deviates >5σ from {Z_P_TRUE} "
             f"(σ_zp={r.sigma_zp:.3f})"
         )
+
+
+def test_window_result_holds_only_scalars(synth_run):
+    """WindowResult must not retain the full PoseResult (unbounded RAM growth).
+
+    Every field should be a plain scalar (int/float/datetime), never a
+    PoseResult or its inliers/outliers lists, so results accumulated over a
+    long run stay bounded regardless of window count.
+    """
+    results, _ = synth_run
+    assert results, "expected at least one window"
+    for f in dataclasses.fields(WindowResult):
+        assert f.type != "PoseResult", f"field {f.name} leaks a PoseResult"
+    for r in results:
+        for value in dataclasses.astuple(r):
+            assert isinstance(value, (int, float)) or hasattr(value, "isoformat")
 
 
 def test_synthetic_csv_rows(synth_run):
