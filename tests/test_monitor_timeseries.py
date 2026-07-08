@@ -209,6 +209,23 @@ def test_min_fit_above_total_yields_no_windows(count_run):
     assert results == []
 
 
+def test_trailing_batch_logs_warning(count_run, caplog):
+    """A non-empty trailing batch at end-of-stream is logged, not silently
+    dropped (mirrors the raw_cap-abandoned-window warning)."""
+    _, _, info = count_run
+    with caplog.at_level("WARNING", logger="monrad.monitor.timeseries"):
+        results = monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            min_fit=10_000_000,
+            make_plots=False,
+        )
+    assert results == []
+    assert any("trailing window" in rec.message for rec in caplog.records)
+
+
 def test_cli_min_fit_below_floor_rejected():
     """--min-fit under fit_probe_pose's hard minimum errors at parse time,
     not with an uncaught ValueError deep in the fit."""

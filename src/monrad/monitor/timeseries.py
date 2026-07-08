@@ -369,6 +369,17 @@ def monitor_probe(
         # else: not enough survivors yet — keep growing the raw batch and
         # re-gate on the next coincidence.
 
+    if batch:
+        utc_start, utc_end = _utc(win_start_ns), _utc(batch[-1].t_ns)
+        logger.warning(
+            "Dropping trailing window %s–%s: stream ended with only %d raw "
+            "coincidence(s), never reaching min_fit=%d survivors.",
+            utc_start.isoformat(),
+            utc_end.isoformat(),
+            len(batch),
+            min_fit,
+        )
+
     # Whole-run residual-RMS distribution — a diagnostic of window quality.
     if results:
         rms_vals = np.array([r.resid_rms for r in results])
