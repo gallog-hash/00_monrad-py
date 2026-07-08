@@ -117,7 +117,7 @@ _TEL_SIZE_MM = 99 * 10.0
 _PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe footprint
 
 
-def _parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="monrad pipeline smoke test")
     p.add_argument(
         "--telescope",
@@ -185,7 +185,20 @@ def _parse_args() -> argparse.Namespace:
         "probe plane, and the inlier tracks to <out>/pose_3d.html "
         "(requires plotly; no-op if stage 5 is skipped).",
     )
-    return p.parse_args()
+    return p
+
+
+def _parse_args() -> tuple[argparse.Namespace, set[str]]:
+    args = _build_parser().parse_args()
+
+    # Which flags did the user actually type, vs leave at their default?
+    # Re-parse the same argv with every default suppressed: a dest only
+    # survives into the resulting namespace if the user supplied it.
+    probe = _build_parser()
+    for action in probe._actions:
+        action.default = argparse.SUPPRESS
+    explicit = set(vars(probe.parse_args()).keys())
+    return args, explicit
 
 
 def _load_detector(d: Path, label: str) -> DetectorFiles:
@@ -397,7 +410,7 @@ def _plot_pose_3d(
 
 
 def main() -> None:
-    args = _parse_args()
+    args, explicit = _parse_args()
     tel_dir: Path = args.telescope
     prb_dir: Path = args.probe
     out_dir: Path = args.out
@@ -409,16 +422,26 @@ def main() -> None:
     lines: list[str] = []
 
     # ── Run configuration ────────────────────────────────────────────────
-    # Record the input data directories and the telescope plane
-    # z-coordinates used: the alignment and pose fits depend on them, and
-    # columns are not always stored in z order (the middle plane is
-    # argsort(z)[1], not necessarily column 1).
+    # Record every CLI parameter the run actually used — both the ones the
+    # user typed and the ones left at their default — tagged so a rerun can
+    # tell which is which; the alignment and pose fits are sensitive to all
+    # of them (e.g. columns are not always stored in z order: the middle
+    # plane is argsort(z)[1], not necessarily column 1).
+    def _tag(name: str) -> str:
+        return "(user-specified)" if name in explicit else "(default)"
+
     z_str = "  ".join(f"{zz:g}" for zz in args.z_tel)
     _emit(lines, "=== Run configuration ===")
-    _emit(lines, f"  Telescope data: {tel_dir}")
-    _emit(lines, f"  Probe data:     {prb_dir}")
-    _emit(lines, f"  Telescope plane z (mm): {z_str}")
-    _emit(lines, f"  Min anchor planes: {min_anchor_planes}")
+    _emit(lines, f"  Telescope data:     {tel_dir}  {_tag('telescope')}")
+    _emit(lines, f"  Probe data:         {prb_dir}  {_tag('probe')}")
+    _emit(lines, f"  Output dir:         {out_dir}  {_tag('out')}")
+    _emit(lines, f"  Telescope plane z (mm): {z_str}  {_tag('z_tel')}")
+    _emit(lines, f"  tot_thresh:         {tot_thresh}  {_tag('tot_thresh')}")
+    _emit(lines, f"  tot_weights:        {tot_weights}  {_tag('tot_weights')}")
+    _emit(
+        lines, f"  Min anchor planes:  {min_anchor_planes}  {_tag('min_anchor_planes')}"
+    )
+    _emit(lines, f"  plot:               {args.plot}  {_tag('plot')}")
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────

@@ -467,7 +467,7 @@ def _plot_timeseries(results: list[WindowResult], path: Path) -> None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="monrad-monitor",
         description="Probe pose monitoring over an acquisition.",
@@ -562,11 +562,58 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--tot-thresh", type=int, default=1)
     p.add_argument("--tot-weights", action="store_true")
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
-    return p.parse_args(argv)
+    return p
+
+
+def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[str]]:
+    args = _build_parser().parse_args(argv)
+
+    # Which flags did the user actually type, vs leave at their default?
+    # Re-parse the same argv with every default suppressed: a dest only
+    # survives into the resulting namespace if the user supplied it.
+    probe = _build_parser()
+    for action in probe._actions:
+        action.default = argparse.SUPPRESS
+    explicit = set(vars(probe.parse_args(argv)).keys())
+    return args, explicit
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = _parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args, explicit = _parse_args(argv)
+
+    def _tag(name: str) -> str:
+        return "(user-specified)" if name in explicit else "(default)"
+
+    logger.info("=== Run configuration ===")
+    logger.info("  Telescope data:      %s  %s", args.telescope, _tag("telescope"))
+    logger.info("  Probe data:          %s  %s", args.probe, _tag("probe"))
+    logger.info("  Output dir:          %s  %s", args.out, _tag("out"))
+    logger.info(
+        "  Telescope plane z (mm): %s  %s",
+        "  ".join(f"{z:g}" for z in args.z_tel),
+        _tag("z_tel"),
+    )
+    logger.info("  min_fit:             %s  %s", args.min_fit, _tag("min_fit"))
+    logger.info(
+        "  min_anchor_planes:   %s  %s",
+        args.min_anchor_planes,
+        _tag("min_anchor_planes"),
+    )
+    logger.info(
+        "  max_rigidity_resid_mm: %s  %s",
+        args.max_rigidity_resid_mm,
+        _tag("max_rigidity_resid_mm"),
+    )
+    logger.info(
+        "  max_off_probe_mm:    %s  %s", args.max_off_probe_mm, _tag("max_off_probe_mm")
+    )
+    logger.info("  window_s:            %s  %s", args.window_s, _tag("window_s"))
+    logger.info("  n_probe_ch:          %s  %s", args.n_probe_ch, _tag("n_probe_ch"))
+    logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
+    logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
+    logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
+
     results = monitor_probe(
         args.telescope,
         args.probe,
