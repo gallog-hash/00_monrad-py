@@ -108,6 +108,7 @@ def _fit_dz_and_tilt(
 def fit_telescope_alignment(
     hits: list[list[Hit]],
     z_tel: np.ndarray | None = None,
+    disambiguated: list[tuple[bool, bool, bool]] | None = None,
 ) -> AlignmentCorrection:
     """
     Fit telescope internal alignment from a batch of 3-plane hits.
@@ -130,6 +131,15 @@ def fit_telescope_alignment(
     ----------
     hits : list of N events; each event is a list of exactly 3 Hits
            (one per telescope plane in z order).
+    disambiguated : optional per-event (plane_0, plane_1, plane_2) flags,
+        same length as hits, marking which planes were recovered by
+        disambiguate_telescope_hits() rather than naturally golden/cluster.
+        A disambiguated plane k's position is manufactured from the same
+        two-plane (j1, j2) predictor used below to compute plane k's own
+        residual, which would otherwise bias that plane's fitted offset
+        toward zero.  Such events are excluded from plane k's own
+        residual sample (but still usable as j1/j2 predictor input for
+        other planes).  Defaults to "nothing was disambiguated".
     """
     n = len(hits)
     if n < 3:
@@ -139,6 +149,11 @@ def fit_telescope_alignment(
     x = np.array([[h[k].x_mm for k in range(3)] for h in hits], dtype=float)
     y = np.array([[h[k].y_mm for k in range(3)] for h in hits], dtype=float)
     z = z_tel if z_tel is not None else _Z_TEL
+    disamb = (
+        np.zeros((n, 3), dtype=bool)
+        if disambiguated is None
+        else np.array(disambiguated, dtype=bool)
+    )
 
     # ── Two-plane prediction ──────────────────────────────────────────
     # The geometric middle plane is the column with the median z, regardless
@@ -149,14 +164,26 @@ def fit_telescope_alignment(
     needs = False
 
     for k, (j1, j2) in enumerate(_OTHERS):
+        # Exclude events where plane k itself was disambiguated: its
+        # position was manufactured from this exact (j1, j2) predictor, so
+        # its own residual here would be artificially near zero.
+        keep = ~disamb[:, k]
+        xk, yk = x[keep, k], y[keep, k]
+        xj1, xj2 = x[keep, j1], x[keep, j2]
+        yj1, yj2 = y[keep, j1], y[keep, j2]
+
+        if xk.size == 0:
+            planes.append(PlaneCorrection(0.0, 0.0, 0.0))
+            continue
+
         # Interpolation / extrapolation fraction along z.
         t = (z[k] - z[j1]) / (z[j2] - z[j1])
 
-        x_pred = x[:, j1] + t * (x[:, j2] - x[:, j1])  # (N,)
-        y_pred = y[:, j1] + t * (y[:, j2] - y[:, j1])
+        x_pred = xj1 + t * (xj2 - xj1)  # (n_keep,)
+        y_pred = yj1 + t * (yj2 - yj1)
 
-        rx = x[:, k] - x_pred  # two-plane residuals
-        ry = y[:, k] - y_pred
+        rx = xk - x_pred  # two-plane residuals
+        ry = yk - y_pred
 
         # Translation: mean residual.
         dx = float(np.mean(rx))
@@ -196,8 +223,8 @@ def fit_telescope_alignment(
         tilt_x = 0.0
         tilt_y = 0.0
         if k == mid:
-            b_x = (x[:, j2] - x[:, j1]) / (z[j2] - z[j1])
-            b_y = (y[:, j2] - y[:, j1]) / (z[j2] - z[j1])
+            b_x = (xj2 - xj1) / (z[j2] - z[j1])
+            b_y = (yj2 - yj1) / (z[j2] - z[j1])
             dz_x, tilt_y = _fit_dz_and_tilt(rx_c, b_x, x_pred)
             dz_y, tilt_x = _fit_dz_and_tilt(ry_c, b_y, y_pred)
             delta_z = (dz_x + dz_y) / 2.0
@@ -231,6 +258,7 @@ class AlignmentAccumulator:
         self.flush_every = flush_every
         self._z_tel = z_tel
         self._hits: list[list[Hit]] = []
+        self._disambiguated: list[tuple[bool, bool, bool]] = []
         self.current_correction = AlignmentCorrection.identity()
 
     def add(self, hits: list[Hit]) -> AlignmentCorrection | None:
@@ -238,17 +266,22 @@ class AlignmentAccumulator:
         Add one decoded 3-plane hit.
 
         Events where any plane quality is not 'golden' or 'cluster' are
-        silently dropped (after attempting disambiguation).  Returns a new
-        AlignmentCorrection when the buffer reaches flush_every events;
-        otherwise None.
+        silently dropped (after attempting disambiguation).  Which planes
+        were recovered by disambiguation (vs. naturally golden/cluster) is
+        recorded alongside the event, so fit_telescope_alignment can
+        exclude a disambiguated plane from its own residual sample (see
+        that function's docstring).  Returns a new AlignmentCorrection when
+        the buffer reaches flush_every events; otherwise None.
         """
         if len(hits) != 3:
             return None
         z = self._z_tel if self._z_tel is not None else _Z_TEL
+        raw_hits = hits
         hits = disambiguate_telescope_hits(hits, z)
         if any(h.quality not in ("golden", "cluster") for h in hits):
             return None
         self._hits.append(hits)
+        self._disambiguated.append(tuple(hits[k] is not raw_hits[k] for k in range(3)))
         if len(self._hits) >= self.flush_every:
             return self._fit_and_flush()
         return None
@@ -260,7 +293,10 @@ class AlignmentAccumulator:
         return self._fit_and_flush()
 
     def _fit_and_flush(self) -> AlignmentCorrection:
-        correction = fit_telescope_alignment(self._hits, self._z_tel)
+        correction = fit_telescope_alignment(
+            self._hits, self._z_tel, self._disambiguated
+        )
         self.current_correction = correction
         self._hits.clear()
+        self._disambiguated.clear()
         return correction
