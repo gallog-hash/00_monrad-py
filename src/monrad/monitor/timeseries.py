@@ -49,6 +49,7 @@ from ..pose import (
     Coincidence,
     PoseFitter,
     PoseResult,
+    _MIN_COINCS,
     filter_off_probe,
     filter_rigidity,
     fit_probe_pose,
@@ -566,7 +567,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[str]]:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.min_fit < _MIN_COINCS:
+        parser.error(
+            f"--min-fit must be >= {_MIN_COINCS} (fit_probe_pose's hard "
+            f"minimum); got {args.min_fit}"
+        )
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only

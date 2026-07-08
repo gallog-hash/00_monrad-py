@@ -33,6 +33,13 @@ def test_resolve_n_tracks():
         R._resolve_n_tracks([1, 2], 3)
 
 
+def test_cli_n_below_floor_rejected():
+    """--n values under fit_probe_pose's hard minimum error at parse time,
+    not with an uncaught ValueError mid-sweep after losing earlier results."""
+    with pytest.raises(SystemExit):
+        R._parse_args(["--n", "30", str(R._MIN_COINCS - 1)])
+
+
 def test_pose_offset_roundtrip():
     """_pose_for_offset and _probe_center are inverses; (r, φ) lands as expected."""
     theta = 0.29671

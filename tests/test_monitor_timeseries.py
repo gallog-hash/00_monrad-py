@@ -15,7 +15,8 @@ import numpy as np
 import pytest
 
 from monrad.monitor.io import centre_cov_2x2
-from monrad.monitor.timeseries import monitor_probe
+from monrad.monitor.timeseries import _parse_args, monitor_probe
+from monrad.pose import _MIN_COINCS
 from monrad.synthetic.generate import Z_TEL, generate
 
 # ── Real-data paths (skipped when absent) ────────────────────────────────────
@@ -206,6 +207,24 @@ def test_min_fit_above_total_yields_no_windows(count_run):
         make_plots=False,
     )
     assert results == []
+
+
+def test_cli_min_fit_below_floor_rejected():
+    """--min-fit under fit_probe_pose's hard minimum errors at parse time,
+    not with an uncaught ValueError deep in the fit."""
+    with pytest.raises(SystemExit):
+        _parse_args(
+            [
+                "--telescope",
+                "unused",
+                "--probe",
+                "unused",
+                "--z-tel",
+                "0",
+                "--min-fit",
+                str(_MIN_COINCS - 1),
+            ]
+        )
 
 
 # ── Hybrid mode (both --window-s and --min-fit) tests ────────────────────────

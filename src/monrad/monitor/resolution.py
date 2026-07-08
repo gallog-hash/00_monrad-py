@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import AlignmentCorrection
-from ..pose import Coincidence, PoseResult, fit_probe_pose
+from ..pose import Coincidence, PoseResult, _MIN_COINCS, fit_probe_pose
 from ..synthetic import generate
 from ..synthetic.generate import N_TEL, STRIP_MM, Z_TEL
 from .io import centre_jacobian, load_detector, stream_coincidences
@@ -1189,7 +1189,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip matplotlib output (CSV only).",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    bad_n = [n for n in args.n if n < _MIN_COINCS]
+    if bad_n:
+        p.error(
+            f"--n values must be >= {_MIN_COINCS} (fit_probe_pose's hard "
+            f"minimum); got {bad_n}"
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
