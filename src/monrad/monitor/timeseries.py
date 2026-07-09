@@ -18,14 +18,25 @@ coincidences *surviving the configured geometric gates* fed to
   the window.
 
 In both modes, once the raw batch reaches ``min_fit`` (and, in hybrid mode,
-spans ``window_s``), the configured geometric gates (``max_rigidity_resid_mm``,
-``max_off_probe_mm``) run against it.  A gate only ever removes coincidences,
-so a raw batch sized to exactly ``min_fit`` can drop below the floor after
-gating; when that happens the batch keeps growing — pulling in more raw
-coincidences and re-gating — until the *survivor* count clears ``min_fit``.
-If the raw batch grows past ``RAW_CAP_MULTIPLIER * min_fit`` coincidences
-without enough survivors, the window is abandoned as contaminated and
-dropped; the trailing remainder at end-of-stream is dropped the same way.
+spans ``window_s``), the configured pre-fit geometric gates
+(``max_rigidity_resid_mm``, ``max_off_probe_mm``) run against it.  A gate only
+ever removes coincidences, so a raw batch sized to exactly ``min_fit`` can
+drop below the floor after gating; when that happens the batch keeps growing
+— pulling in more raw coincidences and re-gating — until the *survivor* count
+clears ``min_fit``.  If the raw batch grows past ``RAW_CAP_MULTIPLIER *
+min_fit`` coincidences without enough survivors, the window is abandoned as
+contaminated and dropped; the trailing remainder at end-of-stream is dropped
+the same way.
+
+Once ``min_fit`` gate-survivors are reached, ``fit_probe_pose`` runs and the
+post-fit continuity gate (``max_pose_jump_mm``/``max_pose_jump_deg``) checks
+the *fitted pose* against the previous accepted window's pose — a
+contaminated raw batch can be internally consistent enough to fool
+``fit_probe_pose``'s own Mahalanobis cut, converging on a spurious pose
+instead of the genuine one.  Unlike the pre-fit gates, a rejection here is
+terminal: the whole batch is dropped immediately (logged the same way as the
+other drop paths) and the next window starts fresh from the following
+coincidence, rather than growing the same batch and retrying.
 
 Only the open batch is ever buffered in RAM.
 
@@ -109,6 +120,31 @@ def _window_resid_rms(pose: PoseResult) -> float:
     return math.sqrt(sq / len(coincs))
 
 
+def _pose_jump(pose: PoseResult, ref: PoseResult) -> tuple[float, float]:
+    """How far *pose* has drifted from *ref* -- the post-fit continuity gate's signal.
+
+    Uses the raw fit corner (t_x, t_y, z_p), not the probe centre.  For a
+    rigid-body pose, a rotation can partly cancel a corner translation when
+    viewed at the centre (half*(cos-sin, sin+cos) folds theta in), so a
+    genuine large (theta, z_p) swing can leave the *centre* looking almost
+    stationary -- exactly what happened in the testLab burst-tail window this
+    gate targets (docs/handoffs/
+    2026-07-09-post-fix-monitor-run-transition-window.md): the corner moved
+    ~65 mm and theta by ~10.5 deg, but the centre moved only ~14 mm.  Checking
+    the corner + z_p and theta separately catches both independently.
+
+    Returns (pos_jump_mm, theta_jump_deg).
+    """
+    pos_jump = math.sqrt(
+        (pose.t_x - ref.t_x) ** 2
+        + (pose.t_y - ref.t_y) ** 2
+        + (pose.z_p - ref.z_p) ** 2
+    )
+    theta_jump = math.degrees(abs(pose.theta - ref.theta)) % 360.0
+    theta_jump = min(theta_jump, 360.0 - theta_jump)
+    return pos_jump, theta_jump
+
+
 @dataclass
 class WindowResult:
     """Pose fit for one time window."""
@@ -140,6 +176,8 @@ def monitor_probe(
     min_anchor_planes: int = 1,
     max_rigidity_resid_mm: float | None = None,
     max_off_probe_mm: float | None = None,
+    max_pose_jump_mm: float | None = None,
+    max_pose_jump_deg: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     make_plots: bool = True,
@@ -216,6 +254,29 @@ def monitor_probe(
         (``n_probe_ch * 10`` mm on a side).  Skipped on the first window (no
         reference pose yet).  Like the rigidity gate, can drop a window to 0
         survivors.  ``None`` (the default) disables the gate.
+    max_pose_jump_mm, max_pose_jump_deg:
+        Post-fit continuity gate, checked *after* ``fit_probe_pose`` runs on
+        a candidate batch of gate-survivors, unlike the two pre-fit gates
+        above which filter individual coincidences before the fit ever sees
+        them.  A contaminated batch can be internally consistent enough
+        (against itself, via rigidity, and against the previous pose's
+        footprint) that ``fit_probe_pose``'s own Mahalanobis cut locks onto a
+        spurious cluster instead of the genuine one -- see
+        docs/handoffs/2026-07-09-post-fix-monitor-run-transition-window.md.
+        Reject the candidate pose if it has moved more than ``max_pose_jump_mm``
+        (Euclidean distance of the fit corner ``(t_x, t_y, z_p)``) or rotated
+        more than ``max_pose_jump_deg`` from the previous accepted window's
+        pose -- checked independently (see :func:`_pose_jump`) because a
+        rotation can partly cancel a corner translation when viewed at the
+        probe centre.  Unlike the pre-fit gates, a rejection here is
+        terminal: the whole raw batch is discarded immediately (logged the
+        same way as the other drop paths) and the next window starts fresh
+        from the following coincidence, rather than growing the same batch
+        and retrying -- diluting a contaminated batch by regrowing it is what
+        ``min_fit`` is for; this gate exists to catch the case where that
+        wasn't done.  Skipped on the first window (no reference pose yet).
+        Either ``None`` (the default) disables that half of the gate; both
+        ``None`` disables it entirely.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -301,22 +362,12 @@ def monitor_probe(
                 )
         return working
 
-    def _fit_and_record(
-        working: list[Coincidence], utc_start: datetime, utc_end: datetime
+    def _record(
+        pose: PoseResult,
+        utc_start: datetime,
+        utc_end: datetime,
     ) -> None:
         nonlocal prev_pose
-        pose = fit_probe_pose(working, z_corr, alignment)
-
-        if pose.outliers:
-            logger.info(
-                "Window %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
-                "%d via Mahalanobis cut.",
-                utc_start.isoformat(),
-                utc_end.isoformat(),
-                pose.n_inliers,
-                len(working),
-                len(pose.outliers),
-            )
 
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
         # honest window-quality signal.  The inlier-only residuals the fit
@@ -365,6 +416,11 @@ def monitor_probe(
     # point the window is abandoned as contaminated. Without a gate, _run_gates
     # is a no-op and this reduces to the original fixed-size batching (first
     # check point == min_fit raw coincidences, always passes, same as before).
+    # The post-fit continuity gate (max_pose_jump_mm/_deg) is a one-shot check
+    # on the *fitted pose*, run once a candidate batch first clears min_fit
+    # survivors: unlike the pre-fit gates, a rejection here drops the whole
+    # batch immediately rather than growing it further -- see
+    # monitor_probe's docstring and _pose_jump.
     window_ns = None if window_s is None else int(window_s * 1e9)
     raw_cap = min_fit * RAW_CAP_MULTIPLIER
     batch: list[Coincidence] = []
@@ -380,30 +436,68 @@ def monitor_probe(
 
         utc_start, utc_end = _utc(win_start_ns), _utc(co.t_ns)
         working = _run_gates(batch, utc_start, utc_end)
-        if len(working) >= min_fit:
-            _fit_and_record(working, utc_start, utc_end)
-            batch = []
-            win_start_ns = None
-            cold_start_z_ref = None
-            cold_start_n = 0
-        elif len(batch) >= raw_cap:
-            logger.warning(
-                "Dropping window %s–%s: only %d/%d raw coincidence(s) survive "
-                "the geometric gates after reaching the %dx raw cap "
-                "(< min_fit=%d).",
+
+        if len(working) < min_fit:
+            if len(batch) >= raw_cap:
+                logger.warning(
+                    "Dropping window %s–%s: only %d/%d raw coincidence(s) "
+                    "survive the geometric gates after reaching the %dx raw "
+                    "cap (< min_fit=%d).",
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(working),
+                    len(batch),
+                    RAW_CAP_MULTIPLIER,
+                    min_fit,
+                )
+                batch = []
+                win_start_ns = None
+                cold_start_z_ref = None
+                cold_start_n = 0
+            # else: not enough survivors yet — keep growing the raw batch and
+            # re-gate on the next coincidence.
+            continue
+
+        pose = fit_probe_pose(working, z_corr, alignment)
+        if pose.outliers:
+            logger.info(
+                "Window %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
+                "%d via Mahalanobis cut.",
                 utc_start.isoformat(),
                 utc_end.isoformat(),
+                pose.n_inliers,
                 len(working),
-                len(batch),
-                RAW_CAP_MULTIPLIER,
-                min_fit,
+                len(pose.outliers),
             )
-            batch = []
-            win_start_ns = None
-            cold_start_z_ref = None
-            cold_start_n = 0
-        # else: not enough survivors yet — keep growing the raw batch and
-        # re-gate on the next coincidence.
+
+        continuity_ok = True
+        if (
+            max_pose_jump_mm is not None or max_pose_jump_deg is not None
+        ) and prev_pose is not None:
+            pos_jump, theta_jump = _pose_jump(pose, prev_pose)
+            continuity_ok = (
+                max_pose_jump_mm is None or pos_jump <= max_pose_jump_mm
+            ) and (max_pose_jump_deg is None or theta_jump <= max_pose_jump_deg)
+            if not continuity_ok:
+                logger.warning(
+                    "Dropping window %s–%s: post-fit continuity gate rejected "
+                    "the fitted pose (Δpos=%.1f mm, Δθ=%.2f° vs prev "
+                    "z_p=%.1f mm, θ=%.2f°); %d gate-survivor(s) discarded.",
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    pos_jump,
+                    theta_jump,
+                    prev_pose.z_p,
+                    math.degrees(prev_pose.theta),
+                    len(working),
+                )
+
+        if continuity_ok:
+            _record(pose, utc_start, utc_end)
+        batch = []
+        win_start_ns = None
+        cold_start_z_ref = None
+        cold_start_n = 0
 
     if batch:
         utc_start, utc_end = _utc(win_start_ns), _utc(batch[-1].t_ns)
@@ -586,6 +680,35 @@ def _build_parser() -> argparse.ArgumentParser:
         "yet). Off by default.",
     )
     p.add_argument(
+        "--max-pose-jump-mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Post-fit continuity gate (mm), checked after fit_probe_pose runs "
+        "(unlike --max-rigidity-resid-mm/--max-off-probe-mm, which filter "
+        "coincidences before the fit).  Reject a candidate window's fitted "
+        "pose if its (t_x, t_y, z_p) corner has moved more than this far from "
+        "the previous accepted window's pose -- the probe moves slowly, so a "
+        "bigger jump means the window's gate-survivors are still internally "
+        "coherent enough to fool the Mahalanobis cut.  On rejection the raw "
+        "batch keeps growing (diluting the contamination) until it passes or "
+        "hits the raw cap and is dropped.  Skipped on the first window (no "
+        "reference pose yet).  Checked independently of --max-pose-jump-deg. "
+        "Off by default.",
+    )
+    p.add_argument(
+        "--max-pose-jump-deg",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="Post-fit continuity gate (degrees), companion to "
+        "--max-pose-jump-mm: reject a candidate window if theta has rotated "
+        "more than this many degrees from the previous accepted window's "
+        "pose.  Checked independently because a rotation can partly cancel a "
+        "corner translation when viewed at the probe centre.  Off by "
+        "default.",
+    )
+    p.add_argument(
         "--window-s",
         type=float,
         default=None,
@@ -662,6 +785,14 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(
         "  max_off_probe_mm:    %s  %s", args.max_off_probe_mm, _tag("max_off_probe_mm")
     )
+    logger.info(
+        "  max_pose_jump_mm:    %s  %s", args.max_pose_jump_mm, _tag("max_pose_jump_mm")
+    )
+    logger.info(
+        "  max_pose_jump_deg:   %s  %s",
+        args.max_pose_jump_deg,
+        _tag("max_pose_jump_deg"),
+    )
     logger.info("  window_s:            %s  %s", args.window_s, _tag("window_s"))
     logger.info("  n_probe_ch:          %s  %s", args.n_probe_ch, _tag("n_probe_ch"))
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
@@ -679,6 +810,8 @@ def main(argv: list[str] | None = None) -> None:
         min_anchor_planes=args.min_anchor_planes,
         max_rigidity_resid_mm=args.max_rigidity_resid_mm,
         max_off_probe_mm=args.max_off_probe_mm,
+        max_pose_jump_mm=args.max_pose_jump_mm,
+        max_pose_jump_deg=args.max_pose_jump_deg,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
