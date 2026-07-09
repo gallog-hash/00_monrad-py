@@ -27,7 +27,10 @@ t_ns, b = d["t_ns"], d["b"]
 wide_t = set(int(x) for x in t_ns[b > 0.5])
 rng = np.random.default_rng(0)
 narrow_all = t_ns[b <= 0.5]
-narrow_t = set(int(x) for x in rng.choice(narrow_all, 400, replace=False))
+narrow_sample_size = min(400, len(narrow_all))
+narrow_t = set(
+    int(x) for x in rng.choice(narrow_all, narrow_sample_size, replace=False)
+)
 targets = wide_t | narrow_t
 print(f"wide={len(wide_t)} narrow_sample={len(narrow_t)}", file=sys.stderr)
 

@@ -186,7 +186,7 @@ and asserts the recorded `fit_probe_pose` call sizes within each growth
 stretch are at least `COLD_START_REFIT_STRIDE` apart, rather than one call
 per append.
 
-### 6. [CONFIRMED] `rng.choice` crash on small population (diagnostic script)
+### 6. [FIXED] `rng.choice` crash on small population (diagnostic script)
 **File:** `scripts/diagnostics/wide_block_inspect.py:30`
 `rng.choice(narrow_all, 400, replace=False)` hardcodes a sample size of 400
 with no bounds check against `len(narrow_all)`.
@@ -196,6 +196,9 @@ take a larger sample than population when replace is False" instead of
 degrading gracefully.
 **Likely fix direction:** `min(400, len(narrow_all))`, or an early
 assertion with a clear message.
+**Fix applied (2026-07-09):** `narrow_t` now samples
+`min(400, len(narrow_all))` items instead of a hardcoded 400, so the script
+degrades gracefully on small datasets instead of crashing.
 
 ### 7. [PLAUSIBLE] Silent negative-gap filtering in timing diagnostic (diagnostic script)
 **File:** `scripts/diagnostics/tel_time_inspect.py:43`
