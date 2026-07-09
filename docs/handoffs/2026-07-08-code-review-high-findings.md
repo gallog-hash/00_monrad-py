@@ -244,7 +244,7 @@ nothing importing the canonical modules to catch the drift.
 **Likely fix direction:** replace the hand-rolled parsing with
 `BinDecoder(path).read()` and imports from `monrad.decoders.gps`.
 
-### 10. [CONFIRMED] Stale module docstring in `pose/optimize.py`
+### 10. [FIXED] Stale module docstring in `pose/optimize.py`
 **File:** `src/monrad/pose/optimize.py:5`
 Still describes `fit_probe_pose` as including "an opt-in absolute-mm
 residual cut layered after the Mahalanobis refit." That cut was removed by

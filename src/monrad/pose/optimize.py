@@ -3,8 +3,7 @@ Stage 5 (part) — the probe pose optimizer.
 
 fit_probe_pose(coincidences, tel_z, alignment) -> PoseResult
     Implements DESIGN.md §8.4 four-step optimizer plus the Mahalanobis outlier
-    cut and stratified-half consistency test, with an opt-in absolute-mm
-    residual cut layered after the Mahalanobis refit.
+    cut and stratified-half consistency test.
 """
 
 import math
