@@ -241,7 +241,7 @@ dataset-specific and non-obvious). `coinc_b_dist.py`, `coinc_dt.py`, and
 and `from _config import Z_TEL` instead of redefining it locally, so a
 future z-order correction only needs one edit.
 
-### 9. [CONFIRMED] Diagnostic scripts reimplement canonical decoders instead of importing them
+### 9. [FIXED] Diagnostic scripts reimplement canonical decoders instead of importing them
 **Files:** `scripts/diagnostics/tel_raw_inspect.py:47`,
 `scripts/diagnostics/tel_plane_inspect.py` (same pattern, ~line 28) — both
 hand-roll `.bin` header parsing/reshaping instead of calling
@@ -256,6 +256,15 @@ with the stale hardcoded layout/masks, silently producing wrong values with
 nothing importing the canonical modules to catch the drift.
 **Likely fix direction:** replace the hand-rolled parsing with
 `BinDecoder(path).read()` and imports from `monrad.decoders.gps`.
+**Fix applied (2026-07-09):** `tel_raw_inspect.py`'s `load_blocks` and
+`tel_plane_inspect.py`'s `load` now call `BinDecoder(path).read()` and
+reshape its `(n_rows, n_cols)` array into the `(nblk, 16, n_cols)` shape
+both scripts already relied on, dropping the hand-rolled `struct.unpack_from`
+header parse. `tel_time_inspect.py`'s `load_event_clks` now calls
+`GPSDecoder(path).read()` and imports `GPS_CLK_MASK`/`GPS_FLAG_SHIFT` from
+`monrad.decoders.gps` instead of redefining them (the unused
+`GPS_GEN_SHIFT` local was dropped). Verified byte-identical stdout on real
+`data/0_testLab_20220204/Base` files before/after for all three scripts.
 
 ### 10. [FIXED] Stale module docstring in `pose/optimize.py`
 **File:** `src/monrad/pose/optimize.py:5`

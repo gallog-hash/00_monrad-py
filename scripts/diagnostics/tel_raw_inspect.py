@@ -12,7 +12,6 @@ z-tel order for this dataset: file columns [0,1,2] -> z = [0, -1340, -670] mm.
 """
 
 import sys
-import struct
 import math
 from pathlib import Path
 import numpy as np
@@ -46,13 +45,9 @@ def fit3(vals):
 
 
 def load_blocks(path):
-    with open(path, "rb") as f:
-        raw = f.read()
-    n_rows, n_cols = struct.unpack_from("<II", raw, 0)
+    n_cols, n_rows, data = BinDecoder(path).read()
     assert n_cols == 3, n_cols
-    words = np.frombuffer(raw, dtype="<u8", count=n_rows * n_cols, offset=8)
-    words = words.reshape(n_rows // 16, 16, n_cols)  # (nblk, 16, 3)
-    return words
+    return data.reshape(n_rows // 16, 16, n_cols)  # (nblk, 16, 3)
 
 
 def or_block(words):

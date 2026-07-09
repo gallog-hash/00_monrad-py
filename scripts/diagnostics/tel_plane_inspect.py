@@ -13,7 +13,6 @@ that a shower/halo burst would perturb:
 """
 
 import sys
-import struct
 import numpy as np
 
 sys.path.insert(0, "src")
@@ -26,11 +25,8 @@ from monrad.decoders.position import (  # noqa: E402
 
 
 def load(path):
-    with open(path, "rb") as f:
-        raw = f.read()
-    n_rows, n_cols = struct.unpack_from("<II", raw, 0)
-    w = np.frombuffer(raw, dtype="<u8", count=n_rows * n_cols, offset=8)
-    return w.reshape(n_rows // 16, 16, n_cols)
+    n_cols, n_rows, data = BinDecoder(path).read()
+    return data.reshape(n_rows // 16, 16, n_cols)
 
 
 def popcount20(v):

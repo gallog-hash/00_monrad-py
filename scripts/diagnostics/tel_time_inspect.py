@@ -14,20 +14,16 @@ of every event record (FLAG=0), convert to seconds (100 MHz clock), and measure:
 """
 
 import sys
-import struct
 import numpy as np
 
-GPS_CLK_MASK = (1 << 52) - 1
-GPS_GEN_SHIFT = 52
-GPS_FLAG_SHIFT = 63
+sys.path.insert(0, "src")
+from monrad.decoders.gps import GPSDecoder, GPS_CLK_MASK, GPS_FLAG_SHIFT  # noqa: E402
+
 CLK_HZ = 1e8  # 100 MHz
 
 
 def load_event_clks(path):
-    with open(path, "rb") as f:
-        raw = f.read()
-    n = struct.unpack_from("<I", raw, 0)[0]
-    d = np.frombuffer(raw, dtype="<u8", count=n, offset=4)
+    _, d = GPSDecoder(path).read()
     flag = (d >> GPS_FLAG_SHIFT) & 1
     clk = (d & GPS_CLK_MASK).astype(np.int64)
     return clk[flag == 0]
