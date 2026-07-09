@@ -307,6 +307,17 @@ def monitor_probe(
         nonlocal prev_pose
         pose = fit_probe_pose(working, z_corr, alignment)
 
+        if pose.outliers:
+            logger.info(
+                "Window %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
+                "%d via Mahalanobis cut.",
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                pose.n_inliers,
+                len(working),
+                len(pose.outliers),
+            )
+
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
         # honest window-quality signal.  The inlier-only residuals the fit
         # reports look clean even for a contaminated window, because the
