@@ -219,7 +219,7 @@ before filtering and prints a stderr warning naming the file and the count
 dropped, whenever that count is nonzero, instead of silently discarding
 them.
 
-### 8. [CONFIRMED] `Z_TEL` hardcoded identically in three diagnostic scripts
+### 8. [FIXED] `Z_TEL` hardcoded identically in three diagnostic scripts
 **Files:** `scripts/diagnostics/coinc_b_dist.py:23`,
 `scripts/diagnostics/coinc_dt.py:25`,
 `scripts/diagnostics/tel_raw_inspect.py:27`
@@ -234,6 +234,12 @@ alignment work exists to catch (see [[telescope-tilt-not-zrotation]]).
 **Likely fix direction:** factor `Z_TEL` into a shared constant/CLI arg
 these scripts import, or at minimum a single shared diagnostics config
 module.
+**Fix applied (2026-07-09):** Added `scripts/diagnostics/_config.py` holding
+the single `Z_TEL` constant (with a docstring flagging it as
+dataset-specific and non-obvious). `coinc_b_dist.py`, `coinc_dt.py`, and
+`tel_raw_inspect.py` now `sys.path.insert(0, str(Path(__file__).parent))`
+and `from _config import Z_TEL` instead of redefining it locally, so a
+future z-order correction only needs one edit.
 
 ### 9. [CONFIRMED] Diagnostic scripts reimplement canonical decoders instead of importing them
 **Files:** `scripts/diagnostics/tel_raw_inspect.py:47`,

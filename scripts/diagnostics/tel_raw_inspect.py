@@ -14,17 +14,19 @@ z-tel order for this dataset: file columns [0,1,2] -> z = [0, -1340, -670] mm.
 import sys
 import struct
 import math
+from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, "src")
+sys.path.insert(0, str(Path(__file__).parent))
 from monrad.reconstruction.hit import _decode_axis  # noqa: E402
 from monrad.decoders.position import (  # noqa: E402
     POS_COORD_MASK,
     POS_X_SHIFT,
     BinDecoder,
 )
+from _config import Z_TEL  # noqa: E402
 
-Z_TEL = np.array([0.0, -1340.0, -670.0])  # per file column
 STRIP_MM = 10.0
 
 # Precompute the LS line-fit projection for 3 fixed z points.

@@ -17,10 +17,11 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, "src")
+sys.path.insert(0, str(Path(__file__).parent))
 OUT = os.environ.get("MONRAD_DIAG_OUT", ".")
 from monrad.monitor.io import load_detector, fit_alignment, stream_coincidences  # noqa: E402
+from _config import Z_TEL  # noqa: E402
 
-Z_TEL = np.array([0.0, -1340.0, -670.0])
 BUCKET_S = 600  # 10-min windows
 
 tel = load_detector(Path("data/0_testLab_20210723/Base"))

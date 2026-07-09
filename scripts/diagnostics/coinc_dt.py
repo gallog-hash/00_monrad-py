@@ -16,13 +16,14 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, "src")
+sys.path.insert(0, str(Path(__file__).parent))
 OUT = os.environ.get("MONRAD_DIAG_OUT", ".")
 from monrad.monitor.io import load_detector, fit_alignment  # noqa: E402
 from monrad.timing import reconstruct_stream  # noqa: E402
 from monrad.coincidence import coincidence_stream  # noqa: E402
 from monrad.pose import PoseFitter  # noqa: E402
+from _config import Z_TEL  # noqa: E402
 
-Z_TEL = np.array([0.0, -1340.0, -670.0])
 tel = load_detector(Path("data/0_testLab_20210723/Base"))
 prb = load_detector(Path("data/0_testLab_20210723/Probe_0"))
 align, _ = fit_alignment(tel, Z_TEL)
