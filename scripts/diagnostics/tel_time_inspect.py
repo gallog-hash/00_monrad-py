@@ -40,6 +40,13 @@ def analyze(path):
     t = t - t[0]
     dur = t[-1] - t[0] if len(t) > 1 else 1.0
     gaps = np.diff(t)
+    n_negative = int((gaps < 0).sum())
+    if n_negative:
+        print(
+            f"{path}: dropping {n_negative} negative CLK gap(s) "
+            "(non-monotonic sequence)",
+            file=sys.stderr,
+        )
     gaps = gaps[gaps >= 0]
     cv = gaps.std() / gaps.mean() if gaps.mean() > 0 else float("nan")
     # per-100ms bin counts

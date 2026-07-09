@@ -200,7 +200,7 @@ assertion with a clear message.
 `min(400, len(narrow_all))` items instead of a hardcoded 400, so the script
 degrades gracefully on small datasets instead of crashing.
 
-### 7. [PLAUSIBLE] Silent negative-gap filtering in timing diagnostic (diagnostic script)
+### 7. [FIXED] Silent negative-gap filtering in timing diagnostic (diagnostic script)
 **File:** `scripts/diagnostics/tel_time_inspect.py:43`
 `gaps = gaps[gaps >= 0]` silently discards non-monotonic CLK gaps with no
 count or warning, even though the comment at `:39` ("guard against wrap /
@@ -214,6 +214,10 @@ refuted during verification: `np.frombuffer(..., count=n)` raises a hard
 does not hold.)
 **Likely fix direction:** print/log the count of dropped negative gaps
 rather than silently filtering.
+**Fix applied (2026-07-09):** `analyze()` now counts negative CLK gaps
+before filtering and prints a stderr warning naming the file and the count
+dropped, whenever that count is nonzero, instead of silently discarding
+them.
 
 ### 8. [CONFIRMED] `Z_TEL` hardcoded identically in three diagnostic scripts
 **Files:** `scripts/diagnostics/coinc_b_dist.py:23`,
