@@ -22,6 +22,8 @@ from ..pose import Coincidence, PoseFitter
 from ..reconstruction import decode_position
 from ..synthetic.generate import STRIP_MM
 from ..timing import (
+    PosRef,
+    TimedEvent,
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
@@ -111,6 +113,37 @@ def fit_alignment(
         )
         accum.add(hits)
     return accum.flush(), quality
+
+
+def build_cluster_stream(
+    tel: DetectorFiles,
+    probes: list[DetectorFiles],
+    *,
+    window_ns: int = 200,
+) -> Iterator[list[tuple[int, TimedEvent, PosRef]]]:
+    """Yield coincidence clusters over one telescope and N probes.
+
+    One :func:`~monrad.timing.reconstruct_stream` per detector (telescope +
+    each probe), merged by a single :func:`~monrad.coincidence.coincidence_stream`
+    call.  The telescope is always ``det_id=0``; probe ``k`` (0-indexed in
+    ``probes``) is ``det_id=k+1`` — the same convention
+    :class:`~monrad.pose.PoseFitter`'s ``tel_id``/``prb_id`` already use, so a
+    caller can build one ``PoseFitter`` per probe and call
+    ``fitter.decode_cluster(cluster)`` on the same cluster for each: a cluster
+    only yields a :class:`~monrad.pose.Coincidence` for the probe(s) it is
+    actually consistent with (see ``PoseFitter._decode_cluster``'s multi-probe
+    contract).  Shared by :mod:`~monrad.monitor.multiprobe`;
+    ``window_ns`` mirrors :func:`~monrad.coincidence.coincidence_stream`'s own
+    default (DESIGN.md §4/§5).
+    """
+    tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
+    prb_streams = [
+        reconstruct_stream(p.gps_paths, p.pos_paths, p.utc0, p.f0) for p in probes
+    ]
+    detector_ids = list(range(len(probes) + 1))
+    return coincidence_stream(
+        [tel_stream, *prb_streams], detector_ids=detector_ids, window_ns=window_ns
+    )
 
 
 def stream_coincidences(

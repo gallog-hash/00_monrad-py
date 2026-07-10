@@ -56,6 +56,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..alignment import AlignmentCorrection
 from ..pose import (
     Coincidence,
     PoseFitter,
@@ -162,6 +163,258 @@ class WindowResult:
     sigma_theta: float
     resid_rms: float  # combined absolute-mm residual RMS over all coincidences
     # fed to the fit (inliers + Mahalanobis-cut outliers); see _window_resid_rms
+
+
+def _utc(t_ns: float) -> datetime:
+    return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+
+
+class _WindowAccumulator:
+    """Windowing/gating state machine for one probe's pose timeseries.
+
+    Buffers a growing raw batch of decoded :class:`~monrad.pose.Coincidence`
+    objects, applies the configured pre-fit geometric gates, fits a window
+    once enough survivors accumulate, checks the post-fit continuity gate,
+    and records a :class:`WindowResult` -- exactly the state machine
+    documented in the module docstring and :func:`monitor_probe`'s
+    docstring.  Multi-probe monitoring drives one independent instance per
+    probe off a shared cluster stream; :func:`monitor_probe` itself is a
+    thin single-instance wrapper so single-probe behavior is unchanged, not
+    duplicated.
+
+    ``label`` prefixes this accumulator's log messages so interleaved
+    multi-probe logs are attributable to the probe they came from.
+    """
+
+    def __init__(
+        self,
+        *,
+        z_corr: np.ndarray,
+        alignment: AlignmentCorrection,
+        n_probe_ch: int,
+        window_ns: int | None = None,
+        min_fit: int = MIN_FIT,
+        max_rigidity_resid_mm: float | None = None,
+        max_off_probe_mm: float | None = None,
+        max_pose_jump_mm: float | None = None,
+        max_pose_jump_deg: float | None = None,
+        label: str = "",
+    ) -> None:
+        self.z_corr = z_corr
+        self.alignment = alignment
+        self.n_probe_ch = n_probe_ch
+        self.probe_size_mm = n_probe_ch * 10.0
+        self.window_ns = window_ns
+        self.min_fit = min_fit
+        self.max_rigidity_resid_mm = max_rigidity_resid_mm
+        self.max_off_probe_mm = max_off_probe_mm
+        self.max_pose_jump_mm = max_pose_jump_mm
+        self.max_pose_jump_deg = max_pose_jump_deg
+        self.label = label
+        self._prefix = f"{label}: " if label else ""
+        self.raw_cap = min_fit * RAW_CAP_MULTIPLIER
+
+        self.results: list[WindowResult] = []
+        self.prev_pose: PoseResult | None = None
+        self.cold_start_z_ref: float | None = None
+        self.cold_start_n = 0
+        self.batch: list[Coincidence] = []
+        self.win_start_ns: int | None = None
+
+    def _run_gates(
+        self, coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
+    ) -> list[Coincidence]:
+        """Apply the configured geometric gates once; return the survivors.
+
+        Read-only w.r.t. ``prev_pose`` — callers decide whether/when to
+        actually commit a fit from the result, so this can be called
+        repeatedly on a growing raw batch without side effects.
+        """
+        working = coincs
+        if self.max_rigidity_resid_mm is not None:
+            if self.prev_pose is not None:
+                z_ref = self.prev_pose.z_p
+            else:
+                # Cold start: no previous accepted pose to anchor z_ref. See
+                # monitor_probe's max_rigidity_resid_mm docstring for why
+                # mean(z_corr) is unusable and the bootstrap fit is cached
+                # rather than recomputed on every growth step.
+                if (
+                    self.cold_start_z_ref is None
+                    or len(coincs) - self.cold_start_n >= COLD_START_REFIT_STRIDE
+                ):
+                    self.cold_start_z_ref = fit_probe_pose(
+                        working, self.z_corr, self.alignment
+                    ).z_p
+                    self.cold_start_n = len(coincs)
+                z_ref = self.cold_start_z_ref
+            working, dropped_rigid = filter_rigidity(
+                working, z_ref, self.max_rigidity_resid_mm
+            )
+            if dropped_rigid:
+                logger.info(
+                    "%sWindow %s–%s: rigidity gate dropped %d/%d coincidence(s) "
+                    "(z_ref=%.1f mm).",
+                    self._prefix,
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(dropped_rigid),
+                    len(coincs),
+                    z_ref,
+                )
+
+        if self.max_off_probe_mm is not None and self.prev_pose is not None:
+            n_before = len(working)
+            working, dropped_fp = filter_off_probe(
+                working, self.prev_pose, self.probe_size_mm, self.max_off_probe_mm
+            )
+            if dropped_fp:
+                logger.info(
+                    "%sWindow %s–%s: footprint gate dropped %d/%d coincidence(s).",
+                    self._prefix,
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(dropped_fp),
+                    n_before,
+                )
+        return working
+
+    def _record(
+        self,
+        pose: PoseResult,
+        utc_start: datetime,
+        utc_end: datetime,
+    ) -> WindowResult:
+        # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
+        # honest window-quality signal.  The inlier-only residuals the fit
+        # reports look clean even for a contaminated window, because the
+        # Mahalanobis cut rejects the wild tracks; counting the rejected tracks
+        # back in is what exposes the contamination (see _window_resid_rms).
+        rms = _window_resid_rms(pose)
+
+        cov_c = centre_cov_2x2(pose.cov, pose.theta, self.n_probe_ch)
+        result = WindowResult(
+            utc_start=utc_start,
+            utc_end=utc_end,
+            n_inliers=pose.n_inliers,
+            t_x=pose.t_x,
+            sigma_tx=math.sqrt(abs(cov_c[0, 0])),
+            t_y=pose.t_y,
+            sigma_ty=math.sqrt(abs(cov_c[1, 1])),
+            z_p=pose.z_p,
+            sigma_zp=math.sqrt(abs(pose.cov[3, 3])),
+            theta=pose.theta,
+            sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
+            resid_rms=rms,
+        )
+        self.results.append(result)
+        self.prev_pose = pose
+        return result
+
+    def _reset_batch(self) -> None:
+        self.batch = []
+        self.win_start_ns = None
+        self.cold_start_z_ref = None
+        self.cold_start_n = 0
+
+    def push(self, co: Coincidence) -> WindowResult | None:
+        """Append one decoded coincidence; return a new WindowResult if a window closed.
+
+        A window "closes" (the raw batch resets) whenever it is committed,
+        dropped via the post-fit continuity gate, or abandoned at the raw
+        cap -- in the latter two cases this returns ``None`` even though the
+        batch reset, since no result was recorded.  While the raw batch is
+        still short of survivors (and hasn't hit the raw cap), it keeps
+        growing and this returns ``None`` without resetting anything.
+        """
+        if self.win_start_ns is None:
+            self.win_start_ns = co.t_ns
+        self.batch.append(co)
+
+        spanned = self.window_ns is None or (
+            co.t_ns - self.win_start_ns >= self.window_ns
+        )
+        if not spanned or len(self.batch) < self.min_fit:
+            return None
+
+        utc_start, utc_end = _utc(self.win_start_ns), _utc(co.t_ns)
+        working = self._run_gates(self.batch, utc_start, utc_end)
+
+        if len(working) < self.min_fit:
+            if len(self.batch) >= self.raw_cap:
+                logger.warning(
+                    "%sDropping window %s–%s: only %d/%d raw coincidence(s) "
+                    "survive the geometric gates after reaching the %dx raw "
+                    "cap (< min_fit=%d).",
+                    self._prefix,
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    len(working),
+                    len(self.batch),
+                    RAW_CAP_MULTIPLIER,
+                    self.min_fit,
+                )
+                self._reset_batch()
+            # else: not enough survivors yet — keep growing the raw batch and
+            # re-gate on the next coincidence.
+            return None
+
+        pose = fit_probe_pose(working, self.z_corr, self.alignment)
+        if pose.outliers:
+            logger.info(
+                "%sWindow %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
+                "%d via Mahalanobis cut.",
+                self._prefix,
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                pose.n_inliers,
+                len(working),
+                len(pose.outliers),
+            )
+
+        continuity_ok = True
+        if (
+            self.max_pose_jump_mm is not None or self.max_pose_jump_deg is not None
+        ) and self.prev_pose is not None:
+            pos_jump, theta_jump = _pose_jump(pose, self.prev_pose)
+            continuity_ok = (
+                self.max_pose_jump_mm is None or pos_jump <= self.max_pose_jump_mm
+            ) and (
+                self.max_pose_jump_deg is None or theta_jump <= self.max_pose_jump_deg
+            )
+            if not continuity_ok:
+                logger.warning(
+                    "%sDropping window %s–%s: post-fit continuity gate rejected "
+                    "the fitted pose (Δpos=%.1f mm, Δθ=%.2f° vs prev "
+                    "z_p=%.1f mm, θ=%.2f°); %d gate-survivor(s) discarded.",
+                    self._prefix,
+                    utc_start.isoformat(),
+                    utc_end.isoformat(),
+                    pos_jump,
+                    theta_jump,
+                    self.prev_pose.z_p,
+                    math.degrees(self.prev_pose.theta),
+                    len(working),
+                )
+
+        result = self._record(pose, utc_start, utc_end) if continuity_ok else None
+        self._reset_batch()
+        return result
+
+    def finalize(self) -> None:
+        """Log the trailing raw batch, if any, as dropped at end-of-stream."""
+        if self.batch:
+            assert self.win_start_ns is not None  # set whenever batch is non-empty
+            utc_start, utc_end = _utc(self.win_start_ns), _utc(self.batch[-1].t_ns)
+            logger.warning(
+                "%sDropping trailing window %s–%s: stream ended with only %d "
+                "raw coincidence(s), never reaching min_fit=%d survivors.",
+                self._prefix,
+                utc_start.isoformat(),
+                utc_end.isoformat(),
+                len(self.batch),
+                self.min_fit,
+            )
 
 
 def monitor_probe(
@@ -289,114 +542,19 @@ def monitor_probe(
         tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
     )
     z_corr = alignment.corrected_z_tel(z_tel)
-    probe_size_mm = n_probe_ch * 10.0
 
-    results: list[WindowResult] = []
-    prev_pose: PoseResult | None = None
-    cold_start_z_ref: float | None = None
-    cold_start_n = 0
-
-    def _run_gates(
-        coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
-    ) -> list[Coincidence]:
-        """Apply the configured geometric gates once; return the survivors.
-
-        Read-only w.r.t. ``prev_pose`` — callers decide whether/when to
-        actually commit a fit from the result, so this can be called
-        repeatedly on a growing raw batch without side effects.
-        """
-        nonlocal cold_start_z_ref, cold_start_n
-        working = coincs
-        if max_rigidity_resid_mm is not None:
-            if prev_pose is not None:
-                z_ref = prev_pose.z_p
-            else:
-                # Cold start: no previous accepted pose to anchor z_ref. The
-                # rigidity residual scales with |z_ref - z_p|, so a probe far
-                # from the telescope stack's mean z (~1500 mm in the testLab
-                # setup: mean(z_corr)=-670 vs true z_p=+840) makes mean(z_corr)
-                # useless and would flag every genuine coincidence, dropping
-                # window 0 entirely and permanently starving prev_pose (it
-                # never updates from None, so every later window inherits the
-                # same bad z_ref). Bootstrap a quick ungated fit on this
-                # window's own coincidences instead — its z_p is a much better
-                # anchor even though the window may itself be contaminated.
-                # It's a throwaway anchor, not the committed pose, so the
-                # (expensive, four-step) bootstrap fit is cached and only
-                # recomputed every COLD_START_REFIT_STRIDE raw coincidences
-                # rather than on every single growth step (see the module
-                # docstring for the cost this avoids).
-                if (
-                    cold_start_z_ref is None
-                    or len(coincs) - cold_start_n >= COLD_START_REFIT_STRIDE
-                ):
-                    cold_start_z_ref = fit_probe_pose(working, z_corr, alignment).z_p
-                    cold_start_n = len(coincs)
-                z_ref = cold_start_z_ref
-            working, dropped_rigid = filter_rigidity(
-                working, z_ref, max_rigidity_resid_mm
-            )
-            if dropped_rigid:
-                logger.info(
-                    "Window %s–%s: rigidity gate dropped %d/%d coincidence(s) "
-                    "(z_ref=%.1f mm).",
-                    utc_start.isoformat(),
-                    utc_end.isoformat(),
-                    len(dropped_rigid),
-                    len(coincs),
-                    z_ref,
-                )
-
-        if max_off_probe_mm is not None and prev_pose is not None:
-            n_before = len(working)
-            working, dropped_fp = filter_off_probe(
-                working, prev_pose, probe_size_mm, max_off_probe_mm
-            )
-            if dropped_fp:
-                logger.info(
-                    "Window %s–%s: footprint gate dropped %d/%d coincidence(s).",
-                    utc_start.isoformat(),
-                    utc_end.isoformat(),
-                    len(dropped_fp),
-                    n_before,
-                )
-        return working
-
-    def _record(
-        pose: PoseResult,
-        utc_start: datetime,
-        utc_end: datetime,
-    ) -> None:
-        nonlocal prev_pose
-
-        # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
-        # honest window-quality signal.  The inlier-only residuals the fit
-        # reports look clean even for a contaminated window, because the
-        # Mahalanobis cut rejects the wild tracks; counting the rejected tracks
-        # back in is what exposes the contamination (see _window_resid_rms).
-        rms = _window_resid_rms(pose)
-
-        cov_c = centre_cov_2x2(pose.cov, pose.theta, n_probe_ch)
-        results.append(
-            WindowResult(
-                utc_start=utc_start,
-                utc_end=utc_end,
-                n_inliers=pose.n_inliers,
-                t_x=pose.t_x,
-                sigma_tx=math.sqrt(abs(cov_c[0, 0])),
-                t_y=pose.t_y,
-                sigma_ty=math.sqrt(abs(cov_c[1, 1])),
-                z_p=pose.z_p,
-                sigma_zp=math.sqrt(abs(pose.cov[3, 3])),
-                theta=pose.theta,
-                sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
-                resid_rms=rms,
-            )
-        )
-        prev_pose = pose
-
-    def _utc(t_ns: float) -> datetime:
-        return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+    window_ns = None if window_s is None else int(window_s * 1e9)
+    acc = _WindowAccumulator(
+        z_corr=z_corr,
+        alignment=alignment,
+        n_probe_ch=n_probe_ch,
+        window_ns=window_ns,
+        min_fit=min_fit,
+        max_rigidity_resid_mm=max_rigidity_resid_mm,
+        max_off_probe_mm=max_off_probe_mm,
+        max_pose_jump_mm=max_pose_jump_mm,
+        max_pose_jump_deg=max_pose_jump_deg,
+    )
 
     stream = stream_coincidences(
         tel,
@@ -407,108 +565,11 @@ def monitor_probe(
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
     )
-
-    # A geometric gate only ever removes coincidences, so a raw batch sized to
-    # exactly min_fit can never yield >= min_fit survivors unless the gate
-    # happens to drop nothing. Grow the raw batch past its nominal size,
-    # re-gating on every new coincidence, until the *survivor* count clears
-    # min_fit or the raw batch reaches RAW_CAP_MULTIPLIER * min_fit, at which
-    # point the window is abandoned as contaminated. Without a gate, _run_gates
-    # is a no-op and this reduces to the original fixed-size batching (first
-    # check point == min_fit raw coincidences, always passes, same as before).
-    # The post-fit continuity gate (max_pose_jump_mm/_deg) is a one-shot check
-    # on the *fitted pose*, run once a candidate batch first clears min_fit
-    # survivors: unlike the pre-fit gates, a rejection here drops the whole
-    # batch immediately rather than growing it further -- see
-    # monitor_probe's docstring and _pose_jump.
-    window_ns = None if window_s is None else int(window_s * 1e9)
-    raw_cap = min_fit * RAW_CAP_MULTIPLIER
-    batch: list[Coincidence] = []
-    win_start_ns: int | None = None
     for co in stream:
-        if win_start_ns is None:
-            win_start_ns = co.t_ns
-        batch.append(co)
+        acc.push(co)
+    acc.finalize()
 
-        spanned = window_ns is None or (co.t_ns - win_start_ns >= window_ns)
-        if not spanned or len(batch) < min_fit:
-            continue
-
-        utc_start, utc_end = _utc(win_start_ns), _utc(co.t_ns)
-        working = _run_gates(batch, utc_start, utc_end)
-
-        if len(working) < min_fit:
-            if len(batch) >= raw_cap:
-                logger.warning(
-                    "Dropping window %s–%s: only %d/%d raw coincidence(s) "
-                    "survive the geometric gates after reaching the %dx raw "
-                    "cap (< min_fit=%d).",
-                    utc_start.isoformat(),
-                    utc_end.isoformat(),
-                    len(working),
-                    len(batch),
-                    RAW_CAP_MULTIPLIER,
-                    min_fit,
-                )
-                batch = []
-                win_start_ns = None
-                cold_start_z_ref = None
-                cold_start_n = 0
-            # else: not enough survivors yet — keep growing the raw batch and
-            # re-gate on the next coincidence.
-            continue
-
-        pose = fit_probe_pose(working, z_corr, alignment)
-        if pose.outliers:
-            logger.info(
-                "Window %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
-                "%d via Mahalanobis cut.",
-                utc_start.isoformat(),
-                utc_end.isoformat(),
-                pose.n_inliers,
-                len(working),
-                len(pose.outliers),
-            )
-
-        continuity_ok = True
-        if (
-            max_pose_jump_mm is not None or max_pose_jump_deg is not None
-        ) and prev_pose is not None:
-            pos_jump, theta_jump = _pose_jump(pose, prev_pose)
-            continuity_ok = (
-                max_pose_jump_mm is None or pos_jump <= max_pose_jump_mm
-            ) and (max_pose_jump_deg is None or theta_jump <= max_pose_jump_deg)
-            if not continuity_ok:
-                logger.warning(
-                    "Dropping window %s–%s: post-fit continuity gate rejected "
-                    "the fitted pose (Δpos=%.1f mm, Δθ=%.2f° vs prev "
-                    "z_p=%.1f mm, θ=%.2f°); %d gate-survivor(s) discarded.",
-                    utc_start.isoformat(),
-                    utc_end.isoformat(),
-                    pos_jump,
-                    theta_jump,
-                    prev_pose.z_p,
-                    math.degrees(prev_pose.theta),
-                    len(working),
-                )
-
-        if continuity_ok:
-            _record(pose, utc_start, utc_end)
-        batch = []
-        win_start_ns = None
-        cold_start_z_ref = None
-        cold_start_n = 0
-
-    if batch:
-        utc_start, utc_end = _utc(win_start_ns), _utc(batch[-1].t_ns)
-        logger.warning(
-            "Dropping trailing window %s–%s: stream ended with only %d raw "
-            "coincidence(s), never reaching min_fit=%d survivors.",
-            utc_start.isoformat(),
-            utc_end.isoformat(),
-            len(batch),
-            min_fit,
-        )
+    results = acc.results
 
     # Whole-run residual-RMS distribution — a diagnostic of window quality.
     if results:
