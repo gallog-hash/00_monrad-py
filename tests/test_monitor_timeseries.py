@@ -244,6 +244,47 @@ def test_trailing_batch_logs_warning(count_run, caplog):
     assert any("trailing window" in rec.message for rec in caplog.records)
 
 
+def test_n_probe_ch_too_small_logs_warning(count_run, caplog):
+    """Decoded hits landing outside the configured [0, n_probe_ch*10] mm
+    footprint warn (both immediately and with an end-of-run summary), since a
+    too-small --n-probe-ch silently biases the off-probe gate and the
+    centre-covariance propagation."""
+    _, _, info = count_run  # generated with the probe's real footprint = 30 ch
+    with caplog.at_level("WARNING", logger="monrad.monitor.timeseries"):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            n_probe_ch=20,  # smaller than the probe's real 30-channel footprint
+            min_fit=30,
+            make_plots=False,
+        )
+    assert any(
+        "exceeds the configured footprint" in rec.message for rec in caplog.records
+    )
+    assert any("consider --n-probe-ch" in rec.message for rec in caplog.records)
+
+
+def test_n_probe_ch_sufficient_logs_no_warning(count_run, caplog):
+    """No footprint warning when --n-probe-ch matches (or exceeds) the
+    probe's real footprint."""
+    _, _, info = count_run
+    with caplog.at_level("WARNING", logger="monrad.monitor.timeseries"):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            n_probe_ch=30,  # matches the probe's real footprint
+            min_fit=30,
+            make_plots=False,
+        )
+    assert not any(
+        "exceeds the configured footprint" in rec.message for rec in caplog.records
+    )
+
+
 def test_cli_min_fit_below_floor_rejected():
     """--min-fit under fit_probe_pose's hard minimum errors at parse time,
     not with an uncaught ValueError deep in the fit."""

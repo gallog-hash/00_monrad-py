@@ -220,6 +220,9 @@ class _WindowAccumulator:
         self.cold_start_n = 0
         self.batch: list[Coincidence] = []
         self.win_start_ns: int | None = None
+        self._max_u_seen = 0.0
+        self._max_v_seen = 0.0
+        self._footprint_warned = False
 
     def _run_gates(
         self, coincs: list[Coincidence], utc_start: datetime, utc_end: datetime
@@ -331,6 +334,28 @@ class _WindowAccumulator:
             self.win_start_ns = co.t_ns
         self.batch.append(co)
 
+        if co.u > self._max_u_seen:
+            self._max_u_seen = co.u
+        if co.v > self._max_v_seen:
+            self._max_v_seen = co.v
+        if not self._footprint_warned and (
+            co.u > self.probe_size_mm or co.v > self.probe_size_mm
+        ):
+            logger.warning(
+                "%sDecoded probe hit at (u=%.1f, v=%.1f) mm exceeds the "
+                "configured footprint [0, %.1f] mm (--n-probe-ch=%d); the "
+                "channel count may be too small for this probe, which would "
+                "bias the off-probe gate and the centre-covariance "
+                "propagation. Further out-of-bounds hits this run are "
+                "summarized at end-of-stream, not logged individually.",
+                self._prefix,
+                co.u,
+                co.v,
+                self.probe_size_mm,
+                self.n_probe_ch,
+            )
+            self._footprint_warned = True
+
         spanned = self.window_ns is None or (
             co.t_ns - self.win_start_ns >= self.window_ns
         )
@@ -414,6 +439,18 @@ class _WindowAccumulator:
                 utc_end.isoformat(),
                 len(self.batch),
                 self.min_fit,
+            )
+        if self._footprint_warned:
+            max_seen = max(self._max_u_seen, self._max_v_seen)
+            logger.warning(
+                "%s--n-probe-ch=%d (footprint %.0f mm) was exceeded by decoded "
+                "probe hits during this run (max observed %.1f mm); consider "
+                "--n-probe-ch %d or higher.",
+                self._prefix,
+                self.n_probe_ch,
+                self.probe_size_mm,
+                max_seen,
+                math.ceil(max_seen / 10.0),
             )
 
 
