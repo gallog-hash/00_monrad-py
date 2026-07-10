@@ -89,20 +89,17 @@ import argparse
 import math
 import sys
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from monrad.timing import (
     Quality,
-    find_file_pairs,
-    load_header_params,
     reconstruct_stream,
 )
 from monrad.coincidence import coincidence_stream
-from monrad.reconstruction import decode_position
-from monrad.alignment import AlignmentAccumulator, AlignmentCorrection
+from monrad.alignment import AlignmentCorrection
+from monrad.monitor.io import DetectorFiles, fit_alignment, load_detector
 from monrad.pose import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
 
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
@@ -120,7 +117,7 @@ _TEL_SIZE_MM = 99 * 10.0
 _PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe footprint
 
 
-def _parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="monrad pipeline smoke test")
     p.add_argument(
         "--telescope",
@@ -188,21 +185,32 @@ def _parse_args() -> argparse.Namespace:
         "probe plane, and the inlier tracks to <out>/pose_3d.html "
         "(requires plotly; no-op if stage 5 is skipped).",
     )
-    return p.parse_args()
+    return p
 
 
-def _load_detector(
-    d: Path,
-    label: str,
-) -> tuple[datetime, int, list[Path], list[Path]]:
-    headers = list(d.glob("*_header*.txt"))
-    if not headers:
-        sys.exit(f"ERROR: no *_header.txt found in {d} ({label})")
-    utc0, f0 = load_header_params(headers[0])
-    gps_paths, pos_paths = find_file_pairs(d)
-    if not gps_paths:
-        sys.exit(f"ERROR: no matching *_GPS.bin / *.bin pairs found in {d} ({label})")
-    return utc0, f0, gps_paths, pos_paths
+def _parse_args() -> tuple[argparse.Namespace, set[str]]:
+    args = _build_parser().parse_args()
+
+    # Which flags did the user actually type, vs leave at their default?
+    # Re-parse the same argv with every default suppressed: a dest only
+    # survives into the resulting namespace if the user supplied it.
+    probe = _build_parser()
+    for action in probe._actions:
+        action.default = argparse.SUPPRESS
+    explicit = set(vars(probe.parse_args()).keys())
+    return args, explicit
+
+
+def _load_detector(d: Path, label: str) -> DetectorFiles:
+    """Locate a detector's files, exiting with a clear message on failure.
+
+    Thin CLI wrapper over monitor.io.load_detector: the library helper raises
+    FileNotFoundError, which this turns into the script's sys.exit contract.
+    """
+    try:
+        return load_detector(d)
+    except FileNotFoundError as exc:
+        sys.exit(f"ERROR: {exc} ({label})")
 
 
 def _fmt_q(q: Counter) -> str:
@@ -402,7 +410,7 @@ def _plot_pose_3d(
 
 
 def main() -> None:
-    args = _parse_args()
+    args, explicit = _parse_args()
     tel_dir: Path = args.telescope
     prb_dir: Path = args.probe
     out_dir: Path = args.out
@@ -414,32 +422,38 @@ def main() -> None:
     lines: list[str] = []
 
     # ── Run configuration ────────────────────────────────────────────────
-    # Record the input data directories and the telescope plane
-    # z-coordinates used: the alignment and pose fits depend on them, and
-    # columns are not always stored in z order (the middle plane is
-    # argsort(z)[1], not necessarily column 1).
+    # Record every CLI parameter the run actually used — both the ones the
+    # user typed and the ones left at their default — tagged so a rerun can
+    # tell which is which; the alignment and pose fits are sensitive to all
+    # of them (e.g. columns are not always stored in z order: the middle
+    # plane is argsort(z)[1], not necessarily column 1).
+    def _tag(name: str) -> str:
+        return "(user-specified)" if name in explicit else "(default)"
+
     z_str = "  ".join(f"{zz:g}" for zz in args.z_tel)
     _emit(lines, "=== Run configuration ===")
-    _emit(lines, f"  Telescope data: {tel_dir}")
-    _emit(lines, f"  Probe data:     {prb_dir}")
-    _emit(lines, f"  Telescope plane z (mm): {z_str}")
-    _emit(lines, f"  Min anchor planes: {min_anchor_planes}")
+    _emit(lines, f"  Telescope data:     {tel_dir}  {_tag('telescope')}")
+    _emit(lines, f"  Probe data:         {prb_dir}  {_tag('probe')}")
+    _emit(lines, f"  Output dir:         {out_dir}  {_tag('out')}")
+    _emit(lines, f"  Telescope plane z (mm): {z_str}  {_tag('z_tel')}")
+    _emit(lines, f"  tot_thresh:         {tot_thresh}  {_tag('tot_thresh')}")
+    _emit(lines, f"  tot_weights:        {tot_weights}  {_tag('tot_weights')}")
+    _emit(
+        lines, f"  Min anchor planes:  {min_anchor_planes}  {_tag('min_anchor_planes')}"
+    )
+    _emit(lines, f"  plot:               {args.plot}  {_tag('plot')}")
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────
-    tel_utc0, tel_f0, tel_gps, tel_pos = _load_detector(tel_dir, "telescope")
-    prb_utc0, prb_f0, prb_gps, prb_pos = _load_detector(prb_dir, "probe")
+    tel = _load_detector(tel_dir, "telescope")
+    prb = _load_detector(prb_dir, "probe")
+    tel_utc0, tel_f0, tel_gps, tel_pos = tel
+    prb_utc0, prb_f0, prb_gps, prb_pos = prb
 
     # ── Pass 1a: telescope alignment (stage 4) + telescope event quality ─
-    accum = AlignmentAccumulator(z_tel=z_tel)
-    tel_q: Counter = Counter()
-    for ev, ref in reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0):
-        tel_q[ev.quality] += 1
-        hits = decode_position(
-            ref, tel_pos, n_cols=3, tot_thresh=tot_thresh, tot_weights=tot_weights
-        )
-        accum.add(hits)
-    alignment = accum.flush()
+    alignment, tel_q = fit_alignment(
+        tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
+    )
 
     # ── Pass 1b: probe event quality (stage 1 only) ──────────────────────
     prb_q: Counter = Counter()

@@ -459,3 +459,123 @@ class TestMiddlePlaneByZOrder:
         """The old code fit column 1; it is an outer plane here and stays 0."""
         assert correction_shuffled.planes[1].tilt_x == 0.0
         assert correction_shuffled.planes[1].tilt_y == 0.0
+
+
+# ── Disambiguated hits must not dilute the alignment fit ────────────────
+#
+# disambiguate_telescope_hits() recovers an 'unresolved' plane by predicting
+# its position from the same two-plane (j1, j2) predictor that
+# fit_telescope_alignment() later uses to compute that very plane's own
+# residual.  For a plane with a genuine small physical offset, a candidate
+# lying within the 1.5-strip match tolerance gets accepted regardless of the
+# offset, manufacturing a near-zero residual against the no-misalignment
+# null hypothesis.  AlignmentAccumulator must exclude such events from that
+# plane's own residual sample so a majority-disambiguated batch (DESIGN.md's
+# ~83% real-world unresolved rate) does not dilute the fitted offset toward
+# zero.
+
+_DILUTE_DX = 5.0  # mm — injected middle-plane offset
+_DILUTE_DY = 3.0  # mm
+_N_NATURAL = 100  # naturally golden/cluster events (vote on misalignment)
+_N_DISAMBIGUATED = 900  # majority: recovered via disambiguation, must be excluded
+
+# 3-sigma bound on the mean residual using only the _N_NATURAL sample
+# (same var_factor = 1.5 as the middle-plane statistical basis above).
+_DILUTE_SIGMA_MEAN = _SIGMA_STRIP * math.sqrt(1.5) / math.sqrt(_N_NATURAL)
+
+
+def _translation_offset_hits(
+    dx_offset, dy_offset, n_natural, n_disambiguated, seed=123
+):
+    """
+    N = n_natural + n_disambiguated 3-plane events, straight tracks with a
+    translational offset injected on the middle plane (z=400).
+
+    The first n_natural events report the middle plane directly as
+    'golden' with the offset baked into its measured position (a real,
+    naturally-resolved hit).  The remaining n_disambiguated events report
+    the middle plane as 'unresolved' with a single candidate placed exactly
+    at the raw (un-offset) two-plane prediction — reproducing the
+    disambiguation contamination scenario: a real physical offset small
+    enough that the "wrong" (un-offset) candidate is still the nearest one
+    within tolerance.
+    """
+    import numpy as np
+
+    from monrad.reconstruction import Hit
+
+    rng = np.random.default_rng(seed)
+    events: list[list[Hit]] = []
+
+    for i in range(n_natural + n_disambiguated):
+        a_x, b_x = rng.uniform(300.0, 700.0), rng.uniform(-0.3, 0.3)
+        a_y, b_y = rng.uniform(300.0, 700.0), rng.uniform(-0.3, 0.3)
+        x0, x1_raw, x2 = a_x, a_x + b_x * 400.0, a_x + b_x * 800.0
+        y0, y1_raw, y2 = a_y, a_y + b_y * 400.0, a_y + b_y * 800.0
+
+        h0 = Hit(x0, y0, _SIGMA_STRIP, _SIGMA_STRIP, "golden")
+        h2 = Hit(x2, y2, _SIGMA_STRIP, _SIGMA_STRIP, "golden")
+
+        if i < n_natural:
+            h1 = Hit(
+                x1_raw + dx_offset,
+                y1_raw + dy_offset,
+                _SIGMA_STRIP,
+                _SIGMA_STRIP,
+                "golden",
+            )
+        else:
+            ch_x = round(x1_raw / STRIP_MM - 0.5)
+            ch_y = round(y1_raw / STRIP_MM - 0.5)
+            h1 = Hit(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                "unresolved",
+                candidates_x=[(float(ch_x), 1)],
+                candidates_y=[(float(ch_y), 1)],
+            )
+
+        events.append([h0, h1, h2])
+
+    return events
+
+
+class TestDisambiguationExclusion:
+    @pytest.fixture(scope="class")
+    def correction_diluted(self):
+        events = _translation_offset_hits(
+            _DILUTE_DX, _DILUTE_DY, _N_NATURAL, _N_DISAMBIGUATED
+        )
+        accum = AlignmentAccumulator(flush_every=len(events) + 1)
+        for hits in events:
+            accum.add(hits)
+        return accum.flush()
+
+    def test_disambiguated_hits_were_recovered(self, correction_diluted):
+        """Sanity check: the majority fraction actually got disambiguated
+        into usable 'cluster' hits (not dropped as 'unresolved'), so the
+        accumulator's buffer really did contain _N_DISAMBIGUATED events
+        that could have diluted the fit."""
+        assert correction_diluted.needs_correction
+
+    def test_plane1_delta_x_not_diluted(self, correction_diluted):
+        """
+        Without excluding disambiguated events, the mean over all 1000
+        events would be ~ (100*5 + 900*0)/1000 = 0.5 mm — far outside this
+        bound and below _OFFSET_THRESH.  Excluding them recovers the true
+        5 mm offset from the 100 naturally-resolved events alone.
+        """
+        dx = correction_diluted.planes[1].delta_x
+        assert abs(dx - _DILUTE_DX) < 3 * _DILUTE_SIGMA_MEAN, (
+            f"delta_x[1]={dx:.4f} mm, expected {_DILUTE_DX} "
+            f"± {3 * _DILUTE_SIGMA_MEAN:.4f} mm (dilution not excluded?)"
+        )
+
+    def test_plane1_delta_y_not_diluted(self, correction_diluted):
+        dy = correction_diluted.planes[1].delta_y
+        assert abs(dy - _DILUTE_DY) < 3 * _DILUTE_SIGMA_MEAN, (
+            f"delta_y[1]={dy:.4f} mm, expected {_DILUTE_DY} "
+            f"± {3 * _DILUTE_SIGMA_MEAN:.4f} mm (dilution not excluded?)"
+        )

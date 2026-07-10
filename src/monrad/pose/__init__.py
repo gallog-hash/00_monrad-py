@@ -12,9 +12,12 @@ from .types import (
 )
 from .optimize import (
     fit_probe_pose as fit_probe_pose,
+    filter_rigidity as filter_rigidity,
+    filter_off_probe as filter_off_probe,
     _linear_solve_fixed_theta as _linear_solve_fixed_theta,
     _sigma_tel_at_z as _sigma_tel_at_z,
     _tel_line_fit as _tel_line_fit,
+    _MIN_COINCS as _MIN_COINCS,
 )
 from .fitter import (
     PoseFitter as PoseFitter,
