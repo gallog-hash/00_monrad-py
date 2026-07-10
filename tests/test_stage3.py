@@ -127,6 +127,90 @@ class TestDecodePosition:
                 )
 
 
+# ── fibers-per-ribbon (N) tests ─────────────────────────────────────────
+
+
+class TestFibersPerRibbon:
+    """
+    N (the fiber×ribbon combine factor, DESIGN.md §2.4) is a per-detector
+    parameter — a probe may only wire the first N of the 10 raw fiber bit
+    positions.  A golden hit encoded with N=5 must decode to a *different*
+    channel under N=5 than under the N=10 default, proving the parameter is
+    load-bearing (not silently ignored) and exercising the fixed-width
+    bit_counts slice (POS_HALF_BITS) independently of the variable combine
+    factor.
+    """
+
+    def _write_block(self, tmp_path, name, word, n_cols=1):
+        import struct
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / name
+        bin_path.write_bytes(raw)
+        return bin_path
+
+    def _golden_word(self, x_ribbon_bit, x_fiber_bit, y_ribbon_bit, y_fiber_bit):
+        x_rib = 1 << x_ribbon_bit
+        x_fib = 1 << x_fiber_bit
+        y_rib = 1 << y_ribbon_bit
+        y_fib = 1 << y_fiber_bit
+        return y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42)
+
+    def test_decode_position_n5_matches_n5_encoding(self, tmp_path):
+        from monrad.timing import PosRef
+
+        # N=5 encoding: cx = 5*1 + 4 = 9, cy = 5*3 + 2 = 17
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_golden.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit = decode_position(ref, [bin_path], n_cols=1, n_fibers_per_ribbon=5)[0]
+        assert hit.quality == "golden"
+        assert hit.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
+        assert hit.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
+
+    def test_decode_position_default_n_gives_wrong_channel_for_n5_data(self, tmp_path):
+        """Decoding N=5 data with the N=10 default must NOT recover the true
+        channel — this is what proves n_fibers_per_ribbon is load-bearing."""
+        from monrad.timing import PosRef
+
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_golden_default.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit = decode_position(ref, [bin_path], n_cols=1)[0]
+        assert hit.quality == "golden"
+        # N=10 default: cx = 10*1+4=14, cy = 10*3+2=32 — different channels.
+        assert hit.x_mm == pytest.approx((14 + 0.5) * STRIP_MM)
+        assert hit.y_mm == pytest.approx((32 + 0.5) * STRIP_MM)
+
+    def test_reconstruct_plane_candidates_n5_matches_n5_encoding(self, tmp_path):
+        from monrad.timing import PosRef
+
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_cand.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        res = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, n_fibers_per_ribbon=5
+        )
+        assert len(res) == 1
+        cands = res[0]
+        assert len(cands) == 1
+        c = cands[0]
+        assert c.quality == "golden"
+        assert c.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
+        assert c.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
+
+
 # ── TOT threshold tests ────────────────────────────────────────────────
 
 

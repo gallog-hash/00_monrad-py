@@ -149,6 +149,74 @@ def test_monitor_probes_broadcasts_single_n_probe_ch(tmp_path_factory):
     assert len(all_results) == 2
 
 
+# ── fibers_per_ribbon (N) — per-probe, differing values (regression) ────────
+
+
+def test_monitor_probes_rejects_fibers_per_ribbon_length_mismatch(multiprobe_run):
+    _, _, info1, info2 = multiprobe_run
+    with pytest.raises(ValueError):
+        monitor_probes(
+            info1["tel_dir"],
+            [info1["probe_dir"], info2["probe_dir"]],
+            z_tel=np.array(Z_TEL, dtype=float),
+            fibers_per_ribbon=[10, 5, 3],
+            make_plots=False,
+        )
+
+
+def test_monitor_probes_recovers_each_probe_with_distinct_fibers_per_ribbon(
+    tmp_path_factory,
+):
+    """Two probes sharing one telescope acquisition, wired with different
+    fiber×ribbon combine factors (N=10 and N=5), each recover their own z_p
+    truth when monitor_probes is given the matching per-probe N — the
+    motivating end-to-end scenario for n_fibers_per_ribbon."""
+    z_p1, z_p2 = 300.0, 500.0
+    src1 = tmp_path_factory.mktemp("mp_nfib_src1")
+    src2 = tmp_path_factory.mktemp("mp_nfib_src2")
+    info1 = generate(
+        src1,
+        n_tracks=5000,
+        seed=42,
+        t_x=300.0,
+        t_y=350.0,
+        theta=0.29671,
+        z_p=z_p1,
+        n_probe_ch=30,
+        n_probe_fibers_per_ribbon=10,
+    )
+    info2 = generate(
+        src2,
+        n_tracks=5000,
+        seed=42,
+        t_x=500.0,
+        t_y=150.0,
+        theta=-0.29671,
+        z_p=z_p2,
+        n_probe_ch=30,
+        n_probe_fibers_per_ribbon=5,
+    )
+
+    all_results = monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        window_s=150.0,
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=[30, 30],
+        fibers_per_ribbon=[10, 5],
+        make_plots=False,
+    )
+    assert len(all_results) == 2
+    for idx, z_p_truth in ((0, z_p1), (1, z_p2)):
+        results = all_results[idx]
+        assert results, f"expected at least one window for probe {idx + 1}"
+        for r in results:
+            assert abs(r.z_p - z_p_truth) < 6 * r.sigma_zp, (
+                f"probe {idx + 1}: z_p={r.z_p:.2f} deviates >6sigma from "
+                f"{z_p_truth} (sigma_zp={r.sigma_zp:.3f})"
+            )
+
+
 # ── CLI: repeatable --probe, --n-probe-ch broadcast / per-probe / mismatch ──
 
 
@@ -227,6 +295,67 @@ def test_cli_n_probe_ch_count_matching_neither_rejected():
                 "30",
                 "40",
                 "50",
+            ]
+        )
+
+
+def test_cli_single_fibers_per_ribbon_value_accepted_for_two_probes():
+    args, _ = _parse_args(
+        [
+            "--telescope",
+            "unused",
+            "--probe",
+            "unused1",
+            "--probe",
+            "unused2",
+            "--z-tel",
+            "0",
+            "400",
+            "800",
+            "--fibers-per-ribbon",
+            "5",
+        ]
+    )
+    assert args.fibers_per_ribbon == [5]
+
+
+def test_cli_per_probe_fibers_per_ribbon_values_accepted():
+    args, _ = _parse_args(
+        [
+            "--telescope",
+            "unused",
+            "--probe",
+            "unused1",
+            "--probe",
+            "unused2",
+            "--z-tel",
+            "0",
+            "400",
+            "800",
+            "--fibers-per-ribbon",
+            "10",
+            "5",
+        ]
+    )
+    assert args.fibers_per_ribbon == [10, 5]
+
+
+def test_cli_fibers_per_ribbon_count_matching_neither_rejected():
+    with pytest.raises(SystemExit):
+        _parse_args(
+            [
+                "--telescope",
+                "unused",
+                "--probe",
+                "unused1",
+                "--probe",
+                "unused2",
+                "--z-tel",
+                "0",
+                "--fibers-per-ribbon",
+                "10",
+                "5",
+                "3",
             ]
         )
 

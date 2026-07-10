@@ -470,6 +470,7 @@ def monitor_probe(
     max_pose_jump_deg: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    fibers_per_ribbon: int = 10,
     make_plots: bool = True,
 ) -> list[WindowResult]:
     """Stream an acquisition and fit the probe pose in successive batches.
@@ -567,6 +568,11 @@ def monitor_probe(
         wasn't done.  Skipped on the first window (no reference pose yet).
         Either ``None`` (the default) disables that half of the gate; both
         ``None`` disables it entirely.
+    fibers_per_ribbon:
+        The probe's fiber×ribbon combine factor (DESIGN.md §2.4) — number of
+        fiber positions actually wired per ribbon channel.  Defaults to 10
+        (the raw hardware width); pass the probe's actual value if it wires
+        fewer.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -601,6 +607,7 @@ def monitor_probe(
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
+        fibers_per_ribbon=fibers_per_ribbon,
     )
     for co in stream:
         acc.push(co)
@@ -823,6 +830,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Probe channel count for centre-covariance propagation (default: 30).",
     )
     p.add_argument(
+        "--fibers-per-ribbon",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Probe fiber x ribbon combine factor (DESIGN.md section 2.4) -- "
+        "number of fiber positions wired per ribbon channel (default: 10).",
+    )
+    p.add_argument(
         "--out",
         type=Path,
         default=Path("./pipeline_out/monitor"),
@@ -893,6 +908,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     logger.info("  window_s:            %s  %s", args.window_s, _tag("window_s"))
     logger.info("  n_probe_ch:          %s  %s", args.n_probe_ch, _tag("n_probe_ch"))
+    logger.info(
+        "  fibers_per_ribbon:   %s  %s",
+        args.fibers_per_ribbon,
+        _tag("fibers_per_ribbon"),
+    )
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
     logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
@@ -912,6 +932,7 @@ def main(argv: list[str] | None = None) -> None:
         max_pose_jump_deg=args.max_pose_jump_deg,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
+        fibers_per_ribbon=args.fibers_per_ribbon,
         make_plots=not args.no_plots,
     )
     print(f"Fitted {len(results)} window(s).")

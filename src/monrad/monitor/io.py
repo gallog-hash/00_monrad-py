@@ -18,6 +18,7 @@ import numpy as np
 
 from ..alignment import AlignmentAccumulator, AlignmentCorrection
 from ..coincidence import coincidence_stream
+from ..decoders.position import POS_HALF_BITS
 from ..pose import Coincidence, PoseFitter
 from ..reconstruction import decode_position
 from ..synthetic.generate import STRIP_MM
@@ -155,6 +156,7 @@ def stream_coincidences(
     tot_thresh: int = 1,
     tot_weights: bool = False,
     min_anchor_planes: int = 1,
+    fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> Iterator[Coincidence]:
     """Yield decoded probe–telescope coincidences for one acquisition.
 
@@ -164,6 +166,10 @@ def stream_coincidences(
     generators and emits one :class:`~monrad.pose.Coincidence` per surviving
     cluster.  Shared by the ``resolution`` and ``timeseries`` drivers so the
     fitter wiring and the ``tel_id``/``prb_id`` convention live in one place.
+
+    fibers_per_ribbon : the probe's fiber×ribbon combine factor (DESIGN.md
+    §2.4), passed through as ``PoseFitter``'s ``prb_fibers_per_ribbon``.
+    Telescope decode is unaffected.
     """
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -175,6 +181,7 @@ def stream_coincidences(
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
+        prb_fibers_per_ribbon=fibers_per_ribbon,
     )
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)

@@ -65,6 +65,7 @@ def monitor_probes(
     max_pose_jump_deg: float | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    fibers_per_ribbon: list[int] | None = None,
     make_plots: bool = True,
 ) -> list[list[WindowResult]]:
     """Stream one acquisition and fit N probes' poses independently.
@@ -85,6 +86,10 @@ def monitor_probes(
         Probe channel count(s).  Either one value (broadcast to every
         probe) or one value per ``prb_dirs`` entry, in the same order.
         ``None`` defaults to ``[30]`` (broadcast).
+    fibers_per_ribbon:
+        Probe fiber×ribbon combine factor(s) (DESIGN.md §2.4).  Same
+        broadcast-or-one-per-probe contract as ``n_probe_ch``.  ``None``
+        defaults to ``[10]`` (broadcast).
     Other parameters mirror :func:`~monrad.monitor.timeseries.monitor_probe`
     and apply identically to every probe's independent accumulator.
     """
@@ -102,6 +107,16 @@ def monitor_probes(
         raise ValueError(
             f"n_probe_ch must have length 1 or {len(prb_dirs)} (one per probe), "
             f"got {len(n_probe_ch)}"
+        )
+
+    if fibers_per_ribbon is None:
+        fibers_per_ribbon = [10]
+    if len(fibers_per_ribbon) == 1:
+        fibers_per_ribbon = fibers_per_ribbon * len(prb_dirs)
+    if len(fibers_per_ribbon) != len(prb_dirs):
+        raise ValueError(
+            f"fibers_per_ribbon must have length 1 or {len(prb_dirs)} (one per "
+            f"probe), got {len(fibers_per_ribbon)}"
         )
 
     tel = load_detector(tel_dir)
@@ -124,6 +139,7 @@ def monitor_probes(
             tot_thresh=tot_thresh,
             tot_weights=tot_weights,
             min_anchor_planes=min_anchor_planes,
+            prb_fibers_per_ribbon=fibers_per_ribbon[k],
         )
         for k in range(len(probes))
     ]
@@ -219,6 +235,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "in channel count in a multi-probe setup (default: 30, all probes).",
     )
     p.add_argument(
+        "--fibers-per-ribbon",
+        nargs="+",
+        type=int,
+        default=[10],
+        metavar="N",
+        help="Probe fiber x ribbon combine factor(s) (DESIGN.md section 2.4) -- "
+        "number of fiber positions wired per ribbon channel.  Pass one value to "
+        "apply it to every probe, or one value per --probe (same order) "
+        "(default: 10, all probes).",
+    )
+    p.add_argument(
         "--min-fit",
         type=int,
         default=MIN_FIT,
@@ -302,6 +329,11 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
             f"--n-probe-ch must have length 1 or {n_probes} (matching the "
             f"number of --probe flags); got {len(args.n_probe_ch)}"
         )
+    if len(args.fibers_per_ribbon) not in (1, n_probes):
+        parser.error(
+            f"--fibers-per-ribbon must have length 1 or {n_probes} (matching "
+            f"the number of --probe flags); got {len(args.fibers_per_ribbon)}"
+        )
 
     # Which flags did the user actually type, vs leave at their default?
     probe = _build_parser()
@@ -328,6 +360,11 @@ def main(argv: list[str] | None = None) -> None:
         _tag("z_tel"),
     )
     logger.info("  n_probe_ch:          %s  %s", args.n_probe_ch, _tag("n_probe_ch"))
+    logger.info(
+        "  fibers_per_ribbon:   %s  %s",
+        args.fibers_per_ribbon,
+        _tag("fibers_per_ribbon"),
+    )
     logger.info("  min_fit:             %s  %s", args.min_fit, _tag("min_fit"))
     logger.info(
         "  min_anchor_planes:   %s  %s",
@@ -370,6 +407,7 @@ def main(argv: list[str] | None = None) -> None:
         max_pose_jump_deg=args.max_pose_jump_deg,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
+        fibers_per_ribbon=args.fibers_per_ribbon,
         make_plots=not args.no_plots,
     )
     for k, results in enumerate(all_results):
