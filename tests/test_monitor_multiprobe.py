@@ -396,3 +396,23 @@ def test_cli_min_fit_below_floor_rejected():
                 str(_MIN_COINCS - 1),
             ]
         )
+
+
+@pytest.mark.parametrize("bad_n", [0, 11])
+def test_cli_fibers_per_ribbon_out_of_range_rejected(bad_n):
+    """--fibers-per-ribbon outside 1..10 errors at parse time, not with an
+    uncaught ZeroDivisionError deep in split_channel (see
+    docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md #3)."""
+    with pytest.raises(SystemExit):
+        _parse_args(
+            [
+                "--telescope",
+                "unused",
+                "--probe",
+                "unused",
+                "--z-tel",
+                "0",
+                "--fibers-per-ribbon",
+                str(bad_n),
+            ]
+        )

@@ -345,6 +345,12 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
             f"--fibers-per-ribbon must have length 1 or {n_probes} (matching "
             f"the number of --probe flags); got {len(args.fibers_per_ribbon)}"
         )
+    for n in args.fibers_per_ribbon:
+        if not 1 <= n <= 10:
+            parser.error(
+                "--fibers-per-ribbon values must be in 1..10 (a probe can "
+                f"wire at most the 10 raw fiber positions); got {n}"
+            )
 
     # Which flags did the user actually type, vs leave at their default?
     probe = _build_parser()

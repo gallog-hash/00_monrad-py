@@ -859,6 +859,11 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
             f"--min-fit must be >= {_MIN_COINCS} (fit_probe_pose's hard "
             f"minimum); got {args.min_fit}"
         )
+    if not 1 <= args.fibers_per_ribbon <= 10:
+        parser.error(
+            "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
+            f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
+        )
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only
