@@ -37,7 +37,12 @@ from pathlib import Path
 import numpy as np
 
 from ..pose import PoseFitter, _MIN_COINCS
-from .io import build_cluster_stream, fit_alignment, load_detector
+from .io import (
+    build_cluster_stream,
+    fit_alignment,
+    load_detector,
+    validate_probe_footprint,
+)
 from .timeseries import (
     MIN_FIT,
     WindowResult,
@@ -118,6 +123,12 @@ def monitor_probes(
             f"fibers_per_ribbon must have length 1 or {len(prb_dirs)} (one per "
             f"probe), got {len(fibers_per_ribbon)}"
         )
+
+    for k in range(len(prb_dirs)):
+        try:
+            validate_probe_footprint(n_probe_ch[k], fibers_per_ribbon[k])
+        except ValueError as e:
+            raise ValueError(f"probe {k + 1} ({prb_dirs[k]}): {e}") from e
 
     tel = load_detector(tel_dir)
     probes = [load_detector(d) for d in prb_dirs]

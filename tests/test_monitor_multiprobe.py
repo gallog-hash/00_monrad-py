@@ -164,6 +164,26 @@ def test_monitor_probes_rejects_fibers_per_ribbon_length_mismatch(multiprobe_run
         )
 
 
+def test_monitor_probes_rejects_n_probe_ch_exceeding_fibers_per_ribbon_range(
+    multiprobe_run,
+):
+    """n_probe_ch and fibers_per_ribbon must be mutually consistent per probe
+    (probe 2: n_probe_ch=40 needs channels up to 39, but N=3 only covers
+    0..29) — catches the class of misconfiguration where the two flags
+    silently alias channels instead of erroring (see
+    docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md #2)."""
+    _, _, info1, info2 = multiprobe_run
+    with pytest.raises(ValueError):
+        monitor_probes(
+            info1["tel_dir"],
+            [info1["probe_dir"], info2["probe_dir"]],
+            z_tel=np.array(Z_TEL, dtype=float),
+            n_probe_ch=[30, 40],
+            fibers_per_ribbon=[10, 3],
+            make_plots=False,
+        )
+
+
 def test_monitor_probes_recovers_each_probe_with_distinct_fibers_per_ribbon(
     tmp_path_factory,
 ):

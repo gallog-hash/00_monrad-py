@@ -59,6 +59,24 @@ def load_detector(d: Path) -> DetectorFiles:
     return DetectorFiles(utc0, f0, gps_paths, pos_paths)
 
 
+def validate_probe_footprint(n_probe_ch: int, fibers_per_ribbon: int) -> None:
+    """Raise ``ValueError`` if ``n_probe_ch`` exceeds the channel range
+    ``fibers_per_ribbon`` can actually address (``10 * fibers_per_ribbon``).
+
+    A probe wired at combine factor N only has raw channels ``0..10*N-1``
+    (DESIGN.md §2.4); anything above that aliases into an in-range-but-wrong
+    channel during decode (``split_channel``/``decode_position``) instead of
+    raising, silently biasing the fitted pose.  Catches the class of error
+    where ``--n-probe-ch`` and ``--fibers-per-ribbon`` are inconsistent with
+    each other; does not catch a wrong-but-plausible value for either.
+    """
+    if n_probe_ch > 10 * fibers_per_ribbon:
+        raise ValueError(
+            f"n_probe_ch={n_probe_ch} exceeds the maximum channel range "
+            f"10 * fibers_per_ribbon={10 * fibers_per_ribbon}"
+        )
+
+
 def centre_jacobian(theta: float, n_probe_ch: int) -> np.ndarray:
     """The 2×4 Jacobian ``J = d(cx, cy)/d(t_x, t_y, θ, z_p)`` of the corner→centre map.
 

@@ -285,6 +285,25 @@ def test_n_probe_ch_sufficient_logs_no_warning(count_run, caplog):
     )
 
 
+def test_n_probe_ch_exceeding_fibers_per_ribbon_range_rejected(count_run):
+    """n_probe_ch must not exceed the channel range fibers_per_ribbon can
+    address (10 * fibers_per_ribbon) — catches a class of misconfiguration
+    that would otherwise silently alias channels instead of erroring (see
+    docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md #2)."""
+    _, _, info = count_run
+    with pytest.raises(ValueError):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            window_s=None,
+            z_tel=np.array(Z_TEL, dtype=float),
+            n_probe_ch=40,
+            fibers_per_ribbon=3,
+            min_fit=30,
+            make_plots=False,
+        )
+
+
 def test_cli_min_fit_below_floor_rejected():
     """--min-fit under fit_probe_pose's hard minimum errors at parse time,
     not with an uncaught ValueError deep in the fit."""

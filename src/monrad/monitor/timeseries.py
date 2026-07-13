@@ -71,6 +71,7 @@ from .io import (
     fit_alignment,
     load_detector,
     stream_coincidences,
+    validate_probe_footprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -577,6 +578,7 @@ def monitor_probe(
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
     z_tel = np.asarray(z_tel, dtype=float)
+    validate_probe_footprint(n_probe_ch, fibers_per_ribbon)
 
     tel = load_detector(tel_dir)
     prb = load_detector(prb_dir)
