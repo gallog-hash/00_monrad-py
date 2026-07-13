@@ -174,7 +174,7 @@ shared across the per-probe loop in `multiprobe.py` — decode only the
 probe-specific part per fitter. This was already proposed (and deferred) in
 the module docstring; may be a larger change worth its own session.
 
-### 10. Broadcast/validate-length logic duplicated 4× in `multiprobe.py`
+### 10. Broadcast/validate-length logic duplicated 4× in `multiprobe.py` — FIXED (`5ba6295`)
 **File:** `src/monrad/monitor/multiprobe.py:102` (`monitor_probes`, for both
 `n_probe_ch` and `fibers_per_ribbon`) and `:322-336` (`_parse_args`, same
 pattern again via `parser.error` instead of `ValueError`)
