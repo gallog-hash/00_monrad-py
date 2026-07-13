@@ -385,6 +385,11 @@ def generate(
       plane_offsets   dict as passed in (or {})
       z_tel_offsets   dict as passed in (or {})
     """
+    if n_probe_ch > 10 * n_probe_fibers_per_ribbon:
+        raise ValueError(
+            f"n_probe_ch={n_probe_ch} exceeds the maximum channel range "
+            f"10 * n_probe_fibers_per_ribbon={10 * n_probe_fibers_per_ribbon}"
+        )
     if plane_offsets is None:
         plane_offsets = {}
     if z_tel_offsets is None:

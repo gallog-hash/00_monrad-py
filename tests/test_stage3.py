@@ -210,6 +210,21 @@ class TestFibersPerRibbon:
         assert c.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
         assert c.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
 
+    def test_generate_rejects_n_probe_ch_exceeding_fibers_per_ribbon_range(
+        self, tmp_path
+    ):
+        """n_probe_ch=40 needs channels up to 39, but n=3 only covers 0..29 —
+        generate() must reject this instead of silently corrupting bits
+        (a channel >= 10*n aliases into the neighbouring axis's field, see
+        docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md #1)."""
+        with pytest.raises(ValueError):
+            generate(
+                tmp_path,
+                n_probe_ch=40,
+                n_probe_fibers_per_ribbon=3,
+                n_tracks=10,
+            )
+
 
 # ── TOT threshold tests ────────────────────────────────────────────────
 
