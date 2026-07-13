@@ -57,6 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import AlignmentCorrection
+from ..decoders.position import POS_HALF_BITS
 from ..pose import Coincidence, PoseResult, _MIN_COINCS, fit_probe_pose
 from ..synthetic import generate
 from ..synthetic.generate import N_TEL, STRIP_MM, Z_TEL
@@ -143,6 +144,7 @@ def decode_coincidences(
     alignment: AlignmentCorrection,
     tot_thresh: int,
     tot_weights: bool,
+    fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> tuple[list[Coincidence], dict]:
     """Generate one synthetic acquisition and decode all its coincidences.
 
@@ -157,6 +159,7 @@ def decode_coincidences(
         theta=theta,
         z_p=z_p,
         n_probe_ch=n_probe_ch,
+        n_probe_fibers_per_ribbon=fibers_per_ribbon,
         n_tracks=n_tracks,
         seed=seed,
     )
@@ -171,6 +174,7 @@ def decode_coincidences(
             alignment=alignment,
             tot_thresh=tot_thresh,
             tot_weights=tot_weights,
+            fibers_per_ribbon=fibers_per_ribbon,
         )
     )
     return coincs, info
@@ -312,6 +316,7 @@ def sweep_one_geometry(
     tot_thresh: int,
     tot_weights: bool,
     rng: np.random.Generator,
+    fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> GeomResult | None:
     """Decode one (z_p, r, φ) geometry once, then fit σ(N) over subsamples.
 
@@ -333,6 +338,7 @@ def sweep_one_geometry(
         alignment=alignment,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
+        fibers_per_ribbon=fibers_per_ribbon,
     )
     pool = len(coincs)
     truth = info["pose"]
@@ -994,6 +1000,7 @@ def run_resolution_study(
     n_probe_ch: int = 30,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    fibers_per_ribbon: int = POS_HALF_BITS,
     make_plots: bool = True,
 ) -> list[GeomResult]:
     """Run the full σ(N, z_p, r, φ) sweep and write CSVs + plots to out_dir.
@@ -1051,6 +1058,7 @@ def run_resolution_study(
                     alignment=alignment,
                     tot_thresh=tot_thresh,
                     tot_weights=tot_weights,
+                    fibers_per_ribbon=fibers_per_ribbon,
                     rng=rng,
                 )
                 k += 1

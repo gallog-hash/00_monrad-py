@@ -51,6 +51,43 @@ def test_pose_offset_roundtrip():
             assert cy == pytest.approx(R.TEL_CENTER_MM + r * math.sin(phi))
 
 
+def test_decode_coincidences_recovers_pose_at_non_default_fibers_per_ribbon(
+    tmp_path_factory,
+):
+    """decode_coincidences must thread fibers_per_ribbon into both generate()
+    (ground truth) and stream_coincidences() (decode) so resolution.py can
+    characterize a probe wired at N != 10 (see finding 8 in
+    docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md). Before
+    this was threaded through, decode_coincidences had no fibers_per_ribbon
+    parameter at all, so only the N=10 default could ever be simulated."""
+    from monrad.alignment import AlignmentCorrection
+    from monrad.pose import fit_probe_pose
+
+    z_p, t_x, t_y, theta = 500.0, 300.0, 350.0, 0.29671
+    z_tel = np.array(R.Z_TEL)
+    alignment = AlignmentCorrection.identity()
+    out = tmp_path_factory.mktemp("resolution_n5")
+    coincs, _info = R.decode_coincidences(
+        out,
+        z_p=z_p,
+        n_tracks=5000,
+        seed=42,
+        t_x=t_x,
+        t_y=t_y,
+        theta=theta,
+        n_probe_ch=30,
+        z_tel=z_tel,
+        alignment=alignment,
+        tot_thresh=1,
+        tot_weights=False,
+        fibers_per_ribbon=5,
+    )
+    assert len(coincs) >= R._MIN_COINCS
+    pose = fit_probe_pose(coincs, tel_z=z_tel, alignment=alignment)
+    sigma_zp = math.sqrt(pose.cov[3, 3])
+    assert abs(pose.z_p - z_p) < 6 * sigma_zp
+
+
 def test_rho_eta_helpers():
     """ρ = z_p/L_tel and η = α/α_max are the geometry-normalized coordinates."""
     assert R.rho(R.L_TEL) == pytest.approx(1.0)
