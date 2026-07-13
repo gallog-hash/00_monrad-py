@@ -121,7 +121,7 @@ instead of fixing the actual root cause.
 (footprint too small *or* wrong fibers-per-ribbon), rather than only the
 former.
 
-### 7. New tests only cover golden hits, missing the actual regression case
+### 7. New tests only cover golden hits, missing the actual regression case — FIXED (`d1435b7`)
 **File:** `tests/test_stage3.py:133` (`TestFibersPerRibbon`)
 All three new tests build a golden (width=1) hit at non-default N. No test
 combines a cluster-width (width>1) hit with non-default N — the only path
