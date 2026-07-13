@@ -181,7 +181,9 @@ class BinDecoder:
             reasons.append("Y_ribbon=0")
         return not reasons, reasons
 
-    def or_visual(self, max_groups: int = None):
+    def or_visual(
+        self, max_groups: int = None, n_fibers_per_ribbon: int = POS_HALF_BITS
+    ):
         """
         Group rows by GEN (16 consecutive samples), bitwise-OR the X and Y
         fields across the group, and print a visual bitstream table.
@@ -197,6 +199,12 @@ class BinDecoder:
           - Cluster: adjacent bits produce an interpolated (half-integer) position.
           - Unresolved: multiple clusters or non-contiguous candidates.
         A reconstruction summary is printed after all groups.
+
+        n_fibers_per_ribbon: fiber×ribbon combine factor N (DESIGN.md section
+            2.4) used for channel-index reconstruction. Defaults to
+            POS_HALF_BITS (10); pass the probe's actual value (see
+            --fibers-per-ribbon) for probes wired at a different N, or the
+            channel index printed here won't match the pipeline's decode.
         """
         GROUP_SIZE = 16
         n_cols, n_rows, data = self.read()
@@ -291,7 +299,7 @@ class BinDecoder:
                     stats["invalid"] += 1
                     continue
 
-                N = POS_HALF_BITS
+                N = n_fibers_per_ribbon
                 xfc = self._find_clusters(x_fib)
                 xrc = self._find_clusters(x_rib)
                 yfc = self._find_clusters(y_fib)
@@ -392,14 +400,36 @@ class BinDecoder:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python decode_bin.py <bin_file> [--csv [output.csv]] [--or [N]]")
         print(
-            "  --or [N]   bitwise-OR visual for each GEN group (optionally limit to N groups)"
+            "Usage: python decode_bin.py <bin_file> [--csv [output.csv]] "
+            "[--or [N]] [--fibers-per-ribbon N]"
+        )
+        print(
+            "  --or [N]                bitwise-OR visual for each GEN group "
+            "(optionally limit to N groups)"
+        )
+        print(
+            "  --fibers-per-ribbon N   fiber x ribbon combine factor used to "
+            "reconstruct channel indices in --or output (default: 10)"
         )
         sys.exit(1)
 
     bin_file = sys.argv[1]
     decoder = BinDecoder(bin_file)
+
+    if "--fibers-per-ribbon" in sys.argv:
+        idx = sys.argv.index("--fibers-per-ribbon")
+        if idx + 1 >= len(sys.argv):
+            sys.exit("--fibers-per-ribbon requires a value")
+        n_fibers_per_ribbon = int(sys.argv[idx + 1])
+        if not 1 <= n_fibers_per_ribbon <= POS_HALF_BITS:
+            sys.exit(
+                f"--fibers-per-ribbon must be in 1..{POS_HALF_BITS} (a probe "
+                f"can wire at most the {POS_HALF_BITS} raw fiber positions); "
+                f"got {n_fibers_per_ribbon}"
+            )
+    else:
+        n_fibers_per_ribbon = POS_HALF_BITS
 
     if "--csv" in sys.argv:
         idx = sys.argv.index("--csv")
@@ -417,7 +447,7 @@ def main():
             else None
         )
         max_groups = int(nxt) if nxt is not None else None
-        decoder.or_visual(max_groups)
+        decoder.or_visual(max_groups, n_fibers_per_ribbon=n_fibers_per_ribbon)
     else:
         decoder.analyze()
 

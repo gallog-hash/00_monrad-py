@@ -91,7 +91,7 @@ decode the same data correctly.
 `run_pipeline.py`'s parser and pass it as `prb_fibers_per_ribbon=` into the
 `PoseFitter` construction.
 
-### 5. `monrad-decode-bin --or` debug tool hardcodes N=10, now inconsistent
+### 5. `monrad-decode-bin --or` debug tool hardcodes N=10, now inconsistent — FIXED
 **File:** `src/monrad/decoders/position.py:294` (`BinDecoder.or_visual`)
 The debug/inspection tool hardcodes `N = POS_HALF_BITS` with no way to pass
 a custom N via the `--or` CLI flag (that flag's `N` argument means "limit
