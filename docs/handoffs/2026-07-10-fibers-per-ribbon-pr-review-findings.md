@@ -28,7 +28,7 @@ cleanup/efficiency. After each fix, run the full suite
 
 ## Findings
 
-### 1. Synthetic generator can corrupt bits when `n_probe_ch` doesn't fit `10×N`
+### 1. Synthetic generator can corrupt bits when `n_probe_ch` doesn't fit `10×N` — FIXED (`aa8ef32`)
 **File:** `src/monrad/synthetic/generate.py:187` (`_ch_to_u64`)
 `r_y, f_y = c_y // n, c_y % n` has no bound check that `c_y < 10 * n`. With
 `generate(prb_dir, n_probe_ch=100, n_probe_fibers_per_ribbon=3)`, a hit
@@ -44,7 +44,7 @@ with no error — hard to debug since the corruption is silent.
 `raise ValueError` if `n_probe_ch > 10 * n_probe_fibers_per_ribbon`
 (the true max channel range for combine factor `n`).
 
-### 2. No cross-validation between a probe's `n_probe_ch` and `fibers_per_ribbon`
+### 2. No cross-validation between a probe's `n_probe_ch` and `fibers_per_ribbon` — FIXED (`a656569`)
 **File:** `src/monrad/monitor/multiprobe.py:112` (`monitor_probes`)
 Nothing ties a probe's `n_probe_ch` to its `fibers_per_ribbon`, even though
 the real channel range is bounded by `10 * N`.
@@ -60,7 +60,7 @@ call time and raise a clear `ValueError` — this can't be fully solved (the
 user could still supply a *wrong-but-plausible* N), but it catches the
 class of error where the two flags are inconsistent with each other.
 
-### 3. Unguarded `divmod` on `--fibers-per-ribbon 0` crashes deep in decode
+### 3. Unguarded `divmod` on `--fibers-per-ribbon 0` crashes deep in decode — FIXED (`15f8dcb`)
 **File:** `src/monrad/decoders/position.py:52` (`split_channel`)
 `split_channel(channel, n)` does `divmod(channel, n)` with no lower-bound
 check on `n`. Neither `timeseries.py`'s nor `multiprobe.py`'s argparse setup
@@ -76,7 +76,7 @@ too since a probe can't wire more than the raw 10 fiber positions) in both
 `timeseries.py::_parse_args` and `multiprobe.py::_parse_args`, mirroring the
 `--min-fit` pattern.
 
-### 4. `scripts/run_pipeline.py` never got the new parameter at all
+### 4. `scripts/run_pipeline.py` never got the new parameter at all — FIXED
 **File:** `scripts/run_pipeline.py:593` (`PoseFitter(...)` construction)
 No `--fibers-per-ribbon` (or `--n-probe-ch`) CLI flag exists in this script,
 and its `PoseFitter(...)` call omits `prb_fibers_per_ribbon`.

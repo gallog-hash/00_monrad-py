@@ -166,6 +166,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "default for the combinatorial path; pass --no-tot-weights to disable.",
     )
     p.add_argument(
+        "--fibers-per-ribbon",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Probe fiber x ribbon combine factor (DESIGN.md section 2.4) -- "
+        "number of fiber positions wired per ribbon channel (default: 10).",
+    )
+    p.add_argument(
         "--min-anchor-planes",
         type=int,
         default=1,
@@ -189,7 +197,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_args() -> tuple[argparse.Namespace, set[str]]:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
+    if not 1 <= args.fibers_per_ribbon <= 10:
+        parser.error(
+            "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
+            f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
+        )
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only
@@ -418,6 +432,7 @@ def main() -> None:
     tot_thresh: int = args.tot_thresh
     tot_weights: bool = args.tot_weights
     min_anchor_planes: int = args.min_anchor_planes
+    fibers_per_ribbon: int = args.fibers_per_ribbon
 
     lines: list[str] = []
 
@@ -440,6 +455,10 @@ def main() -> None:
     _emit(lines, f"  tot_weights:        {tot_weights}  {_tag('tot_weights')}")
     _emit(
         lines, f"  Min anchor planes:  {min_anchor_planes}  {_tag('min_anchor_planes')}"
+    )
+    _emit(
+        lines,
+        f"  fibers_per_ribbon:  {fibers_per_ribbon}  {_tag('fibers_per_ribbon')}",
     )
     _emit(lines, f"  plot:               {args.plot}  {_tag('plot')}")
     _emit(lines)
@@ -600,6 +619,7 @@ def main() -> None:
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
+        prb_fibers_per_ribbon=fibers_per_ribbon,
         on_decode=_on_decode,
     )
 
