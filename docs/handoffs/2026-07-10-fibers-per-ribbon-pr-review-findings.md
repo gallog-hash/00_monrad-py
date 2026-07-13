@@ -140,7 +140,7 @@ centroid matches the N=5 encoding and would differ under the N=10 default —
 mirroring the existing `test_tot_weights_shifts_cluster_centroid` pattern but
 with a non-default combine factor.
 
-### 8. `monrad-resolution` can't exercise the new non-default-N path
+### 8. `monrad-resolution` can't exercise the new non-default-N path — FIXED (`11834c1`)
 **File:** `src/monrad/monitor/resolution.py:153` (`generate()` /
 `stream_coincidences()` calls)
 `fibers_per_ribbon`/`n_probe_fibers_per_ribbon` is never threaded through
