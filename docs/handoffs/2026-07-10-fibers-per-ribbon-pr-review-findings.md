@@ -106,7 +106,7 @@ for exactly the probes this PR was built to support.
 (name it something that doesn't collide with the existing `--or` group-limit
 flag).
 
-### 6. Footprint-overflow warning blames only `n_probe_ch`, never mentions `fibers_per_ribbon`
+### 6. Footprint-overflow warning blames only `n_probe_ch`, never mentions `fibers_per_ribbon` — FIXED
 **File:** `src/monrad/monitor/timeseries.py:346` (push-time warning) and
 `:446-448` (finalize-time summary, suggests a specific `--n-probe-ch` value)
 Both messages attribute any out-of-bounds decoded probe hit solely to

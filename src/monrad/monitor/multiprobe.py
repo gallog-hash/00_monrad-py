@@ -159,6 +159,7 @@ def monitor_probes(
             z_corr=z_corr,
             alignment=alignment,
             n_probe_ch=n_probe_ch[k],
+            fibers_per_ribbon=fibers_per_ribbon[k],
             window_ns=window_ns,
             min_fit=min_fit,
             max_rigidity_resid_mm=max_rigidity_resid_mm,

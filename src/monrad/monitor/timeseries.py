@@ -193,6 +193,7 @@ class _WindowAccumulator:
         z_corr: np.ndarray,
         alignment: AlignmentCorrection,
         n_probe_ch: int,
+        fibers_per_ribbon: int = 10,
         window_ns: int | None = None,
         min_fit: int = MIN_FIT,
         max_rigidity_resid_mm: float | None = None,
@@ -204,6 +205,7 @@ class _WindowAccumulator:
         self.z_corr = z_corr
         self.alignment = alignment
         self.n_probe_ch = n_probe_ch
+        self.fibers_per_ribbon = fibers_per_ribbon
         self.probe_size_mm = n_probe_ch * 10.0
         self.window_ns = window_ns
         self.min_fit = min_fit
@@ -344,16 +346,19 @@ class _WindowAccumulator:
         ):
             logger.warning(
                 "%sDecoded probe hit at (u=%.1f, v=%.1f) mm exceeds the "
-                "configured footprint [0, %.1f] mm (--n-probe-ch=%d); the "
-                "channel count may be too small for this probe, which would "
-                "bias the off-probe gate and the centre-covariance "
-                "propagation. Further out-of-bounds hits this run are "
-                "summarized at end-of-stream, not logged individually.",
+                "configured footprint [0, %.1f] mm (--n-probe-ch=%d, "
+                "--fibers-per-ribbon=%d); either the channel count is too "
+                "small for this probe, or --fibers-per-ribbon is wrong and "
+                "channels are aliasing, which would bias the off-probe gate "
+                "and the centre-covariance propagation either way. Further "
+                "out-of-bounds hits this run are summarized at "
+                "end-of-stream, not logged individually.",
                 self._prefix,
                 co.u,
                 co.v,
                 self.probe_size_mm,
                 self.n_probe_ch,
+                self.fibers_per_ribbon,
             )
             self._footprint_warned = True
 
@@ -445,13 +450,18 @@ class _WindowAccumulator:
             max_seen = max(self._max_u_seen, self._max_v_seen)
             logger.warning(
                 "%s--n-probe-ch=%d (footprint %.0f mm) was exceeded by decoded "
-                "probe hits during this run (max observed %.1f mm); consider "
-                "--n-probe-ch %d or higher.",
+                "probe hits during this run (max observed %.1f mm). This "
+                "means either the channel count is too small (consider "
+                "--n-probe-ch %d or higher) or --fibers-per-ribbon=%d is "
+                "wrong for this probe (channel aliasing produces the same "
+                "symptom) -- check the probe's actual wiring before raising "
+                "--n-probe-ch.",
                 self._prefix,
                 self.n_probe_ch,
                 self.probe_size_mm,
                 max_seen,
                 math.ceil(max_seen / 10.0),
+                self.fibers_per_ribbon,
             )
 
 
@@ -593,6 +603,7 @@ def monitor_probe(
         z_corr=z_corr,
         alignment=alignment,
         n_probe_ch=n_probe_ch,
+        fibers_per_ribbon=fibers_per_ribbon,
         window_ns=window_ns,
         min_fit=min_fit,
         max_rigidity_resid_mm=max_rigidity_resid_mm,
