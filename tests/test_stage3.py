@@ -210,6 +210,57 @@ class TestFibersPerRibbon:
         assert c.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
         assert c.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
 
+    def test_decode_position_tot_weighted_cluster_at_n5(self, tmp_path):
+        """
+        Exercises the actual regression this PR fixed: a *cluster* (width>1)
+        hit, decoded with tot_weights=True at a non-default N, through
+        decode_position (not just reconstruct_plane_candidates). This is the
+        only path that touches bit_counts[:POS_HALF_BITS] / bit_counts[n:] in
+        _decode_axis/_tot_weighted_centroid — a future refactor that
+        re-conflates POS_HALF_BITS and n there would corrupt this centroid
+        while every golden-hit (width=1) test above stays green.
+
+        X cluster at N=5: ribbon bit 2, fiber bits 3 and 4 → channels
+        5*2+3=13, 5*2+4=14 (contiguous, so one width-2 cluster). Fiber bit 3
+        fires in all 16 rows, fiber bit 4 in only 4 — same TOT split as
+        test_tot_weights_shifts_cluster_centroid. Weighted centroid =
+        (256*13 + 64*14)/320 = 13.2, vs unweighted 13.5.
+
+        Decoding the identical raw word with the N=10 default instead gives
+        channels 23,24 and weighted centroid 23.2 — proving n_fibers_per_ribbon
+        is load-bearing on the cluster/tot_weights path, not just golden hits.
+        """
+        import struct
+
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        word_full = y_rib | (y_fib << 10) | (x_rib << 32) | ((x_fib_3 | x_fib_4) << 42)
+        word_f3_only = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42)
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+        bin_path = tmp_path / "tot_weighted_n5_cluster.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit_n5 = decode_position(
+            ref, [bin_path], n_cols=1, tot_weights=True, n_fibers_per_ribbon=5
+        )[0]
+        assert hit_n5.quality == "cluster"
+        assert hit_n5.x_mm == pytest.approx((13.2 + 0.5) * STRIP_MM)
+
+        hit_n10 = decode_position(ref, [bin_path], n_cols=1, tot_weights=True)[0]
+        assert hit_n10.quality == "cluster"
+        assert hit_n10.x_mm == pytest.approx((23.2 + 0.5) * STRIP_MM)
+
     def test_generate_rejects_n_probe_ch_exceeding_fibers_per_ribbon_range(
         self, tmp_path
     ):
