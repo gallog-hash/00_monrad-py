@@ -148,14 +148,20 @@ Each axis's 20 bits encode one or more 1 cm strips firing using a folded
 fiber × ribbon scheme: the physical channel index is
 
 ```
-ch = N · ribbon_bit + fiber_bit ,   N = 10
+ch = N · ribbon_bit + fiber_bit
 ```
 
 where `ribbon_bit` is the LSB-indexed position of the bit set in the 10-bit
-ribbon mask and `fiber_bit` likewise for the fiber mask. With 10 fiber × 10
-ribbon = 100 channel codes available, this comfortably covers the 99-channel
-telescope and any practical probe. **Channel 0 is at one physical edge** of
-the active area.
+ribbon mask and `fiber_bit` likewise for the fiber mask. The 10-bit fiber
+mask's bit width is fixed by the readout ASIC, but `N` — the number of those
+10 fiber positions actually wired for a given detector — is a **per-detector
+parameter**, not a hardware constant: a detector may only connect the first
+`N` of the 10 available fiber positions, leaving the rest permanently unset.
+`N` defaults to 10 (all positions wired, giving 10 fiber × 10 ribbon = 100
+channel codes, comfortably covering the 99-channel telescope). The telescope
+is currently assumed fixed at `N = 10`; probes may wire fewer and are
+configured via `n_fibers_per_ribbon`/`--fibers-per-ribbon` (default 10).
+**Channel 0 is at one physical edge** of the active area.
 
 A clean event has exactly one fiber bit and one ribbon bit set per axis (per
 plane), giving an unambiguous channel ("golden hit"). Events with broader
@@ -449,7 +455,10 @@ coord_mm = (ch + 0.5) × strip_pitch_mm   #   strip_pitch_mm = 10
 with channel 0 at one physical edge of the active area. The same convention
 is used for telescope and probes. Any per-detector edge offset (e.g. a frame
 that prevents the leftmost strip from being at exactly x = 0) is absorbed
-into the alignment fits in §7 and §8.
+into the alignment fits in §7 and §8. `ch` here is computed with that
+detector's own fiber×ribbon combine factor `N` (§2.4) — `strip_pitch_mm`
+stays a single global constant, but `ch` itself is `N`-dependent per
+detector.
 
 ### 6.6 Time-over-threshold weight and future refinement
 

@@ -142,6 +142,19 @@ monrad-monitor \
     --z-tel     0 400 800 \
     --min-fit   30 \
     --out       pipeline_out/monitor
+
+# Multi-probe monitoring: N probes sharing one telescope acquisition, fit
+# independently (--probe is repeatable).  Per-probe overrides like
+# --n-probe-ch and --fibers-per-ribbon take either one value (broadcast to
+# every probe) or one value per --probe, in the same order.
+monrad-multiprobe \
+    --telescope data/telescope \
+    --probe     data/probe1 \
+    --probe     data/probe2 \
+    --z-tel     0 400 800 \
+    --n-probe-ch 30 40 \
+    --min-fit   30 \
+    --out       pipeline_out/multiprobe
 ```
 
 ## Package structure

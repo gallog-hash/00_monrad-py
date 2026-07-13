@@ -18,10 +18,13 @@ import numpy as np
 
 from ..alignment import AlignmentAccumulator, AlignmentCorrection
 from ..coincidence import coincidence_stream
+from ..decoders.position import POS_HALF_BITS
 from ..pose import Coincidence, PoseFitter
 from ..reconstruction import decode_position
 from ..synthetic.generate import STRIP_MM
 from ..timing import (
+    PosRef,
+    TimedEvent,
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
@@ -54,6 +57,24 @@ def load_detector(d: Path) -> DetectorFiles:
     if not gps_paths:
         raise FileNotFoundError(f"no *_GPS.bin / *.bin pairs found in {d}")
     return DetectorFiles(utc0, f0, gps_paths, pos_paths)
+
+
+def validate_probe_footprint(n_probe_ch: int, fibers_per_ribbon: int) -> None:
+    """Raise ``ValueError`` if ``n_probe_ch`` exceeds the channel range
+    ``fibers_per_ribbon`` can actually address (``10 * fibers_per_ribbon``).
+
+    A probe wired at combine factor N only has raw channels ``0..10*N-1``
+    (DESIGN.md §2.4); anything above that aliases into an in-range-but-wrong
+    channel during decode (``split_channel``/``decode_position``) instead of
+    raising, silently biasing the fitted pose.  Catches the class of error
+    where ``--n-probe-ch`` and ``--fibers-per-ribbon`` are inconsistent with
+    each other; does not catch a wrong-but-plausible value for either.
+    """
+    if n_probe_ch > 10 * fibers_per_ribbon:
+        raise ValueError(
+            f"n_probe_ch={n_probe_ch} exceeds the maximum channel range "
+            f"10 * fibers_per_ribbon={10 * fibers_per_ribbon}"
+        )
 
 
 def centre_jacobian(theta: float, n_probe_ch: int) -> np.ndarray:
@@ -113,6 +134,37 @@ def fit_alignment(
     return accum.flush(), quality
 
 
+def build_cluster_stream(
+    tel: DetectorFiles,
+    probes: list[DetectorFiles],
+    *,
+    window_ns: int = 200,
+) -> Iterator[list[tuple[int, TimedEvent, PosRef]]]:
+    """Yield coincidence clusters over one telescope and N probes.
+
+    One :func:`~monrad.timing.reconstruct_stream` per detector (telescope +
+    each probe), merged by a single :func:`~monrad.coincidence.coincidence_stream`
+    call.  The telescope is always ``det_id=0``; probe ``k`` (0-indexed in
+    ``probes``) is ``det_id=k+1`` — the same convention
+    :class:`~monrad.pose.PoseFitter`'s ``tel_id``/``prb_id`` already use, so a
+    caller can build one ``PoseFitter`` per probe and call
+    ``fitter.decode_cluster(cluster)`` on the same cluster for each: a cluster
+    only yields a :class:`~monrad.pose.Coincidence` for the probe(s) it is
+    actually consistent with (see ``PoseFitter._decode_cluster``'s multi-probe
+    contract).  Shared by :mod:`~monrad.monitor.multiprobe`;
+    ``window_ns`` mirrors :func:`~monrad.coincidence.coincidence_stream`'s own
+    default (DESIGN.md §4/§5).
+    """
+    tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
+    prb_streams = [
+        reconstruct_stream(p.gps_paths, p.pos_paths, p.utc0, p.f0) for p in probes
+    ]
+    detector_ids = list(range(len(probes) + 1))
+    return coincidence_stream(
+        [tel_stream, *prb_streams], detector_ids=detector_ids, window_ns=window_ns
+    )
+
+
 def stream_coincidences(
     tel: DetectorFiles,
     prb: DetectorFiles,
@@ -122,6 +174,7 @@ def stream_coincidences(
     tot_thresh: int = 1,
     tot_weights: bool = False,
     min_anchor_planes: int = 1,
+    fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> Iterator[Coincidence]:
     """Yield decoded probe–telescope coincidences for one acquisition.
 
@@ -131,6 +184,10 @@ def stream_coincidences(
     generators and emits one :class:`~monrad.pose.Coincidence` per surviving
     cluster.  Shared by the ``resolution`` and ``timeseries`` drivers so the
     fitter wiring and the ``tel_id``/``prb_id`` convention live in one place.
+
+    fibers_per_ribbon : the probe's fiber×ribbon combine factor (DESIGN.md
+    §2.4), passed through as ``PoseFitter``'s ``prb_fibers_per_ribbon``.
+    Telescope decode is unaffected.
     """
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -142,6 +199,7 @@ def stream_coincidences(
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
+        prb_fibers_per_ribbon=fibers_per_ribbon,
     )
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)

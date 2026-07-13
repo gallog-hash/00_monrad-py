@@ -153,6 +153,7 @@ def _ch_to_u64(
     rng: np.random.Generator | None = None,
     fold_symmetry: float = 1.0,
     fold_crosstalk_rate: float = 0.0,
+    n: int = 10,
 ) -> int:
     """Encode a hit as a u64 word.
 
@@ -177,10 +178,14 @@ def _ch_to_u64(
     decodes as a `cluster` of that width (σ = STRIP_MM*width/√12), letting
     a single plane carry a different σ on each axis.  Ignored when fold is
     True (the two encodings are mutually exclusive).
+
+    n: fiber×ribbon combine factor (DESIGN.md §2.4) — number of fiber
+    positions wired per ribbon channel for this detector.  Defaults to 10
+    (the raw hardware width).
     """
-    # ch = 10 * ribbon_bit + fiber_bit
-    r_y, f_y = c_y // 10, c_y % 10
-    r_x, f_x = c_x // 10, c_x % 10
+    # ch = n * ribbon_bit + fiber_bit
+    r_y, f_y = c_y // n, c_y % n
+    r_x, f_x = c_x // n, c_x % n
     if fold:
         if fold_symmetry >= 1.0 and fold_crosstalk_rate <= 0.0:
             # Exact legacy path — no rng needed, byte-identical to today.
@@ -292,6 +297,7 @@ def generate(
     theta: float = 0.29671,  # radians (≈ 17°)
     z_p: float = 300.0,
     n_probe_ch: int = N_PROBE_DEFAULT,
+    n_probe_fibers_per_ribbon: int = 10,
     n_tracks: int = 1000,
     seed: int = 42,
     start_utc: datetime = datetime(2023, 4, 18, 19, 21, 0),
@@ -364,6 +370,11 @@ def generate(
                      is True.
     probe_cluster_width : optional (width_x, width_y) — same idea for the
                      probe plane's hit.
+    n_probe_fibers_per_ribbon : fiber×ribbon combine factor (DESIGN.md
+                     §2.4) for the probe's encoding only — number of fiber
+                     positions wired per ribbon channel.  Defaults to 10
+                     (the raw hardware width).  The telescope is always
+                     encoded at the default (10).
 
     Returns a dict with keys:
       tracks          list of (a_x, b_x, a_y, b_y)
@@ -374,6 +385,11 @@ def generate(
       plane_offsets   dict as passed in (or {})
       z_tel_offsets   dict as passed in (or {})
     """
+    if n_probe_ch > 10 * n_probe_fibers_per_ribbon:
+        raise ValueError(
+            f"n_probe_ch={n_probe_ch} exceeds the maximum channel range "
+            f"10 * n_probe_fibers_per_ribbon={10 * n_probe_fibers_per_ribbon}"
+        )
     if plane_offsets is None:
         plane_offsets = {}
     if z_tel_offsets is None:
@@ -473,7 +489,18 @@ def generate(
     prb_blocks: list[list[int]] = []
     for i in coinc_idx:
         cu, cv = probe_hits[i]
-        prb_blocks.append([_ch_to_u64(cu, cv, gen, width_x=prb_wx, width_y=prb_wy)])
+        prb_blocks.append(
+            [
+                _ch_to_u64(
+                    cu,
+                    cv,
+                    gen,
+                    width_x=prb_wx,
+                    width_y=prb_wy,
+                    n=n_probe_fibers_per_ribbon,
+                )
+            ]
+        )
         gen = (gen + 1) % 2048
 
     # ── write files ──────────────────────────────────────────────

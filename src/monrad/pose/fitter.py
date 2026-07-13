@@ -14,6 +14,7 @@ from typing import Callable
 import numpy as np
 
 from ..alignment import AlignmentCorrection
+from ..decoders.position import POS_HALF_BITS
 from ..reconstruction import (
     GOOD_QUALITIES,
     decode_position,
@@ -48,6 +49,7 @@ class PoseFitter:
         tot_weights: bool = False,
         min_anchor_planes: int = 1,
         on_decode: Callable[[DecodeReport], None] | None = None,
+        prb_fibers_per_ribbon: int = POS_HALF_BITS,
     ) -> None:
         if not 0 <= min_anchor_planes <= N_TEL_PLANES:
             raise ValueError(
@@ -71,6 +73,7 @@ class PoseFitter:
         # track); N_TEL_PLANES requires every plane already resolved.
         self.min_anchor_planes = min_anchor_planes
         self.on_decode = on_decode
+        self.prb_fibers_per_ribbon = prb_fibers_per_ribbon
         self._coincs: list[Coincidence] = []
         self._since_last = 0
         self.result: PoseResult | None = None
@@ -247,6 +250,7 @@ class PoseFitter:
             n_cols=1,
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
+            n_fibers_per_ribbon=self.prb_fibers_per_ribbon,
         )
         prb_hit = prb_hits[0]
         if prb_hit.quality not in GOOD_QUALITIES:

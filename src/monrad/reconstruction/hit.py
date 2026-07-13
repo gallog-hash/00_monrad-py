@@ -26,7 +26,6 @@ from ..decoders.position import (
 )
 
 _STRIP_MM = 10.0  # mm per channel strip — DESIGN.md §6.5
-_N = POS_HALF_BITS  # fiber × ribbon encoding multiplier
 
 # Qualities that count as a usable hit for the pose fit.
 GOOD_QUALITIES = ("golden", "cluster")
@@ -143,14 +142,15 @@ def _tot_weighted_centroid(
     candidates: list[int],
     ribbon_counts: list[int],
     fiber_counts: list[int],
+    n: int = POS_HALF_BITS,
 ) -> float:
     """
     Compute a TOT-weighted centroid over the candidate channel list.
 
-    Each candidate ch = 10*r + f gets weight = ribbon_counts[r] * fiber_counts[f].
+    Each candidate ch = n*r + f gets weight = ribbon_counts[r] * fiber_counts[f].
     Falls back to the unweighted mean if all weights are zero.
     """
-    rf = [split_channel(ch, _N) for ch in candidates]
+    rf = [split_channel(ch, n) for ch in candidates]
     weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
     total = sum(weights)
     if total == 0:
@@ -158,7 +158,7 @@ def _tot_weighted_centroid(
     return sum(w * ch for w, ch in zip(weights, candidates)) / total
 
 
-def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
+def _axis_candidates(field_or: int, n: int = POS_HALF_BITS) -> list[tuple[float, int]]:
     """
     Return candidate (centroid_ch, width) pairs for an axis that decoded as
     'unresolved'.  centroid_ch is in channel units; width is the number of
@@ -177,7 +177,7 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
             # Adjacent ribbons are N apart, so e.g. fiber {3,4} × ribbon {2,3}
             # yields two candidates [23,24] and [33,34], not one width-4 blob
             # straddling the 25..32 gap.
-            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
+            chs = sorted(combine_channel(r, f, n) for r in rc for f in fc)
             run = [chs[0]]
             for ch in chs[1:]:
                 if ch == run[-1] + 1:
@@ -190,7 +190,10 @@ def _axis_candidates(field_or: int) -> list[tuple[float, int]]:
 
 
 def _axis_candidates_with_tot(
-    field_or: int, counts: list[int], tot_weights: bool = False
+    field_or: int,
+    counts: list[int],
+    tot_weights: bool = False,
+    n: int = POS_HALF_BITS,
 ) -> list[tuple[float, int, int]]:
     """
     Like _axis_candidates, but also returns each candidate's TOT score:
@@ -199,17 +202,22 @@ def _axis_candidates_with_tot(
     how solidly each fired bit was seen across the 16-row block.
 
     counts is the 20-element per-bit row count for this field (ribbon 0-9,
-    fiber 10-19), as returned by _bit_counts.
+    fiber 10-19), as returned by _bit_counts — always the raw hardware bit
+    width, regardless of n (the combine factor).
 
     tot_weights : when True, each candidate's centroid is TOT-weighted by its
                   per-channel ribbon_count * fiber_count (same convention as
                   _tot_weighted_centroid / decode_position's tot_weights path),
                   falling back to the unweighted mean when all weights are
                   zero.  Width-1 candidates are unaffected.
+    n           : fiber×ribbon combine factor for this detector (DESIGN.md
+                  §2.4) — number of fiber positions actually wired per ribbon
+                  channel.  Distinct from POS_HALF_BITS, the fixed raw bit
+                  width used to slice counts into ribbon/fiber halves.
     """
     fiber_half, ribbon_half = split_half(field_or)
-    ribbon_counts = counts[:_N]
-    fiber_counts = counts[_N:]
+    ribbon_counts = counts[:POS_HALF_BITS]
+    fiber_counts = counts[POS_HALF_BITS:]
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
@@ -217,7 +225,7 @@ def _axis_candidates_with_tot(
     candidates: list[tuple[float, int, int]] = []
 
     def _emit(run: list[int]) -> None:
-        rf = [split_channel(c, _N) for c in run]
+        rf = [split_channel(c, n) for c in run]
         weights = [ribbon_counts[r] * fiber_counts[f] for r, f in rf]
         tot = sum(weights)
         if tot_weights and tot > 0:
@@ -237,7 +245,7 @@ def _axis_candidates_with_tot(
             # blob straddling the 25..32 gap.  Split into maximal contiguous
             # runs (mirroring _reconstruct_coord's contiguity rule, but
             # enumerating each run instead of rejecting the whole pair).
-            chs = sorted(combine_channel(r, f, _N) for r in rc for f in fc)
+            chs = sorted(combine_channel(r, f, n) for r in rc for f in fc)
             run = [chs[0]]
             for ch in chs[1:]:
                 if ch == run[-1] + 1:
@@ -252,6 +260,7 @@ def _axis_candidates_with_tot(
 def _decode_axis(
     field_or: int,
     bit_counts: list[int] | None = None,
+    n: int = POS_HALF_BITS,
 ) -> tuple[float, float, Literal["golden", "cluster", "unresolved"]]:
     """
     Decode one 20-bit fiber×ribbon field (already extracted from u64).
@@ -265,22 +274,26 @@ def _decode_axis(
     bit_counts : optional 20-element list of per-bit TOT counts
                  (bit_counts[0..9] = ribbon, bit_counts[10..19] = fiber).
                  When provided, cluster centroids are TOT-weighted.
+    n          : fiber×ribbon combine factor for this detector (DESIGN.md
+                 §2.4).
     """
     fiber_half, ribbon_half = split_half(field_or)
 
     fcs = BinDecoder._find_clusters(fiber_half)
     rcs = BinDecoder._find_clusters(ribbon_half)
 
-    res = BinDecoder._reconstruct_coord(fcs, rcs, _N)
+    res = BinDecoder._reconstruct_coord(fcs, rcs, n)
     if res is not None:
         centroid, candidates = res
         width = len(candidates)
         sigma = (_STRIP_MM * width) / math.sqrt(12)
         quality = "golden" if width == 1 else "cluster"
         if bit_counts is not None and width > 1:
-            ribbon_counts = bit_counts[:_N]
-            fiber_counts = bit_counts[_N:]
-            centroid = _tot_weighted_centroid(candidates, ribbon_counts, fiber_counts)
+            ribbon_counts = bit_counts[:POS_HALF_BITS]
+            fiber_counts = bit_counts[POS_HALF_BITS:]
+            centroid = _tot_weighted_centroid(
+                candidates, ribbon_counts, fiber_counts, n
+            )
         return centroid, sigma, quality
 
     return 0.0, 0.0, "unresolved"
@@ -292,6 +305,7 @@ def decode_position(
     n_cols: int,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    n_fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> list[Hit]:
     """
     Decode one event's position from its PosRef.
@@ -316,6 +330,10 @@ def decode_position(
                    (each bit's weight = number of rows it fired in).  Has
                    no effect on golden hits (width=1).  Automatically
                    enables per-bit counting even when tot_thresh=1.
+    n_fibers_per_ribbon : fiber×ribbon combine factor for this detector
+                   (DESIGN.md §2.4) — number of fiber positions actually
+                   wired per ribbon channel.  Defaults to the raw hardware
+                   width (10); probes may wire fewer.
 
     Returns
     -------
@@ -351,8 +369,8 @@ def decode_position(
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "invalid"))
             continue
 
-        cx, sx, qx = _decode_axis(x_or, bit_counts=x_counts_col)
-        cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col)
+        cx, sx, qx = _decode_axis(x_or, bit_counts=x_counts_col, n=n_fibers_per_ribbon)
+        cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col, n=n_fibers_per_ribbon)
 
         if qx == "unresolved" or qy == "unresolved":
             # An axis that DID resolve is kept as a one-element candidate at
@@ -362,12 +380,12 @@ def decode_position(
             # Stage 5 enumerates its own candidates via
             # reconstruct_plane_candidates rather than reading them here.
             cands_x = (
-                _axis_candidates(x_or)
+                _axis_candidates(x_or, n=n_fibers_per_ribbon)
                 if qx == "unresolved"
                 else [(cx, max(1, round(sx * math.sqrt(12) / _STRIP_MM)))]
             )
             cands_y = (
-                _axis_candidates(y_or)
+                _axis_candidates(y_or, n=n_fibers_per_ribbon)
                 if qy == "unresolved"
                 else [(cy, max(1, round(sy * math.sqrt(12) / _STRIP_MM)))]
             )

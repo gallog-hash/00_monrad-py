@@ -15,7 +15,7 @@ from typing import Literal, NamedTuple, Sequence
 import numpy as np
 
 from ..timing import PosRef
-from ..decoders.position import BinDecoder
+from ..decoders.position import BinDecoder, POS_HALF_BITS
 from .hit import (
     Hit,
     _STRIP_MM,
@@ -42,6 +42,7 @@ def reconstruct_plane_candidates(
     max_per_plane: int = 16,
     tot_thresh: int = 1,
     tot_weights: bool = False,
+    n_fibers_per_ribbon: int = POS_HALF_BITS,
 ) -> list[list[PlaneCandidate]]:
     """
     Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
@@ -77,6 +78,10 @@ def reconstruct_plane_candidates(
     candidate centroid is TOT-weighted by its per-bit row counts (no effect
     on width-1 candidates).  Without it the telescope path would silently
     ignore the pipeline's --tot-weights flag that the probe decode honours.
+
+    n_fibers_per_ribbon : fiber×ribbon combine factor for this detector
+    (DESIGN.md §2.4).  Defaults to the raw hardware width (10); callers
+    decoding a probe wired with fewer fiber positions pass its actual N.
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
 
@@ -91,8 +96,12 @@ def reconstruct_plane_candidates(
             planes.append([])
             continue
 
-        cands_x = _axis_candidates_with_tot(x_or, x_counts, tot_weights)
-        cands_y = _axis_candidates_with_tot(y_or, y_counts, tot_weights)
+        cands_x = _axis_candidates_with_tot(
+            x_or, x_counts, tot_weights, n_fibers_per_ribbon
+        )
+        cands_y = _axis_candidates_with_tot(
+            y_or, y_counts, tot_weights, n_fibers_per_ribbon
+        )
 
         points = [
             (wx + wy, cx, cy, wx, wy, tx, ty)

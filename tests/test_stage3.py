@@ -127,6 +127,156 @@ class TestDecodePosition:
                 )
 
 
+# ── fibers-per-ribbon (N) tests ─────────────────────────────────────────
+
+
+class TestFibersPerRibbon:
+    """
+    N (the fiber×ribbon combine factor, DESIGN.md §2.4) is a per-detector
+    parameter — a probe may only wire the first N of the 10 raw fiber bit
+    positions.  A golden hit encoded with N=5 must decode to a *different*
+    channel under N=5 than under the N=10 default, proving the parameter is
+    load-bearing (not silently ignored) and exercising the fixed-width
+    bit_counts slice (POS_HALF_BITS) independently of the variable combine
+    factor.
+    """
+
+    def _write_block(self, tmp_path, name, word, n_cols=1):
+        import struct
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / name
+        bin_path.write_bytes(raw)
+        return bin_path
+
+    def _golden_word(self, x_ribbon_bit, x_fiber_bit, y_ribbon_bit, y_fiber_bit):
+        x_rib = 1 << x_ribbon_bit
+        x_fib = 1 << x_fiber_bit
+        y_rib = 1 << y_ribbon_bit
+        y_fib = 1 << y_fiber_bit
+        return y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42)
+
+    def test_decode_position_n5_matches_n5_encoding(self, tmp_path):
+        from monrad.timing import PosRef
+
+        # N=5 encoding: cx = 5*1 + 4 = 9, cy = 5*3 + 2 = 17
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_golden.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit = decode_position(ref, [bin_path], n_cols=1, n_fibers_per_ribbon=5)[0]
+        assert hit.quality == "golden"
+        assert hit.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
+        assert hit.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
+
+    def test_decode_position_default_n_gives_wrong_channel_for_n5_data(self, tmp_path):
+        """Decoding N=5 data with the N=10 default must NOT recover the true
+        channel — this is what proves n_fibers_per_ribbon is load-bearing."""
+        from monrad.timing import PosRef
+
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_golden_default.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit = decode_position(ref, [bin_path], n_cols=1)[0]
+        assert hit.quality == "golden"
+        # N=10 default: cx = 10*1+4=14, cy = 10*3+2=32 — different channels.
+        assert hit.x_mm == pytest.approx((14 + 0.5) * STRIP_MM)
+        assert hit.y_mm == pytest.approx((32 + 0.5) * STRIP_MM)
+
+    def test_reconstruct_plane_candidates_n5_matches_n5_encoding(self, tmp_path):
+        from monrad.timing import PosRef
+
+        word = self._golden_word(
+            x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
+        )
+        bin_path = self._write_block(tmp_path, "n5_cand.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        res = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, n_fibers_per_ribbon=5
+        )
+        assert len(res) == 1
+        cands = res[0]
+        assert len(cands) == 1
+        c = cands[0]
+        assert c.quality == "golden"
+        assert c.x_mm == pytest.approx((9 + 0.5) * STRIP_MM)
+        assert c.y_mm == pytest.approx((17 + 0.5) * STRIP_MM)
+
+    def test_decode_position_tot_weighted_cluster_at_n5(self, tmp_path):
+        """
+        Exercises the actual regression this PR fixed: a *cluster* (width>1)
+        hit, decoded with tot_weights=True at a non-default N, through
+        decode_position (not just reconstruct_plane_candidates). This is the
+        only path that touches bit_counts[:POS_HALF_BITS] / bit_counts[n:] in
+        _decode_axis/_tot_weighted_centroid — a future refactor that
+        re-conflates POS_HALF_BITS and n there would corrupt this centroid
+        while every golden-hit (width=1) test above stays green.
+
+        X cluster at N=5: ribbon bit 2, fiber bits 3 and 4 → channels
+        5*2+3=13, 5*2+4=14 (contiguous, so one width-2 cluster). Fiber bit 3
+        fires in all 16 rows, fiber bit 4 in only 4 — same TOT split as
+        test_tot_weights_shifts_cluster_centroid. Weighted centroid =
+        (256*13 + 64*14)/320 = 13.2, vs unweighted 13.5.
+
+        Decoding the identical raw word with the N=10 default instead gives
+        channels 23,24 and weighted centroid 23.2 — proving n_fibers_per_ribbon
+        is load-bearing on the cluster/tot_weights path, not just golden hits.
+        """
+        import struct
+
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib_3 = 1 << 3
+        x_fib_4 = 1 << 4
+        word_full = y_rib | (y_fib << 10) | (x_rib << 32) | ((x_fib_3 | x_fib_4) << 42)
+        word_f3_only = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib_3 << 42)
+        raw = struct.pack("<I", 16) + struct.pack("<I", 1)
+        raw += b"".join(
+            struct.pack("<Q", word_full if row < 4 else word_f3_only)
+            for row in range(16)
+        )
+        bin_path = tmp_path / "tot_weighted_n5_cluster.bin"
+        bin_path.write_bytes(raw)
+
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit_n5 = decode_position(
+            ref, [bin_path], n_cols=1, tot_weights=True, n_fibers_per_ribbon=5
+        )[0]
+        assert hit_n5.quality == "cluster"
+        assert hit_n5.x_mm == pytest.approx((13.2 + 0.5) * STRIP_MM)
+
+        hit_n10 = decode_position(ref, [bin_path], n_cols=1, tot_weights=True)[0]
+        assert hit_n10.quality == "cluster"
+        assert hit_n10.x_mm == pytest.approx((23.2 + 0.5) * STRIP_MM)
+
+    def test_generate_rejects_n_probe_ch_exceeding_fibers_per_ribbon_range(
+        self, tmp_path
+    ):
+        """n_probe_ch=40 needs channels up to 39, but n=3 only covers 0..29 —
+        generate() must reject this instead of silently corrupting bits
+        (a channel >= 10*n aliases into the neighbouring axis's field, see
+        docs/handoffs/2026-07-10-fibers-per-ribbon-pr-review-findings.md #1)."""
+        with pytest.raises(ValueError):
+            generate(
+                tmp_path,
+                n_probe_ch=40,
+                n_probe_fibers_per_ribbon=3,
+                n_tracks=10,
+            )
+
+
 # ── TOT threshold tests ────────────────────────────────────────────────
 
 

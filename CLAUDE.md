@@ -118,4 +118,4 @@ Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 - Telescope: 3 planes, 99 channels per axis, 100 cm × 100 cm active area.
 - Probe: 1 plane, 30 cm × 30 cm active area, channel count unknown a priori.
 - Channel → coordinate: `coord_mm = (ch + 0.5) × 10 mm`, channel 0 at one physical edge.
-- Fiber × ribbon encoding: `ch = 10 × ribbon_bit + fiber_bit` (both are LSB-indexed bit positions in the respective 10-bit half of the 20-bit X or Y field).
+- Fiber × ribbon encoding: `ch = N × ribbon_bit + fiber_bit` (both are LSB-indexed bit positions in the respective 10-bit half of the 20-bit X or Y field). `N` (fibers wired per ribbon channel) defaults to 10 but is configurable per probe via `n_fibers_per_ribbon`/`--fibers-per-ribbon`; the telescope is fixed at `N = 10`.
