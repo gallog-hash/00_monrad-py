@@ -54,6 +54,28 @@ from .timeseries import (
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_per_probe(
+    name: str, values: list[int] | None, default: int, n_probes: int
+) -> list[int]:
+    """Broadcast a singleton per-probe override to ``n_probes``, or pass
+    through a value already given one-per-probe.
+
+    ``values=None`` falls back to ``[default]``.  Any other length raises
+    ``ValueError`` -- callers that only want to validate (e.g. ``_parse_args``,
+    which must not mutate an already-broadcast-later CLI list) can call this
+    for its raise and discard the return value.
+    """
+    if values is None:
+        values = [default]
+    if len(values) == 1:
+        return list(values) * n_probes
+    if len(values) == n_probes:
+        return list(values)
+    raise ValueError(
+        f"{name} must have length 1 or {n_probes} (one per probe), got {len(values)}"
+    )
+
+
 def monitor_probes(
     tel_dir: Path,
     prb_dirs: list[Path],
@@ -104,25 +126,10 @@ def monitor_probes(
         raise ValueError("monitor_probes requires at least one probe directory")
     z_tel = np.asarray(z_tel, dtype=float)
 
-    if n_probe_ch is None:
-        n_probe_ch = [30]
-    if len(n_probe_ch) == 1:
-        n_probe_ch = n_probe_ch * len(prb_dirs)
-    if len(n_probe_ch) != len(prb_dirs):
-        raise ValueError(
-            f"n_probe_ch must have length 1 or {len(prb_dirs)} (one per probe), "
-            f"got {len(n_probe_ch)}"
-        )
-
-    if fibers_per_ribbon is None:
-        fibers_per_ribbon = [10]
-    if len(fibers_per_ribbon) == 1:
-        fibers_per_ribbon = fibers_per_ribbon * len(prb_dirs)
-    if len(fibers_per_ribbon) != len(prb_dirs):
-        raise ValueError(
-            f"fibers_per_ribbon must have length 1 or {len(prb_dirs)} (one per "
-            f"probe), got {len(fibers_per_ribbon)}"
-        )
+    n_probe_ch = _broadcast_per_probe("n_probe_ch", n_probe_ch, 30, len(prb_dirs))
+    fibers_per_ribbon = _broadcast_per_probe(
+        "fibers_per_ribbon", fibers_per_ribbon, 10, len(prb_dirs)
+    )
 
     for k in range(len(prb_dirs)):
         try:
@@ -336,16 +343,13 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
             f"minimum); got {args.min_fit}"
         )
     n_probes = len(args.probe)
-    if len(args.n_probe_ch) not in (1, n_probes):
-        parser.error(
-            f"--n-probe-ch must have length 1 or {n_probes} (matching the "
-            f"number of --probe flags); got {len(args.n_probe_ch)}"
+    try:
+        _broadcast_per_probe("--n-probe-ch", args.n_probe_ch, 30, n_probes)
+        _broadcast_per_probe(
+            "--fibers-per-ribbon", args.fibers_per_ribbon, 10, n_probes
         )
-    if len(args.fibers_per_ribbon) not in (1, n_probes):
-        parser.error(
-            f"--fibers-per-ribbon must have length 1 or {n_probes} (matching "
-            f"the number of --probe flags); got {len(args.fibers_per_ribbon)}"
-        )
+    except ValueError as e:
+        parser.error(str(e))
     for n in args.fibers_per_ribbon:
         if not 1 <= n <= 10:
             parser.error(
