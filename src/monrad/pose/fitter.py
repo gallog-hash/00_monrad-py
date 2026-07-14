@@ -20,8 +20,9 @@ from ..reconstruction import (
     decode_position,
     reconstruct_plane_candidates,
 )
+from ..timing import PosRef
 from .optimize import _fit_triple, fit_probe_pose, tel_align_arrays
-from .types import Coincidence, DecodeReport, PoseResult
+from .types import Coincidence, DecodeReport, PoseResult, TelescopeTrackResult
 
 _CHI2_TRACK = 4.0  # telescope line-fit χ² threshold — DESIGN.md §8.2
 N_TEL_PLANES = 3  # telescope planes the combinatorial search fits a line through
@@ -116,6 +117,54 @@ class PoseFitter:
         """
         return self._decode_cluster(cluster)
 
+    def decode_telescope_track(self, cluster: list) -> TelescopeTrackResult:
+        """
+        Run the combinatorial telescope-track search for one cluster and
+        return its outcome, without touching this fitter's probe side.
+
+        Public wrapper over :meth:`_decode_telescope_track` so multi-probe
+        drivers (``monrad.monitor.multiprobe``) can compute this once per
+        cluster and share it across every :class:`PoseFitter` that watches
+        the same cluster and agrees on tel_id/tel_z/alignment/tot_thresh/
+        tot_weights/min_anchor_planes/tel_pos_paths — pass the result to each
+        fitter's :meth:`decode_from_telescope_track` (finding 9).
+        """
+        return self._decode_telescope_track(cluster)
+
+    def decode_from_telescope_track(
+        self, cluster: list, tel_result: TelescopeTrackResult
+    ) -> "Coincidence | None":
+        """
+        Finish decoding a cluster's probe side given a telescope-track
+        result already computed by :meth:`decode_telescope_track` (by this
+        fitter or shared from another — see that method's docstring).
+        """
+        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
+        if len(prb_refs) != 1:
+            self._fire_report("ambiguous_cluster")
+            return None
+        return self._finish_decode(prb_refs[0], tel_result)
+
+    def _fire_report(
+        self,
+        reason: str,
+        cand_counts: tuple[int, int, int] | None = None,
+        chi2: float | None = None,
+        prb_quality: str | None = None,
+        tel_quality: tuple[str, str, str] | None = None,
+    ) -> None:
+        if self.on_decode is not None:
+            self.on_decode(
+                DecodeReport(
+                    accepted=(reason == "accepted"),
+                    reason=reason,
+                    cand_counts=cand_counts,
+                    chi2=chi2,
+                    prb_quality=prb_quality,
+                    tel_quality=tel_quality,
+                )
+            )
+
     def _decode_cluster(
         self,
         cluster: list,
@@ -124,44 +173,43 @@ class PoseFitter:
         Extract telescope and probe hits from a coincidence cluster,
         apply alignment correction, fit a telescope line, apply the
         track quality cut, and return a Coincidence or None.
+
+        A genuine coincidence pairs exactly one telescope track with exactly
+        one hit in *this* probe.  A cluster carrying two or more events from
+        either of those two detectors is ambiguous (two particles inside the
+        window, or a random coincidence) — reject it rather than silently
+        picking one and fabricating a pairing.  Events belonging to *other*
+        probe detectors are ignored here: a single telescope event may
+        legitimately be in coincidence with several distinct probes, each
+        handled by its own PoseFitter.
+
+        The probe-side ambiguity check runs *before* the (expensive)
+        telescope search, mirroring the combined gate this method used to
+        have, so a probe-ambiguous cluster never pays for a search whose
+        result it can't use.
         """
+        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
+        if len(prb_refs) != 1:
+            self._fire_report("ambiguous_cluster")
+            return None
+        tel_result = self._decode_telescope_track(cluster)
+        return self._finish_decode(prb_refs[0], tel_result)
 
-        def _report(
-            reason: str,
-            cand_counts: tuple[int, int, int] | None = None,
-            chi2: float | None = None,
-            prb_quality: str | None = None,
-            tel_quality: tuple[str, str, str] | None = None,
-        ) -> None:
-            if self.on_decode is not None:
-                self.on_decode(
-                    DecodeReport(
-                        accepted=(reason == "accepted"),
-                        reason=reason,
-                        cand_counts=cand_counts,
-                        chi2=chi2,
-                        prb_quality=prb_quality,
-                        tel_quality=tel_quality,
-                    )
-                )
+    def _decode_telescope_track(self, cluster: list) -> TelescopeTrackResult:
+        """
+        Run the combinatorial telescope-track search for one cluster.
 
-        # A genuine coincidence pairs exactly one telescope track with exactly
-        # one hit in *this* probe.  A cluster carrying two or more events from
-        # either of those two detectors is ambiguous (two particles inside the
-        # window, or a random coincidence) — reject it rather than silently
-        # picking one and fabricating a pairing.  Events belonging to *other*
-        # probe detectors are ignored here: a single telescope event may
-        # legitimately be in coincidence with several distinct probes, each
-        # handled by its own PoseFitter.
+        Depends only on the cluster's telescope entry (never on which probe,
+        if any, is asking), so its result is safe to share across every
+        PoseFitter watching the same cluster with an identical telescope-side
+        configuration (finding 9).
+        """
         tel_entries = [
             (ev, ref) for det_id, ev, ref in cluster if det_id == self.tel_id
         ]
-        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
-        if len(tel_entries) != 1 or len(prb_refs) != 1:
-            _report("ambiguous_cluster")
-            return None
+        if len(tel_entries) != 1:
+            return TelescopeTrackResult(accepted=False, reason="ambiguous_cluster")
         tel_ev, tel_ref = tel_entries[0]
-        prb_ref = prb_refs[0]
 
         # Enumerate per-plane candidate positions (golden/cluster axes give
         # one candidate; mirror-fold-ambiguous axes give their full
@@ -182,8 +230,9 @@ class PoseFitter:
         if any(len(c) == 0 for c in cands):
             # A triple needs all 3 planes; single-half dropouts are out of
             # scope for this phase-1 combinatorial search.
-            _report("zero_candidate_plane", cand_counts=cand_counts)
-            return None
+            return TelescopeTrackResult(
+                accepted=False, reason="zero_candidate_plane", cand_counts=cand_counts
+            )
         # Anchor-plane gate (tunable via min_anchor_planes).  An "anchor" is a
         # plane that decoded to a single resolved candidate; zero-candidate
         # planes were already rejected above, so an anchor is exactly a plane
@@ -202,8 +251,9 @@ class PoseFitter:
         # all planes resolved.
         n_anchor = sum(1 for c in cands if len(c) == 1)
         if n_anchor < self.min_anchor_planes:
-            _report("no_anchor_plane", cand_counts=cand_counts)
-            return None
+            return TelescopeTrackResult(
+                accepted=False, reason="no_anchor_plane", cand_counts=cand_counts
+            )
 
         # The alignment-corrected plane z and the per-plane delta/tilt arrays
         # are constant across every triple of this event, so compute them once
@@ -226,12 +276,12 @@ class PoseFitter:
                 best_cands = (c0, c1, c2)
 
         if best_fit is None or best_chi2 >= _CHI2_TRACK:
-            _report(
-                "chi2_track_cut",
+            return TelescopeTrackResult(
+                accepted=False,
+                reason="chi2_track_cut",
                 cand_counts=cand_counts,
                 chi2=(best_chi2 if best_fit is not None else None),
             )
-            return None
         a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
         assert best_cands is not None  # set whenever best_fit is
 
@@ -242,6 +292,36 @@ class PoseFitter:
             best_cands[1].quality,
             best_cands[2].quality,
         )
+        return TelescopeTrackResult(
+            accepted=True,
+            reason="accepted",
+            cand_counts=cand_counts,
+            chi2=best_chi2,
+            a_x=a_x,
+            b_x=b_x,
+            a_y=a_y,
+            b_y=b_y,
+            cov_ab_x=cov_x,
+            cov_ab_y=cov_y,
+            tel_quality=tel_quality,
+            t_ns=tel_ev.t_ns,
+        )
+
+    def _finish_decode(
+        self, prb_ref: PosRef, tel_result: TelescopeTrackResult
+    ) -> "Coincidence | None":
+        """Probe-side decode given an already-resolved telescope track."""
+        if not tel_result.accepted:
+            self._fire_report(
+                tel_result.reason,
+                cand_counts=tel_result.cand_counts,
+                chi2=tel_result.chi2,
+            )
+            return None
+        # tel_quality is always set once tel_result.accepted is True (see
+        # _decode_telescope_track's success return).
+        assert tel_result.tel_quality is not None
+        tel_quality = tel_result.tel_quality
 
         # Decode probe (1 plane)
         prb_hits = decode_position(
@@ -254,35 +334,35 @@ class PoseFitter:
         )
         prb_hit = prb_hits[0]
         if prb_hit.quality not in GOOD_QUALITIES:
-            _report(
+            self._fire_report(
                 "probe_quality",
-                cand_counts=cand_counts,
-                chi2=best_chi2,
+                cand_counts=tel_result.cand_counts,
+                chi2=tel_result.chi2,
                 prb_quality=prb_hit.quality,
                 tel_quality=tel_quality,
             )
             return None
 
-        _report(
+        self._fire_report(
             "accepted",
-            cand_counts=cand_counts,
-            chi2=best_chi2,
+            cand_counts=tel_result.cand_counts,
+            chi2=tel_result.chi2,
             prb_quality=prb_hit.quality,
             tel_quality=tel_quality,
         )
         return Coincidence(
-            a_x=a_x,
-            b_x=b_x,
-            a_y=a_y,
-            b_y=b_y,
-            cov_ab_x=cov_x,
-            cov_ab_y=cov_y,
+            a_x=tel_result.a_x,
+            b_x=tel_result.b_x,
+            a_y=tel_result.a_y,
+            b_y=tel_result.b_y,
+            cov_ab_x=tel_result.cov_ab_x,
+            cov_ab_y=tel_result.cov_ab_y,
             u=prb_hit.x_mm,
             v=prb_hit.y_mm,
             sigma_prb_x=prb_hit.sigma_x,
             sigma_prb_y=prb_hit.sigma_y,
             tel_quality=tel_quality,
-            t_ns=tel_ev.t_ns,
+            t_ns=tel_result.t_ns,
         )
 
     def _refit(self) -> "PoseResult":
