@@ -29,6 +29,12 @@ monrad-decode-bin data/.../20230418_192121.bin --csv out.csv
 python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir>
 python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir> \
     --z-tel 0 400 800 --tot-thresh 2 --tot-weights
+
+# Monitor a probe's pose over time (single- or multi-probe); see README.md
+# for the full flag list and gate semantics. Both accept a macro file
+# (macros/*.args) via `@path/to/file.args` in place of retyping flags.
+monrad-monitor @macros/monitor.args --out pipeline_out/monitor
+monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
 ```
 
 ## Linting and formatting

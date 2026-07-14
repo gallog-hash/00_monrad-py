@@ -40,6 +40,7 @@ import numpy as np
 
 from ..pose import PoseFitter, _MIN_COINCS
 from .io import (
+    MacroArgumentParser,
     build_cluster_stream,
     fit_alignment,
     load_detector,
@@ -229,9 +230,20 @@ def monitor_probes(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = MacroArgumentParser(
         prog="monrad-multiprobe",
         description="Multi-probe pose monitoring over one telescope acquisition.",
+        epilog="Flags can be collected in a macro file and loaded with "
+        "'@path/to/file.args' (one flag per line, '#' comments allowed, "
+        "repeatable flags like --probe on their own lines); e.g. "
+        "'monrad-multiprobe @run.args --out other/'. Single-value flags "
+        "given on the command line after the @file override the file's "
+        "value. --probe is append-only, though: it accumulates across the "
+        "file and the command line rather than overriding, so a CLI "
+        "--probe on top of a macro file adds a probe instead of replacing "
+        "the file's list. --n-probe-ch/--fibers-per-ribbon take the whole "
+        "space-separated list at once, so repeating them (file vs CLI) "
+        "replaces rather than appends.",
     )
     p.add_argument(
         "--telescope",

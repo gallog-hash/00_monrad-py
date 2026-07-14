@@ -1,0 +1,6 @@
+# monrad-monitor macro file (barebone) -- fill in the paths/z-tel below.
+# Load with: monrad-monitor @macros/monitor.args
+# Extra flags on the command line after the @file override lines here.
+--telescope data/tel_dir
+--probe data/prb_dir
+--z-tel 0 400 800
