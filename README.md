@@ -157,6 +157,21 @@ monrad-multiprobe \
     --out       pipeline_out/multiprobe
 ```
 
+Both scripts' flag lists have grown long enough that a run is easier to keep
+in a macro file than to retype: any `@path/to/file.args` argument is expanded
+as one flag per line (`#` comments and blank lines ignored), and flags typed
+directly on the command line after the `@file` still apply on top of it. See
+`macros/monitor.args` / `macros/multiprobe.args` for barebone templates.
+
+```bash
+monrad-monitor @macros/monitor.args --out pipeline_out/monitor
+
+# CLI flags after the @file override single-value flags (e.g. --out here),
+# but --probe is append-only in monrad-multiprobe: a CLI --probe on top of a
+# macro file adds a probe rather than replacing the file's list.
+monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
+```
+
 ## Package structure
 
 Each stage is a domain package whose public API is re-exported from its
