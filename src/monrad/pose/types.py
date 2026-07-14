@@ -6,6 +6,8 @@ Coincidence   per-coincidence telescope-line + probe-hit bundle fed to the
 PoseResult    full optimizer output (fitted pose, covariance, diagnostics).
 DecodeReport / GATE_ORDER   instrumentation of the
               PoseFitter._decode_cluster funnel.
+TelescopeTrackResult   outcome of the telescope-only half of that funnel,
+              shareable across PoseFitters watching the same cluster.
 """
 
 from dataclasses import dataclass, field
@@ -83,6 +85,39 @@ GATE_ORDER = (
     "chi2_track_cut",
     "probe_quality",
 )
+
+
+class TelescopeTrackResult(NamedTuple):
+    """
+    Outcome of PoseFitter._decode_telescope_track: the combinatorial
+    telescope-track search for one coincidence cluster, computed from the
+    cluster's telescope entry alone — independent of which probe (if any)
+    is asking.
+
+    Shareable across every PoseFitter watching the same cluster, as long as
+    they agree on tel_id/tel_z/alignment/tot_thresh/tot_weights/
+    min_anchor_planes/tel_pos_paths (finding 9 — see
+    ``monrad.monitor.multiprobe``).
+
+    accepted=False marks a telescope-side rejection; reason is one of the
+    telescope-side entries of GATE_ORDER ("ambiguous_cluster" for >1 or 0
+    telescope entries in the cluster, "zero_candidate_plane",
+    "no_anchor_plane", "chi2_track_cut"). The line-fit / covariance /
+    tel_quality / t_ns fields are only meaningful when accepted=True.
+    """
+
+    accepted: bool
+    reason: str
+    cand_counts: tuple[int, int, int] | None = None
+    chi2: float | None = None
+    a_x: float = 0.0
+    b_x: float = 0.0
+    a_y: float = 0.0
+    b_y: float = 0.0
+    cov_ab_x: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    cov_ab_y: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    tel_quality: tuple[str, str, str] | None = None
+    t_ns: int = 0
 
 
 # ── Result bundle ─────────────────────────────────────────────────────────

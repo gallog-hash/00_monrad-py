@@ -21,13 +21,15 @@ off-probe gate and the centre-covariance propagation.  Pass one value to
 apply it to every probe, or one value per probe (matching ``--probe``'s
 order 1:1).
 
-Known, deferred inefficiency: the combinatorial telescope track search
-inside ``PoseFitter._decode_cluster`` depends only on a cluster's telescope
-entry, not on which probe is asking, so with N probes every cluster pays
-that search N times over.  Not fixed here (would need a per-cluster
-memoization keyed off the telescope ``PosRef``, shared across fitters) —
-harmless for the small N a real deployment is expected to have; flagged as
-a follow-up alongside the Step 0b deferred-optimization list.
+The combinatorial telescope track search inside ``PoseFitter`` depends only
+on a cluster's telescope entry, not on which probe is asking (finding 9).
+Every fitter built here shares the same ``tel_id``/``tel_z``/``alignment``/
+``tot_thresh``/``tot_weights``/``min_anchor_planes``/``tel_pos_paths``, so
+the search is run once per cluster
+(:meth:`~monrad.pose.PoseFitter.decode_telescope_track`, called on
+``fitters[0]``) and shared with every fitter's
+:meth:`~monrad.pose.PoseFitter.decode_from_telescope_track` instead of each
+fitter re-running it.
 """
 
 import argparse
@@ -161,6 +163,18 @@ def monitor_probes(
         )
         for k in range(len(probes))
     ]
+    # The shared-telescope-search path below assumes every fitter's
+    # telescope-side configuration is identical (finding 9) -- true by
+    # construction above, but re-asserted here since PoseFitter.alignment is
+    # mutable per-instance (update_alignment) and nothing stops a future
+    # change here from diverging it per probe.
+    assert all(f.tel_id == fitters[0].tel_id for f in fitters)
+    assert all(f.alignment is fitters[0].alignment for f in fitters)
+    assert all(f.tel_pos_paths == fitters[0].tel_pos_paths for f in fitters)
+    assert all(np.array_equal(f.tel_z, fitters[0].tel_z) for f in fitters)
+    assert all(f.tot_thresh == fitters[0].tot_thresh for f in fitters)
+    assert all(f.tot_weights == fitters[0].tot_weights for f in fitters)
+    assert all(f.min_anchor_planes == fitters[0].min_anchor_planes for f in fitters)
     accumulators = [
         _WindowAccumulator(
             z_corr=z_corr,
@@ -179,8 +193,9 @@ def monitor_probes(
     ]
 
     for cluster in build_cluster_stream(tel, probes):
+        tel_result = fitters[0].decode_telescope_track(cluster)
         for fitter, acc in zip(fitters, accumulators):
-            co = fitter.decode_cluster(cluster)
+            co = fitter.decode_from_telescope_track(cluster, tel_result)
             if co is not None:
                 acc.push(co)
     for acc in accumulators:

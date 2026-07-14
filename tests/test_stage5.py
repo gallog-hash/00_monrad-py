@@ -896,3 +896,131 @@ class TestDecodeReport:
         assert r.reason == "ambiguous_cluster"
         assert r.cand_counts is None
         assert r.chi2 is None
+
+
+# ── shared telescope-track search across probes (finding 9) ─────────────────
+
+
+class TestSharedTelescopeSearch:
+    """
+    ``PoseFitter.decode_telescope_track`` + ``decode_from_telescope_track``
+    let a multi-probe caller run the combinatorial telescope search once per
+    cluster and reuse the result across every probe's fitter, instead of each
+    fitter's ``decode_cluster`` repeating it (``monrad.monitor.multiprobe``).
+    This must not change any observable outcome relative to calling
+    ``decode_cluster`` independently per fitter, and must actually cut the
+    number of telescope searches from N per cluster to 1.
+    """
+
+    @pytest.fixture(scope="class")
+    def two_probe_setup(self, tmp_path_factory):
+        from monrad.monitor.io import build_cluster_stream, fit_alignment, load_detector
+
+        src1 = tmp_path_factory.mktemp("shared_tel_src1")
+        src2 = tmp_path_factory.mktemp("shared_tel_src2")
+        info1 = generate(
+            src1,
+            n_tracks=500,
+            seed=42,
+            t_x=300.0,
+            t_y=350.0,
+            theta=0.29671,
+            z_p=300.0,
+            n_probe_ch=30,
+        )
+        info2 = generate(
+            src2,
+            n_tracks=500,
+            seed=42,
+            t_x=500.0,
+            t_y=150.0,
+            theta=-0.29671,
+            z_p=500.0,
+            n_probe_ch=40,
+        )
+        tel = load_detector(info1["tel_dir"])
+        probes = [load_detector(info1["probe_dir"]), load_detector(info2["probe_dir"])]
+        alignment, _ = fit_alignment(tel, Z_TEL)
+        clusters = list(build_cluster_stream(tel, probes))
+        assert clusters, "no coincidence clusters generated"
+
+        def make_fitters(on_decode_1=None, on_decode_2=None):
+            return [
+                PoseFitter(
+                    tel_z=Z_TEL,
+                    alignment=alignment,
+                    tel_id=0,
+                    prb_id=1,
+                    tel_pos_paths=tel.pos_paths,
+                    prb_pos_paths=probes[0].pos_paths,
+                    on_decode=on_decode_1,
+                ),
+                PoseFitter(
+                    tel_z=Z_TEL,
+                    alignment=alignment,
+                    tel_id=0,
+                    prb_id=2,
+                    tel_pos_paths=tel.pos_paths,
+                    prb_pos_paths=probes[1].pos_paths,
+                    on_decode=on_decode_2,
+                ),
+            ]
+
+        return clusters, make_fitters
+
+    def test_shared_path_matches_independent_decode_cluster(self, two_probe_setup):
+        clusters, make_fitters = two_probe_setup
+        reports_indep = [[], []]
+        fitters_indep = make_fitters(reports_indep[0].append, reports_indep[1].append)
+        coincs_indep = [[], []]
+        for cluster in clusters:
+            for fitter, bucket in zip(fitters_indep, coincs_indep):
+                bucket.append(fitter.decode_cluster(cluster))
+
+        reports_shared = [[], []]
+        fitters_shared = make_fitters(
+            reports_shared[0].append, reports_shared[1].append
+        )
+        coincs_shared = [[], []]
+        for cluster in clusters:
+            tel_result = fitters_shared[0].decode_telescope_track(cluster)
+            for fitter, bucket in zip(fitters_shared, coincs_shared):
+                bucket.append(fitter.decode_from_telescope_track(cluster, tel_result))
+
+        assert coincs_shared == coincs_indep
+        assert reports_shared == reports_indep
+
+    def test_shared_path_runs_telescope_search_once_per_cluster(
+        self, two_probe_setup, monkeypatch
+    ):
+        import monrad.pose.fitter as fitter_mod
+
+        clusters, make_fitters = two_probe_setup
+        fitters = make_fitters()
+
+        calls = {"n": 0}
+        real_reconstruct = fitter_mod.reconstruct_plane_candidates
+
+        def counting_reconstruct(*args, **kwargs):
+            calls["n"] += 1
+            return real_reconstruct(*args, **kwargs)
+
+        monkeypatch.setattr(
+            fitter_mod, "reconstruct_plane_candidates", counting_reconstruct
+        )
+
+        for cluster in clusters:
+            tel_result = fitters[0].decode_telescope_track(cluster)
+            for fitter in fitters:
+                fitter.decode_from_telescope_track(cluster, tel_result)
+
+        # One telescope search per cluster whose telescope side is
+        # unambiguous, regardless of how many probes (2) are asking -- not
+        # one per (cluster, probe) pair.
+        expected = sum(
+            1
+            for cluster in clusters
+            if sum(1 for det_id, _ev, _ref in cluster if det_id == 0) == 1
+        )
+        assert calls["n"] == expected
+        assert expected > 0

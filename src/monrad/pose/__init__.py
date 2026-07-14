@@ -9,6 +9,7 @@ from .types import (
     DecodeReport as DecodeReport,
     GATE_ORDER as GATE_ORDER,
     PoseResult as PoseResult,
+    TelescopeTrackResult as TelescopeTrackResult,
 )
 from .optimize import (
     fit_probe_pose as fit_probe_pose,
