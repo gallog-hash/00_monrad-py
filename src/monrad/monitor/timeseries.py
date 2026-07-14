@@ -67,6 +67,7 @@ from ..pose import (
     fit_probe_pose,
 )
 from .io import (
+    MacroArgumentParser,
     centre_cov_2x2,
     fit_alignment,
     load_detector,
@@ -728,9 +729,13 @@ def _plot_timeseries(results: list[WindowResult], path: Path) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = MacroArgumentParser(
         prog="monrad-monitor",
         description="Probe pose monitoring over an acquisition.",
+        epilog="Flags can be collected in a macro file and loaded with "
+        "'@path/to/file.args' (one flag per line, '#' comments allowed); "
+        "e.g. 'monrad-monitor @run.args --out other/'. Flags given on the "
+        "command line after the @file override lines from the file.",
     )
     p.add_argument(
         "--telescope",
