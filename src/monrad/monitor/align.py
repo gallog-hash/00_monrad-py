@@ -404,7 +404,9 @@ def compute_alignment(
 
     corrections: list[AlignmentCorrection] = []
     rows: list[dict[str, str]] = []
-    for label, gps, pos in windows:
+    for i, (label, gps, pos) in enumerate(windows):
+        if i > 0:
+            logger.info("")  # blank line between windows' log blocks
         correction, n_events, quality = _fit_window(
             det,
             f"window {label}",
@@ -533,6 +535,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
     logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
+    logger.info("")
 
     corrections = compute_alignment(
         args.telescope,
@@ -546,6 +549,7 @@ def main(argv: list[str] | None = None) -> None:
         make_plots=not args.no_plots,
     )
     n_flagged = sum(c.needs_correction for c in corrections)
+    logger.info("")
     print(
         f"Processed {len(corrections)} window(s); {n_flagged} flagged "
         "needs_correction=True" + (" (see WARNING(s) above)" if n_flagged else "")
