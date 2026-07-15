@@ -163,31 +163,48 @@ as one flag per line (`#` comments and blank lines ignored), and flags typed
 directly on the command line after the `@file` still apply on top of it. See
 `macros/monitor.args` / `macros/multiprobe.args` for barebone templates.
 
-### Daily alignment calibration + hardware-drift monitor
+### Alignment calibration + hardware-drift monitor
 
 The telescope stack is rigidly mounted, so its internal alignment
-(DESIGN.md §7) is a stable, once-a-day calibration — not something worth
-refitting on every monitoring run. `monrad-align` computes the correction
-**once per day** from the first few telescope files of that day, saves it as a
-reusable artifact, and appends the fit to a running drift log:
+(DESIGN.md §7) is a stable calibration on a fixed refit cadence — not
+something worth refitting on every monitoring run. By default `monrad-align`
+processes the **entire dataset** in `--telescope`, computing one correction
+per `--interval-hours` window (default 24h, i.e. once per calendar day) from
+that window's first few telescope files, saving each as a reusable artifact,
+and appending every fit to a running drift log:
 
 ```bash
-# Fit the earliest day in the directory (or pick one with --date YYYYMMDD)
-# from its first --n-files pairs (default 3). Writes alignment_<date>.json,
-# updates alignment_history.csv, and regenerates alignment_history.png.
+# Process every 24h window (one per calendar day) across the whole
+# --telescope directory, from each day's first --n-files pairs (default 3).
+# Writes one alignment_<date>.json per window, updates alignment_history.csv,
+# and regenerates alignment_history.png once at the end of the run.
 monrad-align \
     --telescope data/telescope \
     --z-tel     0 400 800 \
     --out       pipeline_out/alignment
+
+# Refit every 6 hours instead (four windows/day) and use 5 files per window.
+monrad-align --telescope data/telescope --z-tel 0 400 800 \
+    --interval-hours 6 --n-files 5 --out pipeline_out/alignment
+
+# Restrict to one day (or, under a sub-day --interval-hours, pass a full
+# YYYYMMDD_HHMMSS to restrict to one window).
+monrad-align --telescope data/telescope --z-tel 0 400 800 \
+    --date 20230418 --out pipeline_out/alignment
 ```
+
+Windows are anchored to 00:00 of the earliest day present; a sub-day window's
+label (and its `alignment_<label>.json` file) carries the full
+`YYYYMMDD_HHMMSS` start timestamp, while a whole-day (default) window keeps
+the plain `YYYYMMDD` label.
 
 The fit doubles as a **hardware monitor**: `fit_telescope_alignment` flags
 `needs_correction` when any plane's offset / rotation / z-offset / tilt exceeds
-a mechanical limit. Each day's per-plane parameters are appended to
-`alignment_history.csv` (one row per date, idempotent — re-running a day
-replaces its row) and plotted against date in `alignment_history.png` with the
-limits drawn in, so drift is visible over time. A breach is logged loudly, but
-the tool still exits 0 — it reports, it does not gate.
+a mechanical limit. Each window's per-plane parameters are appended to
+`alignment_history.csv` (one row per window label, idempotent — re-running a
+window replaces its row) and plotted against date in `alignment_history.png`
+with the limits drawn in, so drift is visible over time. A breach is logged
+loudly, but the tool still exits 0 — it reports, it does not gate.
 
 Feed the saved correction to the monitoring drivers with `--alignment`, which
 loads it and **skips the in-run alignment fit** (dropping a full telescope
@@ -226,7 +243,7 @@ src/monrad/
                       #   io.py: save_alignment/load_alignment (JSON)
     pose/             # stage 5: probe pose fit       → PoseFitter
     monitor/          # monitoring drivers (resolution, timeseries,
-                      #   multiprobe, align — daily calibration/drift monitor)
+                      #   multiprobe, align — alignment calibration/drift monitor)
     synthetic/        # synthetic-data generator (for testing)
 ```
 

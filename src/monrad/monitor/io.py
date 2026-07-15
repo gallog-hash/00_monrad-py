@@ -12,7 +12,7 @@ import math
 import shlex
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -132,6 +132,100 @@ def select_day_files(
     gps = [p[0] for p in pairs]
     pos = [p[1] for p in pairs]
     return day, gps, pos
+
+
+def _parse_file_ts(name: str) -> datetime:
+    """Parse the ``YYYYMMDD_HHMMSS`` acquisition timestamp off a file name."""
+    return datetime.strptime(name[:15], "%Y%m%d_%H%M%S")
+
+
+def _window_label(start: datetime, interval_hours: float) -> str:
+    """Format a window's start as a file-name / CSV-safe label.
+
+    A window that starts at midnight and spans whole calendar day(s)
+    (``interval_hours`` a multiple of 24) gets the plain ``YYYYMMDD`` label
+    :func:`group_by_day` already uses -- so the default ``interval_hours=24``
+    reproduces the existing ``alignment_<date>.json`` naming exactly.  Any
+    finer window gets the full ``YYYYMMDD_HHMMSS`` start timestamp (the same
+    style acquisition files already use) so same-day windows stay distinct.
+    """
+    if (
+        interval_hours >= 24
+        and interval_hours % 24 == 0
+        and start.hour == 0
+        and start.minute == 0
+        and start.second == 0
+    ):
+        return start.strftime("%Y%m%d")
+    return start.strftime("%Y%m%d_%H%M%S")
+
+
+def group_by_interval(
+    det: DetectorFiles, interval_hours: float
+) -> "OrderedDict[str, list[tuple[Path, Path]]]":
+    """Group a detector's file pairs into fixed-length, midnight-anchored windows.
+
+    Generalizes :func:`group_by_day` (equivalent to ``interval_hours=24``) to
+    an arbitrary refit cadence, e.g. ``interval_hours=6`` for four alignment
+    windows a day. Windows are anchored to 00:00 of the earliest day present,
+    so an integer number of windows tiles each calendar day whenever ``24 %
+    interval_hours == 0``. Returned mapping is ordered by window start; each
+    window's file list is ordered by filename (= acquisition time).
+    """
+    pairs = sorted(zip(det.gps_paths, det.pos_paths), key=lambda pair: pair[0].name)
+    grouped: dict[datetime, list[tuple[Path, Path]]] = {}
+    if pairs:
+        interval = timedelta(hours=interval_hours)
+        origin = _parse_file_ts(pairs[0][0].name).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        for gps, pos in pairs:
+            idx = (_parse_file_ts(gps.name) - origin) // interval
+            start = origin + idx * interval
+            grouped.setdefault(start, []).append((gps, pos))
+    windows: "OrderedDict[str, list[tuple[Path, Path]]]" = OrderedDict()
+    for start in sorted(grouped):
+        windows[_window_label(start, interval_hours)] = grouped[start]
+    return windows
+
+
+def select_alignment_windows(
+    det: DetectorFiles,
+    interval_hours: float,
+    n_files: int,
+    date: str | None = None,
+) -> list[tuple[str, list[Path], list[Path]]]:
+    """Pick each refit window's first ``n_files`` (gps, pos) pairs.
+
+    ``date=None`` (the default) selects *every* window across the whole
+    telescope directory -- one alignment refit per ``interval_hours``,
+    spanning the full acquisition. Pass an exact window label
+    (``YYYYMMDD`` for a default day-long window, or ``YYYYMMDD_HHMMSS`` for a
+    specific finer one) to refit just that one window, or a bare ``YYYYMMDD``
+    day prefix under a sub-day ``interval_hours`` to refit every window
+    falling on that day. Raises ``ValueError`` if nothing matches.
+    """
+    windows = group_by_interval(det, interval_hours)
+    if not windows:
+        raise ValueError("no dated file pairs found")
+    if date is None:
+        labels = list(windows)
+    elif date in windows:
+        labels = [date]
+    else:
+        labels = [lbl for lbl in windows if lbl.startswith(date)]
+        if not labels:
+            raise ValueError(
+                f"no files for date {date!r}; available windows: {', '.join(windows)}"
+            )
+    return [
+        (
+            lbl,
+            [g for g, _ in windows[lbl][:n_files]],
+            [p for _, p in windows[lbl][:n_files]],
+        )
+        for lbl in labels
+    ]
 
 
 def fit_daily_alignment(

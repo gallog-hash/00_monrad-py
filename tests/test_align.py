@@ -1,9 +1,10 @@
-"""Tests for the daily alignment calibration + hardware-drift monitor.
+"""Tests for the telescope alignment calibration + hardware-drift monitor.
 
 Covers monrad.alignment.io (JSON round-trip + z_tel guard) and
-monrad.monitor.align (day grouping/selection, whole-subset fit,
-needs_correction flagging, idempotent history CSV, and the monitor drivers'
---alignment reuse path).  All synthetic; no real detector files required.
+monrad.monitor.align (day/window grouping+selection, whole-subset fit,
+needs_correction flagging, idempotent history CSV, the whole-dataset default
+(compute_alignment/--interval-hours), and the monitor drivers' --alignment
+reuse path).  All synthetic; no real detector files required.
 """
 
 import csv
@@ -21,11 +22,17 @@ from monrad.alignment import (
     save_alignment,
 )
 from monrad.monitor.align import (
+    compute_alignment,
     compute_daily_alignment,
     group_by_day,
     select_day_files,
 )
-from monrad.monitor.io import DetectorFiles, load_detector
+from monrad.monitor.io import (
+    DetectorFiles,
+    group_by_interval,
+    load_detector,
+    select_alignment_windows,
+)
 from monrad.monitor.timeseries import monitor_probe
 from monrad.synthetic.generate import Z_TEL, generate
 
@@ -134,6 +141,57 @@ def test_select_missing_date_raises():
         select_day_files(det, date="20991231", n_files=3)
 
 
+# ── interval-based window grouping / selection ───────────────────────────────
+
+
+def test_group_by_interval_default_24h_matches_group_by_day():
+    det = _fake_detector(["20230418_090000", "20230418_100000", "20230419_080000"])
+    assert list(group_by_interval(det, 24.0)) == list(group_by_day(det))
+
+
+def test_group_by_interval_sub_day_windows():
+    det = _fake_detector(
+        ["20230418_000000", "20230418_060500", "20230418_120000", "20230418_180500"]
+    )
+    windows = group_by_interval(det, 6.0)
+    assert list(windows) == [
+        "20230418_000000",
+        "20230418_060000",
+        "20230418_120000",
+        "20230418_180000",
+    ]
+    assert [p[0].name for p in windows["20230418_060000"]] == [
+        "20230418_060500_GPS.bin"
+    ]
+
+
+def test_select_alignment_windows_default_returns_every_window():
+    det = _fake_detector(["20230418_090000", "20230419_080000", "20230420_070000"])
+    windows = select_alignment_windows(det, 24.0, n_files=3)
+    assert [label for label, _, _ in windows] == ["20230418", "20230419", "20230420"]
+
+
+def test_select_alignment_windows_exact_label():
+    det = _fake_detector(["20230418_090000", "20230419_080000"])
+    windows = select_alignment_windows(det, 24.0, n_files=3, date="20230419")
+    assert [label for label, _, _ in windows] == ["20230419"]
+
+
+def test_select_alignment_windows_day_prefix_selects_sub_day_windows():
+    det = _fake_detector(["20230418_000000", "20230418_070000", "20230419_000000"])
+    windows = select_alignment_windows(det, 6.0, n_files=3, date="20230418")
+    assert [label for label, _, _ in windows] == [
+        "20230418_000000",
+        "20230418_060000",
+    ]
+
+
+def test_select_alignment_windows_missing_date_raises():
+    det = _fake_detector(["20230418_090000"])
+    with pytest.raises(ValueError, match="no files for date"):
+        select_alignment_windows(det, 24.0, n_files=3, date="20991231")
+
+
 # ── whole-subset fit + artifacts (end-to-end on synthetic data) ──────────────
 
 
@@ -215,6 +273,53 @@ def test_history_two_days_sorted(tmp_path: Path):
     compute_daily_alignment(tel, _Z, date="20230418", out_dir=out, make_plots=False)
     rows = _read_history(out / "alignment_history.csv")
     assert [r["date"] for r in rows] == ["20230418", "20230419"]  # sorted by date
+
+
+# ── whole-dataset default (compute_alignment / --interval-hours) ─────────────
+
+
+def test_compute_alignment_processes_entire_dataset_by_default(tmp_path: Path):
+    tel = tmp_path / "tel"
+    _gen_day(tel, "20230418", "192100")
+    _gen_day(tel, "20230419", "080000")
+    _gen_day(tel, "20230420", "070000")
+    out = tmp_path / "out"
+    corrections = compute_alignment(tel, _Z, out_dir=out, make_plots=False)
+    assert len(corrections) == 3
+    for day in ("20230418", "20230419", "20230420"):
+        assert (out / f"alignment_{day}.json").exists()
+    rows = _read_history(out / "alignment_history.csv")
+    assert [r["date"] for r in rows] == ["20230418", "20230419", "20230420"]
+
+
+def test_compute_alignment_date_restricts_to_one_window(tmp_path: Path):
+    tel = tmp_path / "tel"
+    _gen_day(tel, "20230418", "192100")
+    _gen_day(tel, "20230419", "080000")
+    out = tmp_path / "out"
+    corrections = compute_alignment(
+        tel, _Z, date="20230419", out_dir=out, make_plots=False
+    )
+    assert len(corrections) == 1
+    assert (out / "alignment_20230419.json").exists()
+    assert not (out / "alignment_20230418.json").exists()
+
+
+def test_compute_alignment_plots_once_per_run(tmp_path: Path, monkeypatch):
+    tel = tmp_path / "tel"
+    _gen_day(tel, "20230418", "192100")
+    _gen_day(tel, "20230419", "080000")
+    _gen_day(tel, "20230420", "070000")
+    out = tmp_path / "out"
+
+    calls: list[int] = []
+    import monrad.monitor.align as align_mod
+
+    monkeypatch.setattr(
+        align_mod, "_plot_history", lambda rows, _path: calls.append(len(rows))
+    )
+    compute_alignment(tel, _Z, out_dir=out, make_plots=True)
+    assert calls == [3]  # plotted exactly once, with all 3 accumulated rows
 
 
 # ── monitor reuse path ───────────────────────────────────────────────────────
