@@ -1,20 +1,28 @@
-"""Daily telescope alignment calibration + hardware-drift monitor.
+"""Telescope alignment calibration + hardware-drift monitor.
 
 Console script ``monrad-align``.  The telescope stack is rigidly mounted, so
-its internal alignment (DESIGN.md §7) is a stable, once-a-day calibration
-rather than something worth refitting on every monitoring run.  This tool:
+its internal alignment (DESIGN.md §7) is a stable calibration refit on a
+fixed cadence (one day by default) rather than something worth refitting on
+every monitoring run.  By default this tool processes the **entire dataset**
+in the given telescope directory:
 
-1. picks the **first ``--n-files`` telescope file pairs of one day** (the
-   earliest day in the directory, or ``--date YYYYMMDD``),
-2. fits **one** :class:`~monrad.alignment.AlignmentCorrection` over *all*
-   events in those files (a true whole-subset fit), and
-3. writes it to ``alignment_<date>.json`` for the monitoring drivers to load
+1. splits it into fixed-length, midnight-anchored windows of
+   ``--interval-hours`` (default 24 -- one per calendar day; pass e.g. ``6``
+   for four refits a day),
+2. for each window, fits **one** :class:`~monrad.alignment.AlignmentCorrection`
+   over *all* events in that window's first ``--n-files`` file pairs (a true
+   whole-subset fit), and
+3. writes it to ``alignment_<label>.json`` for the monitoring drivers to load
    with ``--alignment`` instead of refitting.
 
-Day-selection (:func:`~monrad.monitor.io.select_day_files`) and the
-whole-subset fit (:func:`~monrad.monitor.io.fit_daily_alignment`) live in
-:mod:`monrad.monitor.io` and are reused, unchanged, by the monitoring
-drivers' no-``--alignment`` fallback (``monrad.monitor.io.fit_alignment``),
+Pass ``--date`` to restrict this to one day (or, under a sub-day
+``--interval-hours``, one specific window).
+
+Window selection (:func:`~monrad.monitor.io.select_alignment_windows`) and
+the whole-subset fit (:func:`~monrad.monitor.io.fit_daily_alignment`) live in
+:mod:`monrad.monitor.io`.  The single-day building block
+(:func:`~monrad.monitor.io.select_day_files`) is reused, unchanged, by the
+monitoring drivers' no-``--alignment`` fallback (``monrad.monitor.io.fit_alignment``),
 so a monitoring run's auto-fit alignment is identical to a precomputed
 ``monrad-align`` correction for the same telescope directory (issue #18).
 
@@ -49,21 +57,26 @@ from ..alignment.accumulator import (
 )
 from .io import (
     DAILY_ALIGNMENT_N_FILES,
+    DetectorFiles,
     MacroArgumentParser,
     fit_daily_alignment,
     group_by_day,
     load_detector,
+    select_alignment_windows,
     select_day_files,
 )
 
-# Re-exported: group_by_day/select_day_files/fit_daily_alignment now live in
-# .io (shared with the in-run auto-fit fallback, monrad.monitor.io.fit_alignment
-# -- issue #18), but stay importable from here since this module is where
-# callers/tests have always found them.
+# Re-exported: group_by_day/select_day_files/select_alignment_windows/
+# fit_daily_alignment now live in .io (shared with the in-run auto-fit
+# fallback, monrad.monitor.io.fit_alignment -- issue #18), but stay
+# importable from here since this module is where callers/tests have always
+# found them.
 __all__ = [
+    "compute_alignment",
     "compute_daily_alignment",
     "fit_daily_alignment",
     "group_by_day",
+    "select_alignment_windows",
     "select_day_files",
 ]
 
@@ -115,13 +128,13 @@ def _history_columns() -> list[str]:
 
 
 def _history_row(
-    day: str,
+    label: str,
     correction: AlignmentCorrection,
     n_events: int,
     quality: dict[str, int],
 ) -> dict[str, str]:
     row: dict[str, str] = {
-        "date": day,
+        "date": label,
         "computed_utc": datetime.now(timezone.utc).isoformat(),
         "n_events": str(n_events),
         "needs_correction": str(correction.needs_correction),
@@ -159,11 +172,24 @@ def update_history(path: Path, row: dict[str, str]) -> list[dict[str, str]]:
     return rows
 
 
+def _parse_history_label(label: str) -> datetime:
+    """Parse a history row's ``date`` column: ``YYYYMMDD`` or ``YYYYMMDD_HHMMSS``.
+
+    The plain day form is used for whole-day windows (the default
+    ``--interval-hours 24``); sub-day windows carry the full start timestamp
+    (see ``select_alignment_windows``/``_window_label`` in ``.io``).
+    """
+    try:
+        return datetime.strptime(label, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return datetime.strptime(label, "%Y%m%d")
+
+
 def _plot_history(rows: list[dict[str, str]], path: Path) -> None:
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
-    dates = [datetime.strptime(r["date"], "%Y%m%d") for r in rows]
+    dates = [_parse_history_label(r["date"]) for r in rows]
 
     def series(field: str, plane: int) -> np.ndarray:
         return np.array(
@@ -215,42 +241,23 @@ def _plot_history(rows: list[dict[str, str]], path: Path) -> None:
 # ── orchestration ───────────────────────────────────────────────────────────
 
 
-def compute_daily_alignment(
-    tel_dir: Path,
-    z_tel: Sequence[float] | np.ndarray,
-    *,
-    date: str | None = None,
-    n_files: int = DAILY_ALIGNMENT_N_FILES,
-    out_dir: Path | None = None,
-    tot_thresh: int = 1,
-    tot_weights: bool = False,
-    make_plots: bool = True,
-) -> AlignmentCorrection:
-    """Fit a day's telescope alignment and record it as a reusable artifact.
-
-    Writes ``alignment_<date>.json`` (the reusable correction), appends the fit
-    to ``alignment_history.csv`` (idempotent per date) and regenerates
-    ``alignment_history.png`` under ``out_dir``.  Returns the correction.
-    """
-    tel_dir = Path(tel_dir)
-    z_tel = np.asarray(z_tel, dtype=float)
-    det = load_detector(tel_dir)
-    day, gps, pos = select_day_files(det, date, n_files)
-
+def _fit_window(
+    det: DetectorFiles,
+    label: str,
+    gps: list[Path],
+    pos: list[Path],
+    z_tel: np.ndarray,
+    **fit_kwargs,
+) -> tuple[AlignmentCorrection, int, dict[str, int]]:
+    """Fit + log one window's alignment.  Shared by every caller below."""
     logger.info(
-        "Fitting alignment for day %s from %d file(s): %s",
-        day,
+        "Fitting alignment for %s from %d file(s): %s",
+        label,
         len(pos),
         ", ".join(p.name for p in pos),
     )
     correction, n_events, quality = fit_daily_alignment(
-        gps,
-        pos,
-        det.utc0,
-        det.f0,
-        z_tel,
-        tot_thresh=tot_thresh,
-        tot_weights=tot_weights,
+        gps, pos, det.utc0, det.f0, z_tel, **fit_kwargs
     )
     logger.info(
         "Fit over %d alignment-usable event(s) (golden/cluster hits); "
@@ -270,42 +277,153 @@ def compute_daily_alignment(
             plane.tilt_x,
             plane.tilt_y,
         )
-
     if correction.needs_correction:
         breaches = _threshold_breaches(correction)
         logger.warning(
-            "HARDWARE DRIFT: day %s alignment exceeds mechanical limits — %s. "
+            "HARDWARE DRIFT: %s alignment exceeds mechanical limits — %s. "
             "Inspect the telescope stack; the fitted correction is still saved.",
-            day,
+            label,
             "; ".join(breaches),
         )
     else:
         logger.info("Alignment within mechanical limits (needs_correction=False).")
+    return correction, n_events, quality
+
+
+def _write_window_artifact(
+    out_dir: Path,
+    label: str,
+    correction: AlignmentCorrection,
+    pos: list[Path],
+    z_tel: np.ndarray,
+    n_events: int,
+    quality: dict[str, int],
+) -> list[dict[str, str]]:
+    """Write ``alignment_<label>.json`` and append the drift-history row.
+
+    Returns the full (cumulative) history row list, so a multi-window caller
+    can defer plotting until after its last window and still plot everything.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"alignment_{label}.json"
+    save_alignment(
+        correction,
+        json_path,
+        date=label,
+        z_tel=z_tel,
+        files=[p.name for p in pos],
+        n_events=n_events,
+        quality=quality,
+    )
+    rows = update_history(
+        out_dir / "alignment_history.csv",
+        _history_row(label, correction, n_events, quality),
+    )
+    print(f"Wrote {json_path} and updated alignment_history.csv ({len(rows)} row(s))")
+    return rows
+
+
+def compute_daily_alignment(
+    tel_dir: Path,
+    z_tel: Sequence[float] | np.ndarray,
+    *,
+    date: str | None = None,
+    n_files: int = DAILY_ALIGNMENT_N_FILES,
+    out_dir: Path | None = None,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
+    make_plots: bool = True,
+) -> AlignmentCorrection:
+    """Fit a single day's telescope alignment and record it as a reusable artifact.
+
+    Writes ``alignment_<date>.json`` (the reusable correction), appends the fit
+    to ``alignment_history.csv`` (idempotent per date) and regenerates
+    ``alignment_history.png`` under ``out_dir``.  Returns the correction.
+
+    This is the single-day building block; :func:`compute_alignment` (what
+    ``monrad-align`` calls by default) loops it -- as one window per
+    ``--interval-hours`` -- over the whole telescope directory.
+    """
+    tel_dir = Path(tel_dir)
+    z_tel = np.asarray(z_tel, dtype=float)
+    det = load_detector(tel_dir)
+    day, gps, pos = select_day_files(det, date, n_files)
+
+    correction, n_events, quality = _fit_window(
+        det,
+        f"day {day}",
+        gps,
+        pos,
+        z_tel,
+        tot_thresh=tot_thresh,
+        tot_weights=tot_weights,
+    )
 
     if out_dir is not None:
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        json_path = out_dir / f"alignment_{day}.json"
-        save_alignment(
-            correction,
-            json_path,
-            date=day,
-            z_tel=z_tel,
-            files=[p.name for p in pos],
-            n_events=n_events,
-            quality=quality,
-        )
-        rows = update_history(
-            out_dir / "alignment_history.csv",
-            _history_row(day, correction, n_events, quality),
+        rows = _write_window_artifact(
+            out_dir, day, correction, pos, z_tel, n_events, quality
         )
         if make_plots and rows:
-            _plot_history(rows, out_dir / "alignment_history.png")
-        print(
-            f"Wrote {json_path} and updated alignment_history.csv ({len(rows)} day(s))"
-        )
+            _plot_history(rows, Path(out_dir) / "alignment_history.png")
 
     return correction
+
+
+def compute_alignment(
+    tel_dir: Path,
+    z_tel: Sequence[float] | np.ndarray,
+    *,
+    date: str | None = None,
+    interval_hours: float = 24.0,
+    n_files: int = DAILY_ALIGNMENT_N_FILES,
+    out_dir: Path | None = None,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
+    make_plots: bool = True,
+) -> list[AlignmentCorrection]:
+    """Fit telescope alignment over every ``interval_hours`` window in the dataset.
+
+    This is what ``monrad-align`` runs by default: with ``date=None`` it
+    processes the *entire* telescope directory, one whole-subset alignment
+    fit per fixed-length, midnight-anchored window (see
+    :func:`~monrad.monitor.io.group_by_interval`) of ``interval_hours``
+    (default 24 -- one refit per calendar day).  Pass ``date`` to restrict
+    this to one day, or -- under a sub-day ``interval_hours`` -- one specific
+    window (see :func:`~monrad.monitor.io.select_alignment_windows`).
+
+    Writes one ``alignment_<label>.json`` per window and appends each to
+    ``alignment_history.csv``, then regenerates ``alignment_history.png``
+    once after the whole run (not once per window).  Returns the list of
+    fitted corrections, oldest window first.
+    """
+    tel_dir = Path(tel_dir)
+    z_tel = np.asarray(z_tel, dtype=float)
+    det = load_detector(tel_dir)
+    windows = select_alignment_windows(det, interval_hours, n_files, date=date)
+
+    corrections: list[AlignmentCorrection] = []
+    rows: list[dict[str, str]] = []
+    for label, gps, pos in windows:
+        correction, n_events, quality = _fit_window(
+            det,
+            f"window {label}",
+            gps,
+            pos,
+            z_tel,
+            tot_thresh=tot_thresh,
+            tot_weights=tot_weights,
+        )
+        corrections.append(correction)
+        if out_dir is not None:
+            rows = _write_window_artifact(
+                out_dir, label, correction, pos, z_tel, n_events, quality
+            )
+
+    if out_dir is not None and make_plots and rows:
+        _plot_history(rows, Path(out_dir) / "alignment_history.png")
+
+    return corrections
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -314,7 +432,9 @@ def compute_daily_alignment(
 def _build_parser() -> argparse.ArgumentParser:
     p = MacroArgumentParser(
         prog="monrad-align",
-        description="Daily telescope alignment calibration + hardware-drift monitor.",
+        description="Telescope alignment calibration + hardware-drift monitor. "
+        "By default processes the entire dataset in --telescope, one refit "
+        "per --interval-hours window.",
         epilog="Flags can be collected in a macro file and loaded with "
         "'@path/to/file.args' (one flag per line, '#' comments allowed); "
         "e.g. 'monrad-align @align.args --date 20230418'. Flags given on the "
@@ -341,14 +461,26 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         metavar="YYYYMMDD",
-        help="Which day to calibrate.  Default: the earliest day present.",
+        help="Restrict calibration to one day (or, under a sub-day "
+        "--interval-hours, a full YYYYMMDD_HHMMSS to restrict to one "
+        "window).  Default: process every window across the whole "
+        "--telescope directory.",
+    )
+    p.add_argument(
+        "--interval-hours",
+        type=float,
+        default=24.0,
+        metavar="HOURS",
+        help="Length of each alignment-refit window, in hours (default: 24 "
+        "-- one refit per calendar day). E.g. 6 for four refits a day. "
+        "Windows are anchored to 00:00 of the earliest day present.",
     )
     p.add_argument(
         "--n-files",
         type=int,
         default=DAILY_ALIGNMENT_N_FILES,
         metavar="N",
-        help=f"Number of that day's first file pairs to fit over "
+        help=f"Number of each window's first file pairs to fit over "
         f"(default: {DAILY_ALIGNMENT_N_FILES}).",
     )
     p.add_argument(
@@ -368,6 +500,8 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
     args = parser.parse_args(argv)
     if args.n_files < 1:
         parser.error(f"--n-files must be >= 1; got {args.n_files}")
+    if args.interval_hours <= 0:
+        parser.error(f"--interval-hours must be > 0; got {args.interval_hours}")
 
     probe = _build_parser()
     for action in probe._actions:
@@ -392,24 +526,29 @@ def main(argv: list[str] | None = None) -> None:
         _tag("z_tel"),
     )
     logger.info("  date:                %s  %s", args.date, _tag("date"))
+    logger.info(
+        "  interval_hours:      %s  %s", args.interval_hours, _tag("interval_hours")
+    )
     logger.info("  n_files:             %s  %s", args.n_files, _tag("n_files"))
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
     logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
 
-    correction = compute_daily_alignment(
+    corrections = compute_alignment(
         args.telescope,
         np.array(args.z_tel),
         date=args.date,
+        interval_hours=args.interval_hours,
         n_files=args.n_files,
         out_dir=args.out,
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         make_plots=not args.no_plots,
     )
+    n_flagged = sum(c.needs_correction for c in corrections)
     print(
-        f"needs_correction={correction.needs_correction}"
-        + (" (see WARNING above)" if correction.needs_correction else "")
+        f"Processed {len(corrections)} window(s); {n_flagged} flagged "
+        "needs_correction=True" + (" (see WARNING(s) above)" if n_flagged else "")
     )
 
 

@@ -36,13 +36,17 @@ python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir> \
 monrad-monitor @macros/monitor.args --out pipeline_out/monitor
 monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
 
-# Daily telescope alignment calibration + hardware-drift monitor. Fits ONE
-# AlignmentCorrection over the first --n-files (default 3) telescope files of a
-# day (earliest day, or --date YYYYMMDD), writes alignment_<date>.json, and
-# appends to alignment_history.csv/.png (drift log). Feed the JSON back to
-# monitor/multiprobe with --alignment to skip the in-run fit (saved --z-tel
-# must match the run's; enforced on load).
+# Telescope alignment calibration + hardware-drift monitor. By default fits
+# ONE AlignmentCorrection per --interval-hours window (default 24, i.e. once
+# per day) across the ENTIRE --telescope directory, each from that window's
+# first --n-files (default 3) files, writes alignment_<label>.json per
+# window, and appends to alignment_history.csv/.png (drift log). --date
+# restricts to one day (or, under a sub-day --interval-hours, one window via
+# YYYYMMDD_HHMMSS). Feed a JSON back to monitor/multiprobe with --alignment
+# to skip the in-run fit (saved --z-tel must match the run's; enforced on
+# load).
 monrad-align --telescope <tel_dir> --z-tel 0 400 800 --out pipeline_out/alignment
+monrad-align --telescope <tel_dir> --z-tel 0 400 800 --interval-hours 6 --out pipeline_out/alignment
 monrad-monitor @macros/monitor.args --alignment pipeline_out/alignment/alignment_<date>.json
 ```
 
