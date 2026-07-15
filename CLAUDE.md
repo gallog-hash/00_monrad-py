@@ -91,7 +91,7 @@ src/monrad/                 # each stage is a domain package; its public API is
     synthetic/       # generate() — synthetic test-data generator
         generate.py
     monitor/         # probe-position monitoring drivers (resolution, timeseries, multiprobe)
-                     #   align.py: monrad-align daily alignment calibration + drift monitor
+                     #   align.py: monrad-align alignment calibration + drift monitor
 ```
 
 ### The five pipeline stages

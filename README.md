@@ -243,7 +243,7 @@ src/monrad/
                       #   io.py: save_alignment/load_alignment (JSON)
     pose/             # stage 5: probe pose fit       → PoseFitter
     monitor/          # monitoring drivers (resolution, timeseries,
-                      #   multiprobe, align — daily calibration/drift monitor)
+                      #   multiprobe, align — alignment calibration/drift monitor)
     synthetic/        # synthetic-data generator (for testing)
 ```
 
