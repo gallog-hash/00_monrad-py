@@ -7,10 +7,16 @@ rather than something worth refitting on every monitoring run.  This tool:
 1. picks the **first ``--n-files`` telescope file pairs of one day** (the
    earliest day in the directory, or ``--date YYYYMMDD``),
 2. fits **one** :class:`~monrad.alignment.AlignmentCorrection` over *all*
-   events in those files (a true whole-subset fit -- unlike the in-run
-   ``fit_alignment`` path, which returns only a trailing chunk), and
+   events in those files (a true whole-subset fit), and
 3. writes it to ``alignment_<date>.json`` for the monitoring drivers to load
    with ``--alignment`` instead of refitting.
+
+Day-selection (:func:`~monrad.monitor.io.select_day_files`) and the
+whole-subset fit (:func:`~monrad.monitor.io.fit_daily_alignment`) live in
+:mod:`monrad.monitor.io` and are reused, unchanged, by the monitoring
+drivers' no-``--alignment`` fallback (``monrad.monitor.io.fit_alignment``),
+so a monitoring run's auto-fit alignment is identical to a precomputed
+``monrad-align`` correction for the same telescope directory (issue #18).
 
 The fit doubles as a **hardware-drift monitor**: ``fit_telescope_alignment``
 already raises ``needs_correction`` when any plane's offset / rotation / z /
@@ -24,19 +30,13 @@ still exits 0 -- it is a monitor, not a gate.
 import argparse
 import csv
 import logging
-from collections import Counter, OrderedDict
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
-from ..alignment import (
-    AlignmentAccumulator,
-    AlignmentCorrection,
-    PlaneCorrection,
-    save_alignment,
-)
+from ..alignment import AlignmentCorrection, PlaneCorrection, save_alignment
 
 # Mechanical significance thresholds fit_telescope_alignment uses to set
 # needs_correction; imported so the drift plot and the per-parameter warning
@@ -47,9 +47,25 @@ from ..alignment.accumulator import (
     _TILT_THRESH,
     _Z_THRESH,
 )
-from ..reconstruction import decode_position
-from ..timing import reconstruct_stream
-from .io import DetectorFiles, MacroArgumentParser, load_detector
+from .io import (
+    DAILY_ALIGNMENT_N_FILES,
+    MacroArgumentParser,
+    fit_daily_alignment,
+    group_by_day,
+    load_detector,
+    select_day_files,
+)
+
+# Re-exported: group_by_day/select_day_files/fit_daily_alignment now live in
+# .io (shared with the in-run auto-fit fallback, monrad.monitor.io.fit_alignment
+# -- issue #18), but stay importable from here since this module is where
+# callers/tests have always found them.
+__all__ = [
+    "compute_daily_alignment",
+    "fit_daily_alignment",
+    "group_by_day",
+    "select_day_files",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -69,81 +85,6 @@ _FIELD_THRESH = {
     "tilt_x": _TILT_THRESH,
     "tilt_y": _TILT_THRESH,
 }
-
-
-def group_by_day(det: DetectorFiles) -> "OrderedDict[str, list[tuple[Path, Path]]]":
-    """Group a detector's file pairs by ``YYYYMMDD`` day prefix, day-ascending.
-
-    Files are named ``YYYYMMDD_HHMMSS[_GPS].bin``.  The returned mapping is
-    ordered by day, and each day's list is ordered by filename (=
-    acquisition time), so ``select_day_files`` can take the earliest day and
-    its first-N files by iteration order regardless of the input order.
-    """
-    grouped: dict[str, list[tuple[Path, Path]]] = {}
-    for gps, pos in zip(det.gps_paths, det.pos_paths):
-        grouped.setdefault(gps.name[:8], []).append((gps, pos))
-    days: "OrderedDict[str, list[tuple[Path, Path]]]" = OrderedDict()
-    for day in sorted(grouped):
-        days[day] = sorted(grouped[day], key=lambda pair: pair[0].name)
-    return days
-
-
-def select_day_files(
-    det: DetectorFiles, date: str | None, n_files: int
-) -> tuple[str, list[Path], list[Path]]:
-    """Choose a day and return its first ``n_files`` (gps, pos) paths, split.
-
-    ``date`` selects the day (``YYYYMMDD``); ``None`` picks the earliest day
-    present.  Raises ``ValueError`` if the requested day is absent.
-    """
-    days = group_by_day(det)
-    if not days:
-        raise ValueError("no dated file pairs found")
-    if date is None:
-        day = next(iter(days))
-    elif date in days:
-        day = date
-    else:
-        raise ValueError(
-            f"no files for date {date!r}; available days: {', '.join(days)}"
-        )
-    pairs = days[day][:n_files]
-    gps = [p[0] for p in pairs]
-    pos = [p[1] for p in pairs]
-    return day, gps, pos
-
-
-def fit_daily_alignment(
-    gps_paths: list[Path],
-    pos_paths: list[Path],
-    utc0: datetime,
-    f0: int,
-    z_tel: np.ndarray,
-    *,
-    tot_thresh: int = 1,
-    tot_weights: bool = False,
-) -> tuple[AlignmentCorrection, int, dict[str, int]]:
-    """Fit one alignment correction over *all* events in the given files.
-
-    Mirrors :func:`monrad.monitor.io.fit_alignment`'s stage-1→stage-4 wiring,
-    but drives the :class:`AlignmentAccumulator` with an effectively infinite
-    ``flush_every`` so ``add`` never mid-flushes: the single trailing
-    ``flush`` then fits over every buffered event, not just the last chunk.
-
-    Returns ``(correction, n_events, quality_by_name)``.
-    """
-    accum = AlignmentAccumulator(flush_every=1 << 62, z_tel=z_tel)
-    quality: Counter = Counter()
-    for ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
-        quality[ev.quality.name] += 1
-        hits = decode_position(
-            ref, pos_paths, n_cols=3, tot_thresh=tot_thresh, tot_weights=tot_weights
-        )
-        accum.add(hits)
-    n_events = accum.n_buffered  # read before flush() clears the buffer
-    correction = accum.flush()
-    quality_by_name = {name: quality.get(name, 0) for name in _QUALITY_NAMES}
-    return correction, n_events, quality_by_name
 
 
 def _threshold_breaches(correction: AlignmentCorrection) -> list[str]:
@@ -279,7 +220,7 @@ def compute_daily_alignment(
     z_tel: Sequence[float] | np.ndarray,
     *,
     date: str | None = None,
-    n_files: int = 3,
+    n_files: int = DAILY_ALIGNMENT_N_FILES,
     out_dir: Path | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
@@ -405,9 +346,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-files",
         type=int,
-        default=3,
+        default=DAILY_ALIGNMENT_N_FILES,
         metavar="N",
-        help="Number of that day's first file pairs to fit over (default: 3).",
+        help=f"Number of that day's first file pairs to fit over "
+        f"(default: {DAILY_ALIGNMENT_N_FILES}).",
     )
     p.add_argument(
         "--out",

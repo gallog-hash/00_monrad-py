@@ -10,7 +10,7 @@ carrying their own copy.
 import argparse
 import math
 import shlex
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +57,13 @@ class MacroArgumentParser(argparse.ArgumentParser):
         return shlex.split(line)
 
 
+# monrad-align's own default: the earliest day's first 3 file pairs (see
+# monrad.monitor.align).  Shared here so fit_alignment's no-``--alignment``
+# fallback picks the identical subset -- keeping the two paths in lockstep is
+# the whole point of issue #18; a second hardcoded "3" would just reopen it.
+DAILY_ALIGNMENT_N_FILES = 3
+
+
 class DetectorFiles(NamedTuple):
     """One detector's decoded header + matched ``*_GPS.bin`` / ``*.bin`` pairs."""
 
@@ -83,6 +90,84 @@ def load_detector(d: Path) -> DetectorFiles:
     if not gps_paths:
         raise FileNotFoundError(f"no *_GPS.bin / *.bin pairs found in {d}")
     return DetectorFiles(utc0, f0, gps_paths, pos_paths)
+
+
+def group_by_day(det: DetectorFiles) -> "OrderedDict[str, list[tuple[Path, Path]]]":
+    """Group a detector's file pairs by ``YYYYMMDD`` day prefix, day-ascending.
+
+    Files are named ``YYYYMMDD_HHMMSS[_GPS].bin``.  The returned mapping is
+    ordered by day, and each day's list is ordered by filename (=
+    acquisition time), so ``select_day_files`` can take the earliest day and
+    its first-N files by iteration order regardless of the input order.
+    """
+    grouped: dict[str, list[tuple[Path, Path]]] = {}
+    for gps, pos in zip(det.gps_paths, det.pos_paths):
+        grouped.setdefault(gps.name[:8], []).append((gps, pos))
+    days: "OrderedDict[str, list[tuple[Path, Path]]]" = OrderedDict()
+    for day in sorted(grouped):
+        days[day] = sorted(grouped[day], key=lambda pair: pair[0].name)
+    return days
+
+
+def select_day_files(
+    det: DetectorFiles, date: str | None, n_files: int
+) -> tuple[str, list[Path], list[Path]]:
+    """Choose a day and return its first ``n_files`` (gps, pos) paths, split.
+
+    ``date`` selects the day (``YYYYMMDD``); ``None`` picks the earliest day
+    present.  Raises ``ValueError`` if the requested day is absent.
+    """
+    days = group_by_day(det)
+    if not days:
+        raise ValueError("no dated file pairs found")
+    if date is None:
+        day = next(iter(days))
+    elif date in days:
+        day = date
+    else:
+        raise ValueError(
+            f"no files for date {date!r}; available days: {', '.join(days)}"
+        )
+    pairs = days[day][:n_files]
+    gps = [p[0] for p in pairs]
+    pos = [p[1] for p in pairs]
+    return day, gps, pos
+
+
+def fit_daily_alignment(
+    gps_paths: list[Path],
+    pos_paths: list[Path],
+    utc0: datetime,
+    f0: int,
+    z_tel: np.ndarray,
+    *,
+    tot_thresh: int = 1,
+    tot_weights: bool = False,
+) -> tuple[AlignmentCorrection, int, dict[str, int]]:
+    """Fit one alignment correction over *all* events in the given files.
+
+    Drives the :class:`AlignmentAccumulator` with an effectively infinite
+    ``flush_every`` so ``add`` never mid-flushes: the single trailing
+    ``flush`` then fits over every buffered event, not just the last chunk
+    (unlike a small-``flush_every`` accumulator, whose disjoint intermediate
+    fits are discarded by a caller that keeps only the final ``flush()``).
+
+    Returns ``(correction, n_events, quality_by_name)``.
+    """
+    accum = AlignmentAccumulator(flush_every=1 << 62, z_tel=z_tel)
+    quality: Counter = Counter()
+    for ev, ref in reconstruct_stream(gps_paths, pos_paths, utc0, f0):
+        quality[ev.quality.name] += 1
+        hits = decode_position(
+            ref, pos_paths, n_cols=3, tot_thresh=tot_thresh, tot_weights=tot_weights
+        )
+        accum.add(hits)
+    n_events = accum.n_buffered  # read before flush() clears the buffer
+    correction = accum.flush()
+    quality_by_name = {
+        name: quality.get(name, 0) for name in ("GOOD", "DEGRADED", "UNTRUSTED")
+    }
+    return correction, n_events, quality_by_name
 
 
 def validate_probe_footprint(n_probe_ch: int, fibers_per_ribbon: int) -> None:
@@ -140,24 +225,34 @@ def fit_alignment(
     tot_thresh: int = 1,
     tot_weights: bool = False,
 ) -> tuple[AlignmentCorrection, Counter]:
-    """Run the stage-4 telescope alignment pass over one telescope acquisition.
+    """Auto-fit fallback for a monitoring run's telescope alignment.
 
-    Mirrors ``run_pipeline.py``'s pass 1a: stream every telescope event,
-    decode its three-plane hits, and feed them to an
-    :class:`AlignmentAccumulator`.  Returns the fitted correction together with
-    the per-event :class:`monrad.timing.Quality` histogram (the same count the
-    script prints for stage 1), so callers do not have to re-stream the
-    telescope just to tally event quality.
+    Used when the caller does not pass ``--alignment``.  Delegates to the
+    same day-selection (:func:`select_day_files`, earliest day, first
+    :data:`DAILY_ALIGNMENT_N_FILES` files) and whole-subset fit
+    (:func:`fit_daily_alignment`) that ``monrad-align`` uses, so a
+    monitoring run's auto-fit alignment is identical to a precomputed
+    ``monrad-align`` correction for the same telescope directory.
+
+    Previously this streamed *every* telescope event into an
+    :class:`AlignmentAccumulator` and kept only its final ``flush()`` --
+    since the accumulator re-fits into disjoint ``flush_every``-sized
+    blocks, that silently fit over only the trailing ≤10k-event remainder
+    rather than the whole acquisition (issue #18).  Returns the fitted
+    correction together with a per-quality-name event histogram, so callers
+    do not have to re-stream the telescope just to tally event quality.
     """
-    accum = AlignmentAccumulator(z_tel=z_tel)
-    quality: Counter = Counter()
-    for ev, ref in reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0):
-        quality[ev.quality] += 1
-        hits = decode_position(
-            ref, tel.pos_paths, n_cols=3, tot_thresh=tot_thresh, tot_weights=tot_weights
-        )
-        accum.add(hits)
-    return accum.flush(), quality
+    _day, gps, pos = select_day_files(tel, date=None, n_files=DAILY_ALIGNMENT_N_FILES)
+    correction, _n_events, quality = fit_daily_alignment(
+        gps,
+        pos,
+        tel.utc0,
+        tel.f0,
+        z_tel,
+        tot_thresh=tot_thresh,
+        tot_weights=tot_weights,
+    )
+    return correction, Counter(quality)
 
 
 def build_cluster_stream(

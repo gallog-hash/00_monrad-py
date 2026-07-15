@@ -243,6 +243,25 @@ def test_monitor_probe_uses_saved_alignment(tmp_path: Path):
         assert abs(r.z_p - 300.0) < 5 * r.sigma_zp
 
 
+def test_autofit_matches_monrad_align(tmp_path: Path):
+    """The no-``--alignment`` auto-fit fallback (monrad.monitor.io.fit_alignment)
+    must equal monrad-align's own whole-subset fit over the same telescope
+    directory (issue #18) -- both now delegate to the same
+    select_day_files + fit_daily_alignment helpers."""
+    from monrad.monitor.io import fit_alignment
+
+    src = tmp_path / "gen"
+    info = generate(src, n_tracks=3000, seed=7)
+    det = load_detector(info["tel_dir"])
+
+    align_corr = compute_daily_alignment(info["tel_dir"], _Z, make_plots=False)
+    auto_corr, _quality = fit_alignment(det, _Z)
+
+    assert auto_corr.needs_correction == align_corr.needs_correction
+    for got, want in zip(auto_corr.planes, align_corr.planes):
+        assert got == pytest.approx(want)
+
+
 def test_monitor_probe_alignment_z_tel_mismatch_raises(tmp_path: Path):
     src = tmp_path / "gen"
     info = generate(src, n_tracks=800, seed=1)
