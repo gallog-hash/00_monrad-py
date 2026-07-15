@@ -196,7 +196,11 @@ monrad-align --telescope data/telescope --z-tel 0 400 800 \
 Windows are anchored to 00:00 of the earliest day present; a sub-day window's
 label (and its `alignment_<label>.json` file) carries the full
 `YYYYMMDD_HHMMSS` start timestamp, while a whole-day (default) window keeps
-the plain `YYYYMMDD` label.
+the plain `YYYYMMDD` label. The label is a **file-name** time (the DAQ's clock,
+often local); each JSON also records the window's true **UTC** coverage
+(`utc_start`/`utc_end`, plus exact `utc_start_ns`/`utc_end_ns`) derived from
+the acquisition's GPS-UTC, so a consumer can key on real UTC rather than the
+possibly-offset label — this is what time-varying monitoring below uses.
 
 The fit doubles as a **hardware monitor**: `fit_telescope_alignment` flags
 `needs_correction` when any plane's offset / rotation / z-offset / tilt exceeds
@@ -214,6 +218,21 @@ z-order-dependent, and this is enforced on load:
 ```bash
 monrad-monitor @macros/monitor.args \
     --alignment pipeline_out/alignment/alignment_20230418.json
+```
+
+`--alignment` also accepts a **directory** of `alignment_<label>.json` files
+(exactly what a `--interval-hours` run of `monrad-align` writes) for
+**time-varying alignment**: the driver builds a schedule from each window's
+UTC coverage and switches the active correction as the coincidence stream
+crosses window boundaries, so a multi-window run applies each window's own
+correction to its own time span instead of one static correction for the whole
+run. Every file's `--z-tel` is validated up front. A single file (or a
+one-file directory) behaves exactly as before — one correction for the run.
+Both `monrad-monitor` and `monrad-multiprobe` support this.
+
+```bash
+monrad-monitor @macros/monitor.args \
+    --alignment pipeline_out/alignment          # a directory → time-varying
 ```
 
 ```bash

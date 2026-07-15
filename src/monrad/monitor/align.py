@@ -39,12 +39,13 @@ import argparse
 import csv
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 
 from ..alignment import AlignmentCorrection, PlaneCorrection, save_alignment
+from ..timing import _utc_to_ns
 
 # Mechanical significance thresholds fit_telescope_alignment uses to set
 # needs_correction; imported so the drift plot and the per-parameter warning
@@ -59,6 +60,8 @@ from .io import (
     DAILY_ALIGNMENT_N_FILES,
     DetectorFiles,
     MacroArgumentParser,
+    _parse_file_ts,
+    _parse_window_label,
     fit_daily_alignment,
     group_by_day,
     load_detector,
@@ -241,6 +244,28 @@ def _plot_history(rows: list[dict[str, str]], path: Path) -> None:
 # ── orchestration ───────────────────────────────────────────────────────────
 
 
+def _daq_utc_offset(det: DetectorFiles) -> timedelta:
+    """The constant DAQ-file-name-clock minus GPS-UTC offset for an acquisition.
+
+    Window labels (and file names) are in whatever clock the DAQ names files
+    with -- often local time -- while events are stamped in GPS-UTC
+    (``TimedEvent.t_ns``).  Measured once from the earliest file:
+    ``file-name time - utc0`` (both for the acquisition start), it maps any
+    file-name/window-label time to the UTC of the event a file so named would
+    carry.  A window's own files cannot give this per-window (they are
+    reconstructed against the acquisition-start ``utc0``, so only the earliest
+    window's ``t_ns`` is absolute), so the offset is taken globally and applied
+    to each window label -- see :func:`_window_utc_start_ns`.
+    """
+    utc0 = det.utc0 if det.utc0.tzinfo is None else det.utc0.replace(tzinfo=None)
+    return _parse_file_ts(det.gps_paths[0].name) - utc0
+
+
+def _window_utc_start_ns(label: str, offset: timedelta) -> int:
+    """A window label's true UTC start (integer ns), shifting out the DAQ offset."""
+    return _utc_to_ns(_parse_window_label(label) - offset)
+
+
 def _fit_window(
     det: DetectorFiles,
     label: str,
@@ -298,15 +323,28 @@ def _write_window_artifact(
     z_tel: np.ndarray,
     n_events: int,
     quality: dict[str, int],
+    *,
+    utc_start_ns: int | None = None,
+    interval_hours: float = 24.0,
 ) -> list[dict[str, str]]:
     """Write ``alignment_<label>.json`` and append the drift-history row.
 
     Returns the full (cumulative) history row list, so a multi-window caller
     can defer plotting until after its last window and still plot everything.
+
+    ``utc_start_ns`` (the window's true UTC start, from the first fitted event)
+    and ``interval_hours`` are recorded as the window's real-clock UTC bounds
+    (``utc_start_ns``/``utc_end_ns = start + interval``) so a time-varying
+    consumer keys on UTC, not the file-name ``label`` (which is DAQ-local).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"alignment_{label}.json"
+    utc_end_ns = (
+        None
+        if utc_start_ns is None
+        else utc_start_ns + int(interval_hours * 3600 * 1_000_000_000)
+    )
     save_alignment(
         correction,
         json_path,
@@ -315,6 +353,8 @@ def _write_window_artifact(
         files=[p.name for p in pos],
         n_events=n_events,
         quality=quality,
+        utc_start_ns=utc_start_ns,
+        utc_end_ns=utc_end_ns,
     )
     rows = update_history(
         out_dir / "alignment_history.csv",
@@ -362,7 +402,15 @@ def compute_daily_alignment(
 
     if out_dir is not None:
         rows = _write_window_artifact(
-            out_dir, day, correction, pos, z_tel, n_events, quality
+            out_dir,
+            day,
+            correction,
+            pos,
+            z_tel,
+            n_events,
+            quality,
+            utc_start_ns=_window_utc_start_ns(day, _daq_utc_offset(det)),
+            interval_hours=24.0,
         )
         if make_plots and rows:
             _plot_history(rows, Path(out_dir) / "alignment_history.png")
@@ -401,6 +449,7 @@ def compute_alignment(
     z_tel = np.asarray(z_tel, dtype=float)
     det = load_detector(tel_dir)
     windows = select_alignment_windows(det, interval_hours, n_files, date=date)
+    offset = _daq_utc_offset(det)
 
     corrections: list[AlignmentCorrection] = []
     rows: list[dict[str, str]] = []
@@ -419,7 +468,15 @@ def compute_alignment(
         corrections.append(correction)
         if out_dir is not None:
             rows = _write_window_artifact(
-                out_dir, label, correction, pos, z_tel, n_events, quality
+                out_dir,
+                label,
+                correction,
+                pos,
+                z_tel,
+                n_events,
+                quality,
+                utc_start_ns=_window_utc_start_ns(label, offset),
+                interval_hours=interval_hours,
             )
 
     if out_dir is not None and make_plots and rows:

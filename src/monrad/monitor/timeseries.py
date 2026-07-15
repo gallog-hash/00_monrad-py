@@ -70,6 +70,7 @@ from .io import (
     MacroArgumentParser,
     centre_cov_2x2,
     fit_alignment,
+    load_alignment_schedule,
     load_detector,
     stream_coincidences,
     validate_probe_footprint,
@@ -604,13 +605,25 @@ def monitor_probe(
     tel = load_detector(tel_dir)
     prb = load_detector(prb_dir)
 
-    if alignment_path is not None:
+    schedule = None
+    if alignment_path is not None and alignment_path.is_dir():
+        schedule = load_alignment_schedule(alignment_path, expect_z_tel=z_tel)
+        alignment = schedule.corrections[0]
+        logger.info(
+            "Loaded %d-window time-varying alignment from %s",
+            len(schedule.corrections),
+            alignment_path,
+        )
+    elif alignment_path is not None:
         alignment = load_alignment(alignment_path, expect_z_tel=z_tel)
         logger.info("Loaded telescope alignment from %s", alignment_path)
     else:
         alignment, _ = fit_alignment(
             tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
         )
+    # z_corr feeds only the z_p start guess in fit_probe_pose; under a schedule
+    # the per-coincidence correction is switched inside stream_coincidences, so
+    # the first window's value is a fine seed.
     z_corr = alignment.corrected_z_tel(z_tel)
 
     window_ns = None if window_s is None else int(window_s * 1e9)
@@ -632,6 +645,7 @@ def monitor_probe(
         prb,
         z_tel=z_tel,
         alignment=alignment,
+        schedule=schedule,
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
@@ -873,11 +887,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--alignment",
         type=Path,
         default=None,
-        metavar="FILE",
-        help="Path to a telescope alignment correction saved by monrad-align. "
-        "When given, load it and skip the in-run alignment fit (the saved "
-        "--z-tel must match this run's). Off by default (fit from this "
-        "acquisition).",
+        metavar="PATH",
+        help="Path to a telescope alignment correction saved by monrad-align, "
+        "OR a directory of alignment_<label>.json files for time-varying "
+        "correction (the active window is switched as the stream crosses "
+        "boundaries). When given, load it and skip the in-run alignment fit "
+        "(every saved --z-tel must match this run's). Off by default (fit from "
+        "this acquisition).",
     )
     p.add_argument(
         "--out",

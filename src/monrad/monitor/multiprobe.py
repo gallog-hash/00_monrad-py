@@ -42,8 +42,10 @@ from ..alignment import load_alignment
 from ..pose import PoseFitter, _MIN_COINCS
 from .io import (
     MacroArgumentParser,
+    _cluster_tel_time,
     build_cluster_stream,
     fit_alignment,
+    load_alignment_schedule,
     load_detector,
     validate_probe_footprint,
 )
@@ -150,13 +152,25 @@ def monitor_probes(
     tel = load_detector(tel_dir)
     probes = [load_detector(d) for d in prb_dirs]
 
-    if alignment_path is not None:
+    schedule = None
+    if alignment_path is not None and alignment_path.is_dir():
+        schedule = load_alignment_schedule(alignment_path, expect_z_tel=z_tel)
+        alignment = schedule.corrections[0]
+        logger.info(
+            "Loaded %d-window time-varying alignment from %s",
+            len(schedule.corrections),
+            alignment_path,
+        )
+    elif alignment_path is not None:
         alignment = load_alignment(alignment_path, expect_z_tel=z_tel)
         logger.info("Loaded telescope alignment from %s", alignment_path)
     else:
         alignment, _ = fit_alignment(
             tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
         )
+    # z_corr feeds only the z_p start guess in fit_probe_pose; under a schedule
+    # the per-coincidence correction is switched below, so the first window's
+    # value is a fine seed.
     z_corr = alignment.corrected_z_tel(z_tel)
     window_ns = None if window_s is None else int(window_s * 1e9)
 
@@ -205,6 +219,16 @@ def monitor_probes(
     ]
 
     for cluster in build_cluster_stream(tel, probes):
+        if schedule is not None:
+            t_ns = _cluster_tel_time(cluster, tel_id=0)
+            if t_ns is not None:
+                corr = schedule.at(t_ns)
+                if corr is not fitters[0].alignment:
+                    # Switch all fitters to the *same* object so the shared-
+                    # search identity invariant (asserted above) still holds;
+                    # only fitters[0].alignment is read by the shared decode.
+                    for f in fitters:
+                        f.update_alignment(corr)
         tel_result = fitters[0].decode_telescope_track(cluster)
         for fitter, acc in zip(fitters, accumulators):
             co = fitter.decode_from_telescope_track(cluster, tel_result)
@@ -364,11 +388,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--alignment",
         type=Path,
         default=None,
-        metavar="FILE",
-        help="Path to a telescope alignment correction saved by monrad-align. "
-        "When given, load it and skip the in-run alignment fit (the saved "
-        "--z-tel must match this run's). Off by default (fit from this "
-        "acquisition).",
+        metavar="PATH",
+        help="Path to a telescope alignment correction saved by monrad-align, "
+        "OR a directory of alignment_<label>.json files for time-varying "
+        "correction (the active window is switched as the stream crosses "
+        "boundaries). When given, load it and skip the in-run alignment fit "
+        "(every saved --z-tel must match this run's). Off by default (fit from "
+        "this acquisition).",
     )
     p.add_argument(
         "--out",

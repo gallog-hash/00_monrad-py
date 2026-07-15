@@ -8,17 +8,19 @@ carrying their own copy.
 """
 
 import argparse
+import json
 import math
 import shlex
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 
-from ..alignment import AlignmentAccumulator, AlignmentCorrection
+from ..alignment import AlignmentAccumulator, AlignmentCorrection, load_alignment
 from ..coincidence import coincidence_stream
 from ..decoders.position import POS_HALF_BITS
 from ..pose import Coincidence, PoseFitter
@@ -27,6 +29,7 @@ from ..synthetic.generate import STRIP_MM
 from ..timing import (
     PosRef,
     TimedEvent,
+    _utc_to_ns,
     find_file_pairs,
     load_header_params,
     reconstruct_stream,
@@ -160,6 +163,21 @@ def _window_label(start: datetime, interval_hours: float) -> str:
     return start.strftime("%Y%m%d_%H%M%S")
 
 
+def _parse_window_label(label: str) -> datetime:
+    """Inverse of :func:`_window_label`: a window label back to its start time.
+
+    Accepts both forms :func:`_window_label` emits -- the whole-day ``YYYYMMDD``
+    and the sub-day ``YYYYMMDD_HHMMSS`` -- returning a naive UTC datetime on the
+    same clock the header ``timeR`` seeds ``utc0`` with. Mirrors
+    :func:`monrad.monitor.align._parse_history_label`, kept here so the schedule
+    loader (and any ``.io`` caller) need not import from ``align``.
+    """
+    try:
+        return datetime.strptime(label, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return datetime.strptime(label, "%Y%m%d")
+
+
 def group_by_interval(
     det: DetectorFiles, interval_hours: float
 ) -> "OrderedDict[str, list[tuple[Path, Path]]]":
@@ -228,6 +246,86 @@ def select_alignment_windows(
     ]
 
 
+@dataclass
+class AlignmentSchedule:
+    """A time-ordered step function ``window_start_ns -> AlignmentCorrection``.
+
+    Built from a directory of ``alignment_<label>.json`` files (one per
+    ``monrad-align --interval-hours`` window) so the monitoring drivers can
+    switch the active telescope correction as the coincidence stream crosses
+    window boundaries, instead of applying one static correction for the whole
+    run. :meth:`at` returns the correction whose window *starts* at or before a
+    given telescope-event time; times before the first window clamp to the
+    earliest correction rather than dropping events (the monitor windows are
+    independent of the alignment windows). See ``load_alignment_schedule``.
+    """
+
+    starts_ns: np.ndarray  # int64, ascending
+    corrections: list[AlignmentCorrection]
+    labels: list[str]
+
+    def at(self, t_ns: int) -> AlignmentCorrection:
+        """The active correction for a telescope-event time ``t_ns``."""
+        idx = int(np.searchsorted(self.starts_ns, t_ns, side="right")) - 1
+        return self.corrections[max(idx, 0)]
+
+
+def load_alignment_schedule(
+    directory: Path, *, expect_z_tel: np.ndarray
+) -> AlignmentSchedule:
+    """Load every ``alignment_<label>.json`` in *directory* into a schedule.
+
+    Each window's start time is taken from the file's ``utc_start_ns`` field --
+    the true UTC (integer ns, same clock as ``Coincidence.t_ns``) of the
+    window's first fitted event -- so :meth:`AlignmentSchedule.at` maps a
+    coincidence to its window by real UTC time.  Files written before that
+    field existed fall back to parsing the file-name ``date`` label as UTC (the
+    original behavior); note this is only exact when the DAQ names files in UTC
+    (see :func:`save_alignment`).  ``load_alignment``'s ``expect_z_tel`` check
+    runs on *every* file: a single window fit against a different plane z-order
+    aborts the whole run up front (the delta_z/tilt fit is z-order-dependent and
+    cannot be mixed).
+    """
+    files = sorted(Path(directory).glob("alignment_*.json"))
+    if not files:
+        raise ValueError(f"{directory}: no alignment_*.json files found")
+    rows: list[tuple[int, str, AlignmentCorrection]] = []
+    for f in files:
+        label = f.name[len("alignment_") : -len(".json")]
+        payload = json.loads(f.read_text())
+        raw_start = payload.get("utc_start_ns")
+        start_ns = (
+            int(raw_start)
+            if raw_start is not None
+            else _utc_to_ns(_parse_window_label(label))  # legacy pre-utc_start_ns
+        )
+        corr = load_alignment(f, expect_z_tel=expect_z_tel)
+        rows.append((start_ns, label, corr))
+    rows.sort(key=lambda r: r[0])
+    return AlignmentSchedule(
+        starts_ns=np.array([r[0] for r in rows], dtype=np.int64),
+        corrections=[r[2] for r in rows],
+        labels=[r[1] for r in rows],
+    )
+
+
+def _cluster_tel_time(
+    cluster: list[tuple[int, TimedEvent, PosRef]], tel_id: int
+) -> int | None:
+    """The telescope event's integer-ns time from a coincidence cluster.
+
+    Reads the same ``det_id == tel_id`` entry the decode path uses
+    (``PoseFitter._decode_telescope_track``), *before* decoding, so an
+    :class:`AlignmentSchedule` can pick the active correction for the cluster.
+    Returns ``None`` if the cluster carries no (or more than one) telescope
+    entry -- the decode will reject it anyway.
+    """
+    tel_times = [ev.t_ns for det_id, ev, _ in cluster if det_id == tel_id]
+    if len(tel_times) != 1:
+        return None
+    return tel_times[0]
+
+
 def fit_daily_alignment(
     gps_paths: list[Path],
     pos_paths: list[Path],
@@ -246,7 +344,11 @@ def fit_daily_alignment(
     (unlike a small-``flush_every`` accumulator, whose disjoint intermediate
     fits are discarded by a caller that keeps only the final ``flush()``).
 
-    Returns ``(correction, n_events, quality_by_name)``.
+    Returns ``(correction, n_events, quality_by_name)``.  (Absolute event times
+    are *not* returned here: a window's files are reconstructed against the
+    acquisition-start ``utc0``, so ``t_ns`` is only correct for the earliest
+    window -- the caller derives per-window UTC from a constant DAQ→UTC offset
+    instead; see :func:`~monrad.monitor.align._daq_utc_offset`.)
     """
     accum = AlignmentAccumulator(flush_every=1 << 62, z_tel=z_tel)
     quality: Counter = Counter()
@@ -386,6 +488,7 @@ def stream_coincidences(
     *,
     z_tel: np.ndarray,
     alignment: AlignmentCorrection,
+    schedule: AlignmentSchedule | None = None,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     min_anchor_planes: int = 1,
@@ -403,6 +506,12 @@ def stream_coincidences(
     fibers_per_ribbon : the probe's fiber×ribbon combine factor (DESIGN.md
     §2.4), passed through as ``PoseFitter``'s ``prb_fibers_per_ribbon``.
     Telescope decode is unaffected.
+
+    schedule : optional :class:`AlignmentSchedule`. When given, the fitter's
+    alignment is switched (via ``update_alignment``) before each cluster
+    decodes, to the correction active at that cluster's telescope-event time --
+    time-varying alignment. ``None`` (the default) keeps ``alignment`` fixed for
+    the whole stream, exactly as before.
     """
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -419,6 +528,12 @@ def stream_coincidences(
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
     for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
+        if schedule is not None:
+            t_ns = _cluster_tel_time(cluster, tel_id=0)
+            if t_ns is not None:
+                corr = schedule.at(t_ns)
+                if corr is not fitter.alignment:
+                    fitter.update_alignment(corr)
         co = fitter.decode_cluster(cluster)
         if co is not None:
             yield co

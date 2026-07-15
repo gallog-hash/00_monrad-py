@@ -36,13 +36,17 @@ def save_alignment(
     files: Sequence[str],
     n_events: int,
     quality: Mapping[str, int] | None = None,
+    utc_start_ns: int | None = None,
+    utc_end_ns: int | None = None,
 ) -> None:
     """Write *correction* to *path* as JSON, with provenance metadata.
 
     Parameters
     ----------
     date:
-        The ``YYYYMMDD`` day the correction was fit for.
+        The ``YYYYMMDD`` (or ``YYYYMMDD_HHMMSS``) window label the correction
+        was fit for -- a *file-name* time, which for a DAQ that names files in
+        local time is **not** UTC.  Prefer ``utc_start_ns`` for time-keying.
     z_tel:
         Telescope plane z-positions (mm) the fit used.  Recorded so
         :func:`load_alignment` can reject a mismatched reuse (the fit is
@@ -53,6 +57,15 @@ def save_alignment(
         Number of valid events the fit was computed from.
     quality:
         Optional per-event quality histogram (``{name: count}``).
+    utc_start_ns, utc_end_ns:
+        The window's true UTC coverage in integer nanoseconds -- the same
+        absolute clock as ``TimedEvent.t_ns`` -- so a consumer (e.g.
+        ``monrad-monitor``'s time-varying alignment) can map a coincidence to
+        its window by real UTC time rather than by the file-name ``date`` label
+        (the two differ by the DAQ's UTC offset).  Written both as exact
+        integer-ns fields (authoritative) and as human-readable ISO strings.
+        Omitted when ``None`` (e.g. an empty window, or a caller that has no
+        timing) -- consumers then fall back to the ``date`` label.
     """
     path = Path(path)
     payload = {
@@ -68,10 +81,21 @@ def save_alignment(
             {f: float(getattr(p, f)) for f in _PLANE_FIELDS} for p in correction.planes
         ],
     }
+    if utc_start_ns is not None:
+        payload["utc_start_ns"] = int(utc_start_ns)
+        payload["utc_start"] = _ns_to_iso(utc_start_ns)
+    if utc_end_ns is not None:
+        payload["utc_end_ns"] = int(utc_end_ns)
+        payload["utc_end"] = _ns_to_iso(utc_end_ns)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2)
         fh.write("\n")
+
+
+def _ns_to_iso(t_ns: int) -> str:
+    """An integer-ns UTC time as a human-readable ISO-8601 string."""
+    return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc).isoformat()
 
 
 def load_alignment(

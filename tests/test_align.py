@@ -99,6 +99,28 @@ def _fake_detector(names: list[str]) -> DetectorFiles:
     return DetectorFiles(datetime(2023, 4, 18), 100_000_000, gps, pos)
 
 
+def test_daq_utc_offset_and_window_start():
+    """The DAQ file-name clock vs GPS-UTC offset is measured from the earliest
+    file, then maps each window label to its true UTC start."""
+    from datetime import timedelta
+
+    from monrad.monitor.align import _daq_utc_offset, _window_utc_start_ns
+    from monrad.timing import _utc_to_ns
+
+    # first file named 11:40 local, acquisition utc0 09:40 -> +2h DAQ offset
+    det = DetectorFiles(
+        datetime(2021, 7, 23, 9, 40, 0),
+        100_000_000,
+        [Path("20210723_114000_GPS.bin")],
+        [Path("20210723_114000.bin")],
+    )
+    assert _daq_utc_offset(det) == timedelta(hours=2)
+    # a window labeled 12:00 (local) therefore starts at UTC 10:00.
+    assert _window_utc_start_ns("20210723_120000", timedelta(hours=2)) == _utc_to_ns(
+        datetime(2021, 7, 23, 10, 0, 0)
+    )
+
+
 def test_group_by_day_orders_ascending():
     det = _fake_detector(["20230419_000000", "20230418_100000", "20230418_090000"])
     days = group_by_day(det)
