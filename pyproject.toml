@@ -18,6 +18,7 @@ monrad-decode-header = "monrad.decoders.header:main"
 monrad-resolution = "monrad.monitor.resolution:main"
 monrad-monitor = "monrad.monitor.timeseries:main"
 monrad-multiprobe = "monrad.monitor.multiprobe:main"
+monrad-align = "monrad.monitor.align:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
