@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..alignment import load_alignment
 from ..pose import PoseFitter, _MIN_COINCS
 from .io import (
     MacroArgumentParser,
@@ -96,6 +97,7 @@ def monitor_probes(
     tot_thresh: int = 1,
     tot_weights: bool = False,
     fibers_per_ribbon: list[int] | None = None,
+    alignment_path: Path | None = None,
     make_plots: bool = True,
 ) -> list[list[WindowResult]]:
     """Stream one acquisition and fit N probes' poses independently.
@@ -120,6 +122,11 @@ def monitor_probes(
         Probe fiber×ribbon combine factor(s) (DESIGN.md §2.4).  Same
         broadcast-or-one-per-probe contract as ``n_probe_ch``.  ``None``
         defaults to ``[10]`` (broadcast).
+    alignment_path:
+        Optional path to a telescope alignment correction saved by
+        ``monrad-align``.  When given, load it and skip the in-run alignment
+        fit (the saved ``z_tel`` must match this run's).  ``None`` (the
+        default) fits the alignment from this acquisition.
     Other parameters mirror :func:`~monrad.monitor.timeseries.monitor_probe`
     and apply identically to every probe's independent accumulator.
     """
@@ -143,9 +150,13 @@ def monitor_probes(
     tel = load_detector(tel_dir)
     probes = [load_detector(d) for d in prb_dirs]
 
-    alignment, _ = fit_alignment(
-        tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
-    )
+    if alignment_path is not None:
+        alignment = load_alignment(alignment_path, expect_z_tel=z_tel)
+        logger.info("Loaded telescope alignment from %s", alignment_path)
+    else:
+        alignment, _ = fit_alignment(
+            tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
+        )
     z_corr = alignment.corrected_z_tel(z_tel)
     window_ns = None if window_s is None else int(window_s * 1e9)
 
@@ -350,6 +361,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--window-s, applied independently per probe.",
     )
     p.add_argument(
+        "--alignment",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Path to a telescope alignment correction saved by monrad-align. "
+        "When given, load it and skip the in-run alignment fit (the saved "
+        "--z-tel must match this run's). Off by default (fit from this "
+        "acquisition).",
+    )
+    p.add_argument(
         "--out",
         type=Path,
         default=Path("./pipeline_out/multiprobe"),
@@ -402,6 +423,11 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("=== Run configuration ===")
     logger.info("  Telescope data:      %s  %s", args.telescope, _tag("telescope"))
     logger.info("  Probe data:          %s  %s", args.probe, _tag("probe"))
+    logger.info(
+        "  Alignment source:    %s  %s",
+        args.alignment if args.alignment is not None else "(fit from this run)",
+        _tag("alignment"),
+    )
     logger.info("  Output dir:          %s  %s", args.out, _tag("out"))
     logger.info(
         "  Telescope plane z (mm): %s  %s",
@@ -457,6 +483,7 @@ def main(argv: list[str] | None = None) -> None:
         tot_thresh=args.tot_thresh,
         tot_weights=args.tot_weights,
         fibers_per_ribbon=args.fibers_per_ribbon,
+        alignment_path=args.alignment,
         make_plots=not args.no_plots,
     )
     for k, results in enumerate(all_results):

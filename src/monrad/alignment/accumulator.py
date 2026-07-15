@@ -261,6 +261,17 @@ class AlignmentAccumulator:
         self._disambiguated: list[tuple[bool, bool, bool]] = []
         self.current_correction = AlignmentCorrection.identity()
 
+    @property
+    def n_buffered(self) -> int:
+        """Number of valid events currently buffered, awaiting the next fit.
+
+        Read this just before :meth:`flush` to report how many events a fit
+        was computed from (``flush`` clears the buffer).  With a very large
+        ``flush_every`` -- so ``add`` never mid-flushes -- this is the full
+        event count going into a single whole-acquisition fit.
+        """
+        return len(self._hits)
+
     def add(self, hits: list[Hit]) -> AlignmentCorrection | None:
         """
         Add one decoded 3-plane hit.

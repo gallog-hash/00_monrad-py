@@ -35,6 +35,15 @@ python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir> \
 # (macros/*.args) via `@path/to/file.args` in place of retyping flags.
 monrad-monitor @macros/monitor.args --out pipeline_out/monitor
 monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
+
+# Daily telescope alignment calibration + hardware-drift monitor. Fits ONE
+# AlignmentCorrection over the first --n-files (default 3) telescope files of a
+# day (earliest day, or --date YYYYMMDD), writes alignment_<date>.json, and
+# appends to alignment_history.csv/.png (drift log). Feed the JSON back to
+# monitor/multiprobe with --alignment to skip the in-run fit (saved --z-tel
+# must match the run's; enforced on load).
+monrad-align --telescope <tel_dir> --z-tel 0 400 800 --out pipeline_out/alignment
+monrad-monitor @macros/monitor.args --alignment pipeline_out/alignment/alignment_<date>.json
 ```
 
 ## Linting and formatting
@@ -70,6 +79,7 @@ src/monrad/                 # each stage is a domain package; its public API is
         candidates.py #   PlaneCandidate, reconstruct_plane_candidates()
     alignment/       # stage 4: AlignmentAccumulator, AlignmentCorrection, fit_telescope_alignment()
         accumulator.py
+        io.py         #   save_alignment/load_alignment — AlignmentCorrection JSON (de)serialization
     pose/            # stage 5: PoseFitter, PoseResult, Coincidence, fit_probe_pose()
         types.py      #   Coincidence, PoseResult, DecodeReport, GATE_ORDER
         optimize.py   #   fit_probe_pose() four-step optimizer + residual helpers
@@ -77,6 +87,7 @@ src/monrad/                 # each stage is a domain package; its public API is
     synthetic/       # generate() — synthetic test-data generator
         generate.py
     monitor/         # probe-position monitoring drivers (resolution, timeseries, multiprobe)
+                     #   align.py: monrad-align daily alignment calibration + drift monitor
 ```
 
 ### The five pipeline stages

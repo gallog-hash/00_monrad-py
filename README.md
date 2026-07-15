@@ -163,6 +163,42 @@ as one flag per line (`#` comments and blank lines ignored), and flags typed
 directly on the command line after the `@file` still apply on top of it. See
 `macros/monitor.args` / `macros/multiprobe.args` for barebone templates.
 
+### Daily alignment calibration + hardware-drift monitor
+
+The telescope stack is rigidly mounted, so its internal alignment
+(DESIGN.md §7) is a stable, once-a-day calibration — not something worth
+refitting on every monitoring run. `monrad-align` computes the correction
+**once per day** from the first few telescope files of that day, saves it as a
+reusable artifact, and appends the fit to a running drift log:
+
+```bash
+# Fit the earliest day in the directory (or pick one with --date YYYYMMDD)
+# from its first --n-files pairs (default 3). Writes alignment_<date>.json,
+# updates alignment_history.csv, and regenerates alignment_history.png.
+monrad-align \
+    --telescope data/telescope \
+    --z-tel     0 400 800 \
+    --out       pipeline_out/alignment
+```
+
+The fit doubles as a **hardware monitor**: `fit_telescope_alignment` flags
+`needs_correction` when any plane's offset / rotation / z-offset / tilt exceeds
+a mechanical limit. Each day's per-plane parameters are appended to
+`alignment_history.csv` (one row per date, idempotent — re-running a day
+replaces its row) and plotted against date in `alignment_history.png` with the
+limits drawn in, so drift is visible over time. A breach is logged loudly, but
+the tool still exits 0 — it reports, it does not gate.
+
+Feed the saved correction to the monitoring drivers with `--alignment`, which
+loads it and **skips the in-run alignment fit** (dropping a full telescope
+pass). The saved `--z-tel` must match the run's — the `delta_z`/`tilt` fit is
+z-order-dependent, and this is enforced on load:
+
+```bash
+monrad-monitor @macros/monitor.args \
+    --alignment pipeline_out/alignment/alignment_20230418.json
+```
+
 ```bash
 monrad-monitor @macros/monitor.args --out pipeline_out/monitor
 
@@ -187,8 +223,10 @@ src/monrad/
     coincidence/      # stage 2: coincidence search  → coincidence_stream()
     reconstruction/   # stage 3: position decoding   → decode_position()
     alignment/        # stage 4: telescope alignment → AlignmentAccumulator
+                      #   io.py: save_alignment/load_alignment (JSON)
     pose/             # stage 5: probe pose fit       → PoseFitter
-    monitor/          # monitoring drivers (resolution, timeseries)
+    monitor/          # monitoring drivers (resolution, timeseries,
+                      #   multiprobe, align — daily calibration/drift monitor)
     synthetic/        # synthetic-data generator (for testing)
 ```
 
