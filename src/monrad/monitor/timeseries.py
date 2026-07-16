@@ -72,6 +72,7 @@ from .io import (
     fit_alignment,
     load_alignment_schedule,
     load_detector,
+    static_alignment_label,
     stream_coincidences,
     validate_probe_footprint,
 )
@@ -166,6 +167,11 @@ class WindowResult:
     sigma_theta: float
     resid_rms: float  # combined absolute-mm residual RMS over all coincidences
     # fed to the fit (inliers + Mahalanobis-cut outliers); see _window_resid_rms
+    # Alignment label(s) active over this window's coincidences (see
+    # Coincidence.alignment_label). Comma-joined in encounter order when the
+    # window straddled an AlignmentSchedule boundary, so a mixed-alignment
+    # window is visible rather than silently attributed to one correction.
+    alignment_label: str = ""
 
 
 def _utc(t_ns: float) -> datetime:
@@ -292,6 +298,7 @@ class _WindowAccumulator:
         pose: PoseResult,
         utc_start: datetime,
         utc_end: datetime,
+        coincs: list[Coincidence],
     ) -> WindowResult:
         # Absolute-mm residual RMS over ALL coincidences fed to the fit — the
         # honest window-quality signal.  The inlier-only residuals the fit
@@ -299,6 +306,16 @@ class _WindowAccumulator:
         # Mahalanobis cut rejects the wild tracks; counting the rejected tracks
         # back in is what exposes the contamination (see _window_resid_rms).
         rms = _window_resid_rms(pose)
+
+        # Distinct alignment labels over the window's coincidences, in
+        # encounter (chronological) order — more than one means the window
+        # straddled an AlignmentSchedule boundary.
+        labels: list[str] = []
+        seen: set[str] = set()
+        for c in coincs:
+            if c.alignment_label and c.alignment_label not in seen:
+                seen.add(c.alignment_label)
+                labels.append(c.alignment_label)
 
         cov_c = centre_cov_2x2(pose.cov, pose.theta, self.n_probe_ch)
         result = WindowResult(
@@ -314,6 +331,7 @@ class _WindowAccumulator:
             theta=pose.theta,
             sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
             resid_rms=rms,
+            alignment_label=",".join(labels),
         )
         self.results.append(result)
         self.prev_pose = pose
@@ -430,7 +448,9 @@ class _WindowAccumulator:
                     len(working),
                 )
 
-        result = self._record(pose, utc_start, utc_end) if continuity_ok else None
+        result = (
+            self._record(pose, utc_start, utc_end, working) if continuity_ok else None
+        )
         self._reset_batch()
         return result
 
@@ -646,6 +666,7 @@ def monitor_probe(
         z_tel=z_tel,
         alignment=alignment,
         schedule=schedule,
+        alignment_label=static_alignment_label(alignment_path),
         tot_thresh=tot_thresh,
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
@@ -697,6 +718,7 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                 "theta",
                 "sigma_theta",
                 "resid_rms",
+                "alignment_label",
             ]
         )
         for r in results:
@@ -714,6 +736,7 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                     f"{r.theta:.6g}",
                     f"{r.sigma_theta:.6g}",
                     f"{r.resid_rms:.6g}",
+                    r.alignment_label,
                 ]
             )
 

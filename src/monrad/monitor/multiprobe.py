@@ -47,6 +47,7 @@ from .io import (
     fit_alignment,
     load_alignment_schedule,
     load_detector,
+    static_alignment_label,
     validate_probe_footprint,
 )
 from .timeseries import (
@@ -218,6 +219,7 @@ def monitor_probes(
         for k in range(len(probes))
     ]
 
+    label = static_alignment_label(alignment_path)
     for cluster in build_cluster_stream(tel, probes):
         if schedule is not None:
             t_ns = _cluster_tel_time(cluster, tel_id=0)
@@ -229,11 +231,12 @@ def monitor_probes(
                     # only fitters[0].alignment is read by the shared decode.
                     for f in fitters:
                         f.update_alignment(corr)
+                label = schedule.label_at(t_ns)
         tel_result = fitters[0].decode_telescope_track(cluster)
         for fitter, acc in zip(fitters, accumulators):
             co = fitter.decode_from_telescope_track(cluster, tel_result)
             if co is not None:
-                acc.push(co)
+                acc.push(co._replace(alignment_label=label))
     for acc in accumulators:
         acc.finalize()
 

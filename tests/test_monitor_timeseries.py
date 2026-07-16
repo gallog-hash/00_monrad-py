@@ -100,7 +100,7 @@ def test_synthetic_zp_within_5sigma(synth_run):
 def test_window_result_holds_only_scalars(synth_run):
     """WindowResult must not retain the full PoseResult (unbounded RAM growth).
 
-    Every field should be a plain scalar (int/float/datetime), never a
+    Every field should be a plain scalar (int/float/str/datetime), never a
     PoseResult or its inliers/outliers lists, so results accumulated over a
     long run stay bounded regardless of window count.
     """
@@ -110,7 +110,7 @@ def test_window_result_holds_only_scalars(synth_run):
         assert f.type != "PoseResult", f"field {f.name} leaks a PoseResult"
     for r in results:
         for value in dataclasses.astuple(r):
-            assert isinstance(value, (int, float)) or hasattr(value, "isoformat")
+            assert isinstance(value, (int, float, str)) or hasattr(value, "isoformat")
 
 
 def test_synthetic_csv_rows(synth_run):
@@ -831,3 +831,77 @@ def test_switch_actually_fires(align_synth, tmp_path, monkeypatch):
     assert results
     # at least one switch into the second window's (delta_x=5.0) correction.
     assert 5.0 in calls
+
+
+def test_static_alignment_label_matches_file(align_synth):
+    """A single-file --alignment labels every window with that file's stem
+    (the "alignment_" prefix stripped), matching AlignmentSchedule's own
+    window-label convention."""
+    _, single_json, baseline = align_synth
+    expected = single_json.stem.removeprefix("alignment_")
+    assert baseline
+    for r in baseline:
+        assert r.alignment_label == expected
+
+
+def test_auto_fit_alignment_label_is_auto(count_run):
+    """No --alignment given: the driver auto-fits, and every window is
+    labelled "auto" (no schedule/static file to name it after)."""
+    results, _, _ = count_run
+    assert results
+    for r in results:
+        assert r.alignment_label == "auto"
+
+
+def test_schedule_alignment_label_reflects_switch(align_synth, tmp_path):
+    """Each window's alignment_label names the schedule window(s) its
+    coincidences were decoded under; a window straddling the boundary lists
+    both, in encounter order."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    adir = tmp_path / "sched_label"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(5.0))
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert results
+    for r in results:
+        assert set(r.alignment_label.split(",")) <= {label0, label1}
+    # label1 shows up somewhere once the stream crosses into the second window.
+    assert any(label1 in r.alignment_label.split(",") for r in results)
+
+
+def test_csv_has_alignment_label_column(align_synth, tmp_path):
+    """The CSV carries an alignment_label column populated per window."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    adir = tmp_path / "sched_csv"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(5.0))
+    out = tmp_path / "sched_csv_out"
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        out_dir=out,
+        make_plots=False,
+    )
+    lines = (out / "pose_timeseries.csv").read_text().splitlines()
+    header = lines[0].split(",")
+    assert "alignment_label" in header
+    col = header.index("alignment_label")
+    assert len(lines) == len(results) + 1
+    for line in lines[1:]:
+        assert line.split(",")[col] != ""

@@ -45,6 +45,16 @@ class Coincidence(NamedTuple):
     # re-reading the stage-1 stream.  The default keeps positional
     # Coincidence(...) construction in tests working unchanged.
     t_ns: int = 0
+    # Label of the AlignmentCorrection active when this coincidence was
+    # decoded (e.g. "20210723_060000" for a time-varying AlignmentSchedule
+    # window, or the static alignment source's name).  Set by the monitor
+    # drivers (monrad.monitor.io.stream_coincidences /
+    # monrad.monitor.multiprobe), not by PoseFitter itself, since only the
+    # caller knows the schedule/label -- PoseFitter only holds the
+    # AlignmentCorrection object.  "" when no label is available.  The
+    # default keeps positional Coincidence(...) construction in tests
+    # working unchanged.
+    alignment_label: str = ""
 
 
 class DecodeReport(NamedTuple):

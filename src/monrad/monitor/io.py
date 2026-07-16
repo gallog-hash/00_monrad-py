@@ -269,6 +269,26 @@ class AlignmentSchedule:
         idx = int(np.searchsorted(self.starts_ns, t_ns, side="right")) - 1
         return self.corrections[max(idx, 0)]
 
+    def label_at(self, t_ns: int) -> str:
+        """The active window's label (the ``alignment_<label>.json`` stem)
+        for a telescope-event time ``t_ns``.  Mirrors :meth:`at`."""
+        idx = int(np.searchsorted(self.starts_ns, t_ns, side="right")) - 1
+        return self.labels[max(idx, 0)]
+
+
+def static_alignment_label(alignment_path: Path | None) -> str:
+    """Provenance label for a fixed (non-schedule) alignment.
+
+    Used for the monitoring CSV's ``alignment_label`` column when
+    ``--alignment`` names a single file (or is omitted). Matches
+    :class:`AlignmentSchedule`'s window-label convention (the file stem with
+    the ``alignment_`` prefix stripped) so static and time-varying runs read
+    consistently; ``"auto"`` when no ``--alignment`` was given (in-run fit).
+    """
+    if alignment_path is None:
+        return "auto"
+    return alignment_path.stem.removeprefix("alignment_")
+
 
 def load_alignment_schedule(
     directory: Path, *, expect_z_tel: np.ndarray
@@ -489,6 +509,7 @@ def stream_coincidences(
     z_tel: np.ndarray,
     alignment: AlignmentCorrection,
     schedule: AlignmentSchedule | None = None,
+    alignment_label: str = "",
     tot_thresh: int = 1,
     tot_weights: bool = False,
     min_anchor_planes: int = 1,
@@ -512,6 +533,12 @@ def stream_coincidences(
     decodes, to the correction active at that cluster's telescope-event time --
     time-varying alignment. ``None`` (the default) keeps ``alignment`` fixed for
     the whole stream, exactly as before.
+
+    alignment_label : the label recorded on each yielded ``Coincidence`` when
+    ``schedule`` is ``None`` (a fixed, whole-run alignment) -- e.g. the static
+    alignment file's name, for provenance in the monitoring CSV output. When
+    ``schedule`` is given, each cluster's label instead comes from
+    ``schedule.label_at()`` and this parameter is unused.
     """
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -525,6 +552,7 @@ def stream_coincidences(
         min_anchor_planes=min_anchor_planes,
         prb_fibers_per_ribbon=fibers_per_ribbon,
     )
+    label = alignment_label
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
     for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
@@ -534,6 +562,7 @@ def stream_coincidences(
                 corr = schedule.at(t_ns)
                 if corr is not fitter.alignment:
                     fitter.update_alignment(corr)
+                label = schedule.label_at(t_ns)
         co = fitter.decode_cluster(cluster)
         if co is not None:
-            yield co
+            yield co._replace(alignment_label=label)

@@ -492,3 +492,33 @@ def test_multiprobe_directory_switch_preserves_identity(
         by_corr.setdefault(cid, set()).add(fid)
     # the boundary switch touches both fitters with one shared correction id.
     assert any(len(fitters) == 2 for fitters in by_corr.values())
+
+
+def test_multiprobe_alignment_label_reflects_switch(multiprobe_run, tmp_path):
+    """Each probe's per-window alignment_label names the schedule window(s)
+    its coincidences were decoded under, mirroring the single-probe driver."""
+    all_results, _, info1, info2 = multiprobe_run
+    base = all_results[0]
+    first, last = base[0].utc_start, base[-1].utc_end
+    mid = first + (last - first) / 2
+    label0 = first.strftime("%Y%m%d_%H%M%S")
+    label1 = mid.strftime("%Y%m%d_%H%M%S")
+    adir = tmp_path / "mp_sched_label"
+    _mp_write_window(adir, label0, _mp_corr(0.0))
+    _mp_write_window(adir, label1, _mp_corr(5.0))
+
+    results = monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        window_s=150.0,
+        z_tel=_Z_MP,
+        n_probe_ch=[30, 40],
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert len(results) == 2
+    for probe_results in results:
+        assert probe_results
+        for r in probe_results:
+            assert set(r.alignment_label.split(",")) <= {label0, label1}
+        assert any(label1 in r.alignment_label.split(",") for r in probe_results)
