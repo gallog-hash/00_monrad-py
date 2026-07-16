@@ -42,12 +42,18 @@ monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
 # first --n-files (default 3) files, writes alignment_<label>.json per
 # window, and appends to alignment_history.csv/.png (drift log). --date
 # restricts to one day (or, under a sub-day --interval-hours, one window via
-# YYYYMMDD_HHMMSS). Feed a JSON back to monitor/multiprobe with --alignment
-# to skip the in-run fit (saved --z-tel must match the run's; enforced on
-# load).
+# YYYYMMDD_HHMMSS). Each JSON also records the window's true UTC coverage
+# (utc_start_ns/utc_end_ns, from a constant DAQ-filename->GPS-UTC offset, since
+# the label is a file-name/DAQ-local time). Feed a JSON back to
+# monitor/multiprobe with --alignment to skip the in-run fit (saved --z-tel
+# must match the run's; enforced on load). Or feed the whole --out DIRECTORY to
+# --alignment for time-varying alignment: the driver switches the active
+# correction per window as the stream crosses UTC boundaries (single file / one-
+# file dir == static, unchanged).
 monrad-align --telescope <tel_dir> --z-tel 0 400 800 --out pipeline_out/alignment
 monrad-align --telescope <tel_dir> --z-tel 0 400 800 --interval-hours 6 --out pipeline_out/alignment
 monrad-monitor @macros/monitor.args --alignment pipeline_out/alignment/alignment_<date>.json
+monrad-monitor @macros/monitor.args --alignment pipeline_out/alignment  # DIR = time-varying
 ```
 
 ## Linting and formatting

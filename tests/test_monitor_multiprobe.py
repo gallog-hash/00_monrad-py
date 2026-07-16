@@ -13,7 +13,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from monrad.alignment import AlignmentCorrection, PlaneCorrection, save_alignment
 from monrad.monitor.multiprobe import _parse_args, monitor_probes
+from monrad.pose import PoseFitter
 from monrad.synthetic.generate import Z_TEL, generate
 
 # (t_x, t_y, theta, z_p, n_probe_ch) truth per probe.
@@ -416,3 +418,107 @@ def test_cli_fibers_per_ribbon_out_of_range_rejected(bad_n):
                 str(bad_n),
             ]
         )
+
+
+# ── Time-varying alignment (shared-search identity across a mid-stream switch) ─
+
+_Z_MP = np.array(Z_TEL, dtype=float)
+
+
+def _mp_corr(delta_x: float) -> AlignmentCorrection:
+    planes = [
+        PlaneCorrection(delta_x, 0.0, 0.0, 0.0, 0.0, 0.0),
+        PlaneCorrection(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        PlaneCorrection(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    ]
+    return AlignmentCorrection(planes, False)
+
+
+def _mp_write_window(dir_: Path, label: str, corr: AlignmentCorrection) -> None:
+    dir_.mkdir(parents=True, exist_ok=True)
+    save_alignment(
+        corr,
+        dir_ / f"alignment_{label}.json",
+        date=label,
+        z_tel=_Z_MP,
+        files=[f"{label}.bin"],
+        n_events=100,
+    )
+
+
+def test_multiprobe_directory_switch_preserves_identity(
+    multiprobe_run, tmp_path, monkeypatch
+):
+    """A mid-stream alignment switch applies the *same* correction object to
+    every probe's fitter, so the shared-telescope-search identity invariant
+    (all fitters share one AlignmentCorrection) still holds, and the run still
+    produces per-probe windows."""
+    all_results, _, info1, info2 = multiprobe_run
+    base = all_results[0]
+    first, last = base[0].utc_start, base[-1].utc_end
+    mid = first + (last - first) / 2
+    label0 = first.strftime("%Y%m%d_%H%M%S")
+    label1 = mid.strftime("%Y%m%d_%H%M%S")
+    assert label0 != label1
+    adir = tmp_path / "mp_sched"
+    _mp_write_window(adir, label0, _mp_corr(0.0))
+    _mp_write_window(adir, label1, _mp_corr(5.0))  # distinct second window
+
+    switches: list[tuple[int, int]] = []  # (id(fitter), id(correction))
+    orig = PoseFitter.update_alignment
+
+    def spy(self, correction):
+        switches.append((id(self), id(correction)))
+        return orig(self, correction)
+
+    monkeypatch.setattr(PoseFitter, "update_alignment", spy)
+    results = monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        window_s=150.0,
+        z_tel=_Z_MP,
+        n_probe_ch=[30, 40],
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert len(results) == 2
+    assert all(r for r in results)  # each probe produced windows
+
+    # A switch fired, and at each switched-to correction both probes' fitters
+    # received the *same* object (identity invariant preserved).
+    assert switches, "expected at least one mid-stream alignment switch"
+    by_corr: dict[int, set[int]] = {}
+    for fid, cid in switches:
+        by_corr.setdefault(cid, set()).add(fid)
+    # the boundary switch touches both fitters with one shared correction id.
+    assert any(len(fitters) == 2 for fitters in by_corr.values())
+
+
+def test_multiprobe_alignment_label_reflects_switch(multiprobe_run, tmp_path):
+    """Each probe's per-window alignment_label names the schedule window(s)
+    its coincidences were decoded under, mirroring the single-probe driver."""
+    all_results, _, info1, info2 = multiprobe_run
+    base = all_results[0]
+    first, last = base[0].utc_start, base[-1].utc_end
+    mid = first + (last - first) / 2
+    label0 = first.strftime("%Y%m%d_%H%M%S")
+    label1 = mid.strftime("%Y%m%d_%H%M%S")
+    adir = tmp_path / "mp_sched_label"
+    _mp_write_window(adir, label0, _mp_corr(0.0))
+    _mp_write_window(adir, label1, _mp_corr(5.0))
+
+    results = monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        window_s=150.0,
+        z_tel=_Z_MP,
+        n_probe_ch=[30, 40],
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert len(results) == 2
+    for probe_results in results:
+        assert probe_results
+        for r in probe_results:
+            assert set(r.alignment_label.split(",")) <= {label0, label1}
+        assert any(label1 in r.alignment_label.split(",") for r in probe_results)

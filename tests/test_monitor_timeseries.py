@@ -15,10 +15,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from monrad.alignment import AlignmentCorrection, PlaneCorrection, save_alignment
 from monrad.monitor import timeseries as timeseries_mod
-from monrad.monitor.io import centre_cov_2x2
+from monrad.monitor.align import compute_daily_alignment
+from monrad.monitor.io import centre_cov_2x2, load_detector
 from monrad.monitor.timeseries import WindowResult, _parse_args, monitor_probe
-from monrad.pose import _MIN_COINCS
+from monrad.pose import PoseFitter, _MIN_COINCS
 from monrad.synthetic.generate import Z_TEL, generate
 
 # ── Real-data paths (skipped when absent) ────────────────────────────────────
@@ -98,7 +100,7 @@ def test_synthetic_zp_within_5sigma(synth_run):
 def test_window_result_holds_only_scalars(synth_run):
     """WindowResult must not retain the full PoseResult (unbounded RAM growth).
 
-    Every field should be a plain scalar (int/float/datetime), never a
+    Every field should be a plain scalar (int/float/str/datetime), never a
     PoseResult or its inliers/outliers lists, so results accumulated over a
     long run stay bounded regardless of window count.
     """
@@ -108,7 +110,7 @@ def test_window_result_holds_only_scalars(synth_run):
         assert f.type != "PoseResult", f"field {f.name} leaks a PoseResult"
     for r in results:
         for value in dataclasses.astuple(r):
-            assert isinstance(value, (int, float)) or hasattr(value, "isoformat")
+            assert isinstance(value, (int, float, str)) or hasattr(value, "isoformat")
 
 
 def test_synthetic_csv_rows(synth_run):
@@ -658,3 +660,248 @@ def test_cold_start_bootstrap_fit_is_throttled(tmp_path, monkeypatch):
                 f"cold-start bootstrap refit at {prev} -> {nxt} raw "
                 f"coincidences, only {nxt - prev} apart (< stride={stride})"
             )
+
+
+# ── Time-varying alignment (directory of alignment_<label>.json) ──────────────
+
+_Z_SYNTH = np.array(Z_TEL, dtype=float)
+
+
+def _mk_corr(delta_x: float = 0.0) -> AlignmentCorrection:
+    planes = [
+        PlaneCorrection(delta_x, 0.0, 0.0, 0.0, 0.0, 0.0),
+        PlaneCorrection(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        PlaneCorrection(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    ]
+    return AlignmentCorrection(planes, False)
+
+
+def _write_window(dir_: Path, label: str, corr: AlignmentCorrection) -> None:
+    dir_.mkdir(parents=True, exist_ok=True)
+    save_alignment(
+        corr,
+        dir_ / f"alignment_{label}.json",
+        date=label,
+        z_tel=_Z_SYNTH,
+        files=[f"{label}.bin"],
+        n_events=100,
+    )
+
+
+@pytest.fixture(scope="module")
+def align_synth(tmp_path_factory):
+    """Synthetic data + a single-file baseline alignment run.
+
+    Returns (info, single_json, baseline_results) so the schedule tests can
+    derive window labels that bracket the real coincidence span and compare
+    against static behavior.
+    """
+    src = tmp_path_factory.mktemp("align_synth_gen")
+    info = generate(
+        src, t_x=300.0, t_y=350.0, z_p=300.0, n_probe_ch=30, n_tracks=5000, seed=42
+    )
+    out_align = tmp_path_factory.mktemp("align_synth_align")
+    compute_daily_alignment(
+        info["tel_dir"], _Z_SYNTH, out_dir=out_align, make_plots=False
+    )
+    det = load_detector(info["tel_dir"])
+    single_json = out_align / f"alignment_{det.gps_paths[0].name[:8]}.json"
+    baseline = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=single_json,
+        make_plots=False,
+    )
+    assert len(baseline) >= 2
+    return info, single_json, baseline
+
+
+def _span_labels(baseline) -> tuple[str, str]:
+    """A (window0, window1) label pair: window0 at the first window's start,
+    window1 at the midpoint of the run (so a mid-stream switch must fire)."""
+    first = baseline[0].utc_start
+    last = baseline[-1].utc_end
+    mid = first + (last - first) / 2
+    return first.strftime("%Y%m%d_%H%M%S"), mid.strftime("%Y%m%d_%H%M%S")
+
+
+def test_alignment_directory_consumed(align_synth, tmp_path):
+    """A directory of two window JSONs is loaded, z_tel-validated, and produces
+    windows just like a single file."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    adir = tmp_path / "sched"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(0.0))
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert len(results) >= 1
+    for r in results:
+        assert r.n_inliers > 0
+
+
+def test_alignment_directory_z_tel_mismatch_raises(align_synth, tmp_path):
+    """A window fit against a different z-order aborts the run up front."""
+    info, _, baseline = align_synth
+    label0, _ = _span_labels(baseline)
+    adir = tmp_path / "sched_bad"
+    _write_window(adir, label0, _mk_corr(0.0))
+    with pytest.raises(ValueError, match="z-order-dependent"):
+        monitor_probe(
+            info["tel_dir"],
+            info["probe_dir"],
+            z_tel=np.array([0.0, -1340.0, -670.0]),
+            n_probe_ch=30,
+            alignment_path=adir,
+            make_plots=False,
+        )
+
+
+def test_single_file_matches_directory_of_one(align_synth, tmp_path):
+    """A one-file directory degenerates exactly to today's static behavior."""
+    info, single_json, baseline = align_synth
+    adir = tmp_path / "sched_one"
+    adir.mkdir()
+    # reuse the baseline's own correction, relabelled into a directory
+    corr = _mk_corr(0.0)
+    label0, _ = _span_labels(baseline)
+    _write_window(adir, label0, corr)
+
+    from_file = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir / f"alignment_{label0}.json",
+        make_plots=False,
+    )
+    from_dir = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert len(from_file) == len(from_dir)
+    for a, b in zip(from_file, from_dir):
+        assert a == b
+
+
+def test_switch_actually_fires(align_synth, tmp_path, monkeypatch):
+    """With a boundary mid-span, the fitter's alignment is switched at least
+    once as the stream crosses into the second window."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    assert label0 != label1
+    adir = tmp_path / "sched_switch"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(5.0))  # visibly distinct correction
+
+    calls: list[float] = []
+    orig = PoseFitter.update_alignment
+
+    def spy(self, correction):
+        calls.append(correction.planes[0].delta_x)
+        return orig(self, correction)
+
+    monkeypatch.setattr(PoseFitter, "update_alignment", spy)
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert results
+    # at least one switch into the second window's (delta_x=5.0) correction.
+    assert 5.0 in calls
+
+
+def test_static_alignment_label_matches_file(align_synth):
+    """A single-file --alignment labels every window with that file's stem
+    (the "alignment_" prefix stripped), matching AlignmentSchedule's own
+    window-label convention."""
+    _, single_json, baseline = align_synth
+    expected = single_json.stem.removeprefix("alignment_")
+    assert baseline
+    for r in baseline:
+        assert r.alignment_label == expected
+
+
+def test_auto_fit_alignment_label_is_auto(count_run):
+    """No --alignment given: the driver auto-fits, and every window is
+    labelled "auto" (no schedule/static file to name it after)."""
+    results, _, _ = count_run
+    assert results
+    for r in results:
+        assert r.alignment_label == "auto"
+
+
+def test_schedule_alignment_label_reflects_switch(align_synth, tmp_path):
+    """Each window's alignment_label names the schedule window(s) its
+    coincidences were decoded under; a window straddling the boundary lists
+    both, in encounter order."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    adir = tmp_path / "sched_label"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(5.0))
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        make_plots=False,
+    )
+    assert results
+    for r in results:
+        assert set(r.alignment_label.split(",")) <= {label0, label1}
+    # label1 shows up somewhere once the stream crosses into the second window.
+    assert any(label1 in r.alignment_label.split(",") for r in results)
+
+
+def test_csv_has_alignment_label_column(align_synth, tmp_path):
+    """The CSV carries an alignment_label column populated per window."""
+    info, _, baseline = align_synth
+    label0, label1 = _span_labels(baseline)
+    adir = tmp_path / "sched_csv"
+    _write_window(adir, label0, _mk_corr(0.0))
+    _write_window(adir, label1, _mk_corr(5.0))
+    out = tmp_path / "sched_csv_out"
+
+    results = monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        window_s=150.0,
+        z_tel=_Z_SYNTH,
+        n_probe_ch=30,
+        alignment_path=adir,
+        out_dir=out,
+        make_plots=False,
+    )
+    lines = (out / "pose_timeseries.csv").read_text().splitlines()
+    header = lines[0].split(",")
+    assert "alignment_label" in header
+    col = header.index("alignment_label")
+    assert len(lines) == len(results) + 1
+    for line in lines[1:]:
+        assert line.split(",")[col] != ""
