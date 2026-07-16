@@ -71,6 +71,17 @@ Commits: `94d4b8c` (the time-varying alignment feature, see
 
 ## Known limitations (documented, not bugs to fix now)
 
+- **No `--alignment` at all → single static auto-fit, not time-varying.**
+  Without `--alignment`, `fit_alignment()` (`monitor/io.py`) picks the
+  *earliest day* in the telescope directory and fits one `AlignmentCorrection`
+  from that day's first `DAILY_ALIGNMENT_N_FILES` (3) files — identical to
+  what a `monrad-align` run on that directory would produce — then holds that
+  one correction fixed for the *entire* run. Every window's `alignment_label`
+  reads `"auto"` for exactly this reason: it flags "no schedule, no static
+  file, just the in-run day-0 fit." If the telescope drifts over a
+  multi-day acquisition, an auto-fit run silently applies only the earliest
+  day's geometry throughout — `--alignment <dir>` (time-varying) or a
+  fresher single `--alignment <file>.json` avoids that.
 - Same DST-offset caveat as the 07-15 handoff (`_daq_utc_offset` is one
   constant per acquisition).
 - `fit_probe_pose`'s `alignment` parameter (stage 5) is **not** what
