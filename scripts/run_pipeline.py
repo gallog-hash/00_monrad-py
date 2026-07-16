@@ -99,8 +99,22 @@ from monrad.timing import (
 )
 from monrad.coincidence import coincidence_stream
 from monrad.alignment import AlignmentCorrection
-from monrad.monitor.io import DetectorFiles, fit_alignment, load_detector
-from monrad.pose import GATE_ORDER, DecodeReport, PoseFitter, PoseResult
+from monrad.monitor.io import (
+    DetectorFiles,
+    fit_alignment,
+    load_detector,
+    validate_probe_footprint,
+)
+from monrad.pose import (
+    GATE_ORDER,
+    Coincidence,
+    DecodeReport,
+    PoseFitter,
+    PoseResult,
+    filter_off_probe,
+    filter_rigidity,
+    fit_probe_pose,
+)
 
 _CAND_BUCKETS = ("invalid(0)", "resolved(1)", "ambiguous(2+)")
 # Probe Hit.quality values (stage3.Hit), in canonical order, for the probe
@@ -186,6 +200,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "can fabricate tracks); 3 demands every plane already resolved.",
     )
     p.add_argument(
+        "--max-rigidity-resid-mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Pre-fit geometric gate (mm), applied once to the whole run's "
+        "accepted coincidences before the final pose fit: drops coincidences "
+        "whose track-vs-probe pairwise distances (DESIGN.md docs/handoffs/"
+        "2026-07-07-off-probe-track-gate-strategy.md) are inconsistent with a "
+        "rigid transform -- catches combinatorial telescope-track picks that "
+        "look fine over the telescope's own short baseline but are wrong once "
+        "extrapolated out to z_p. Off by default (see monrad-monitor's flag "
+        "of the same name).",
+    )
+    p.add_argument(
+        "--n-probe-ch",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Probe channel count, i.e. probe side length in units of 10mm "
+        "(default: 30 = 300mm; CLAUDE.md's nominal size, often wrong for real "
+        "probes -- derive it from the data, e.g. the max decoded golden-hit "
+        "coordinate). Only used by --max-off-probe-mm's footprint check.",
+    )
+    p.add_argument(
+        "--max-off-probe-mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Pre-fit geometric gate (mm), applied after --max-rigidity-resid-"
+        "mm: drops coincidences whose track projects more than this far "
+        "outside the probe's [0, --n-probe-ch*10]^2 footprint. The reference "
+        "pose is bootstrapped from a fit on the (rigidity-gated) accepted set "
+        "-- there is no prior window to anchor it to, unlike monrad-monitor's "
+        "streaming gate. Off by default (see monrad-monitor's flag of the "
+        "same name).",
+    )
+    p.add_argument(
         "--plot",
         action="store_true",
         default=False,
@@ -204,6 +255,10 @@ def _parse_args() -> tuple[argparse.Namespace, set[str]]:
             "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
             f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
         )
+    try:
+        validate_probe_footprint(args.n_probe_ch, args.fibers_per_ribbon)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only
@@ -433,6 +488,10 @@ def main() -> None:
     tot_weights: bool = args.tot_weights
     min_anchor_planes: int = args.min_anchor_planes
     fibers_per_ribbon: int = args.fibers_per_ribbon
+    max_rigidity_resid_mm: float | None = args.max_rigidity_resid_mm
+    n_probe_ch: int = args.n_probe_ch
+    max_off_probe_mm: float | None = args.max_off_probe_mm
+    probe_size_mm = n_probe_ch * 10.0
 
     lines: list[str] = []
 
@@ -459,6 +518,16 @@ def main() -> None:
     _emit(
         lines,
         f"  fibers_per_ribbon:  {fibers_per_ribbon}  {_tag('fibers_per_ribbon')}",
+    )
+    _emit(
+        lines,
+        f"  max_rigidity_resid_mm: {max_rigidity_resid_mm}  "
+        f"{_tag('max_rigidity_resid_mm')}",
+    )
+    _emit(lines, f"  n_probe_ch:         {n_probe_ch}  {_tag('n_probe_ch')}")
+    _emit(
+        lines,
+        f"  max_off_probe_mm:   {max_off_probe_mm}  {_tag('max_off_probe_mm')}",
     )
     _emit(lines, f"  plot:               {args.plot}  {_tag('plot')}")
     _emit(lines)
@@ -625,6 +694,7 @@ def main() -> None:
 
     n_coinc = 0
     total_cluster_size = 0
+    coincs: list[Coincidence] = []
 
     for cluster in coincidence_stream(
         [tel_stream, prb_stream],
@@ -632,9 +702,65 @@ def main() -> None:
     ):
         n_coinc += 1
         total_cluster_size += len(cluster)
-        fitter.add(cluster)
+        co = fitter.decode_cluster(cluster)
+        if co is not None:
+            coincs.append(co)
 
-    pose = fitter.flush()
+    # ── Pre-fit geometric gate (stage 5) ───────────────────────────────────
+    # filter_rigidity scores each accepted coincidence by pairwise-distance
+    # consistency with the others (DESIGN.md docs/handoffs/
+    # 2026-07-07-off-probe-track-gate-strategy.md) — catches a combinatorial
+    # telescope-track pick that looked fine over the telescope's own short
+    # baseline but is geometrically wrong once extrapolated out to z_p.
+    # z_ref is bootstrapped from an unfiltered fit (there is no prior window's
+    # pose to anchor it to, unlike monrad-monitor's streaming gate).
+    n_rigidity_dropped = 0
+    rigidity_fallback = False
+    z_ref_bootstrap: float | None = None
+    if max_rigidity_resid_mm is not None and len(coincs) >= 3:
+        z_ref_bootstrap = fit_probe_pose(
+            coincs, alignment.corrected_z_tel(z_tel), alignment
+        ).z_p
+        kept, dropped = filter_rigidity(coincs, z_ref_bootstrap, max_rigidity_resid_mm)
+        if len(kept) >= 3:
+            n_rigidity_dropped = len(dropped)
+            coincs = kept
+        else:
+            # Too few survivors -- keep the unfiltered set rather than starve
+            # the fit (fit_probe_pose's own Mahalanobis cut falls back the
+            # same way when it would otherwise drop below 3 inliers).
+            rigidity_fallback = True
+    n_after_rigidity = len(coincs)
+
+    # filter_off_probe drops coincidences whose track, extrapolated to a
+    # reference pose's z_p and mapped into probe-frame coordinates, lands
+    # outside the probe's physical [0, n_probe_ch*10]^2 footprint. The
+    # reference pose is bootstrapped from a fit on the (rigidity-gated)
+    # coincidences -- there is no prior window's pose to anchor it to here,
+    # unlike monrad-monitor's streaming gate.
+    n_off_probe_dropped = 0
+    off_probe_fallback = False
+    ref_pose_bootstrap: PoseResult | None = None
+    if max_off_probe_mm is not None and len(coincs) >= 3:
+        ref_pose_bootstrap = fit_probe_pose(
+            coincs, alignment.corrected_z_tel(z_tel), alignment
+        )
+        kept, dropped = filter_off_probe(
+            coincs, ref_pose_bootstrap, probe_size_mm, max_off_probe_mm
+        )
+        if len(kept) >= 3:
+            n_off_probe_dropped = len(dropped)
+            coincs = kept
+        else:
+            # Too few survivors -- keep the (rigidity-gated) set rather than
+            # starve the fit, same fallback philosophy as the rigidity gate.
+            off_probe_fallback = True
+
+    pose = (
+        fit_probe_pose(coincs, alignment.corrected_z_tel(z_tel), alignment)
+        if len(coincs) >= PoseFitter.MIN_FIT
+        else None
+    )
 
     # ── Print stage 2 ────────────────────────────────────────────────────
     mean_sz = (total_cluster_size / n_coinc) if n_coinc else 0.0
@@ -718,6 +844,61 @@ def main() -> None:
             )
 
     _emit(lines)
+
+    # ── Print pre-fit geometric gate (stage 5) ─────────────────────────────
+    if max_rigidity_resid_mm is not None:
+        _emit(lines, "  Pre-fit rigidity gate:")
+        if z_ref_bootstrap is None:
+            _emit(lines, "    skipped -- fewer than 3 accepted coincidences")
+        else:
+            _emit(
+                lines,
+                f"    z_ref (bootstrap fit) = {z_ref_bootstrap:+.1f} mm   "
+                f"max_resid = {max_rigidity_resid_mm:g} mm",
+            )
+            if rigidity_fallback:
+                _emit(
+                    lines,
+                    "    fewer than 3 would survive -- gate bypassed, "
+                    "fit uses the unfiltered set",
+                )
+            else:
+                _emit(
+                    lines,
+                    f"    dropped {n_rigidity_dropped}   "
+                    f"survivors -> {n_after_rigidity}",
+                )
+        _emit(lines)
+
+    if max_off_probe_mm is not None:
+        _emit(lines, "  Pre-fit off-probe footprint gate:")
+        if ref_pose_bootstrap is None:
+            _emit(lines, "    skipped -- fewer than 3 accepted coincidences")
+        else:
+            _emit(
+                lines,
+                f"    ref pose (bootstrap fit): t_x={ref_pose_bootstrap.t_x:+.1f} "
+                f"t_y={ref_pose_bootstrap.t_y:+.1f} "
+                f"theta={math.degrees(ref_pose_bootstrap.theta):+.1f} "
+                f"z_p={ref_pose_bootstrap.z_p:+.1f} mm",
+            )
+            _emit(
+                lines,
+                f"    probe footprint = [0, {probe_size_mm:g}]^2 mm "
+                f"(n_probe_ch={n_probe_ch})   max_off = {max_off_probe_mm:g} mm",
+            )
+            if off_probe_fallback:
+                _emit(
+                    lines,
+                    "    fewer than 3 would survive -- gate bypassed, "
+                    "fit uses the rigidity-gated set",
+                )
+            else:
+                _emit(
+                    lines,
+                    f"    dropped {n_off_probe_dropped}   survivors -> {len(coincs)}",
+                )
+        _emit(lines)
 
     # ── Print stage 5 ────────────────────────────────────────────────────
     _emit(lines, "=== Stage 5: Probe pose fit ===")
