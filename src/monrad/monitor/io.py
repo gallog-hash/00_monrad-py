@@ -404,6 +404,60 @@ def validate_probe_footprint(n_probe_ch: int, fibers_per_ribbon: int) -> None:
         )
 
 
+def add_chi2_track_args(
+    p: argparse.ArgumentParser, *, shared_across_probes: bool = False
+) -> None:
+    """Add ``--chi2-track``/``--max-cluster-width`` to a driver's parser.
+
+    Shared by ``scripts/run_pipeline.py`` and the ``monrad-monitor``/
+    ``monrad-multiprobe`` drivers so the two flags' type/default/help stay in
+    lockstep. ``shared_across_probes`` selects multiprobe's help wording,
+    where a single override applies to every probe's fitter.
+    """
+    p.add_argument(
+        "--chi2-track",
+        type=float,
+        default=None,
+        metavar="X",
+        help=(
+            "Telescope line-fit chi-squared threshold override, shared "
+            "across every probe (default: PoseFitter's built-in 4.0)."
+            if shared_across_probes
+            else "Telescope line-fit chi-squared threshold override (default: "
+            "PoseFitter's built-in 4.0)."
+        ),
+    )
+    p.add_argument(
+        "--max-cluster-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap on the per-axis merged-channel width a hit's centroid may be "
+            "built from, shared across every probe; a wider hit is treated as "
+            "unresolved. Off by default."
+            if shared_across_probes
+            else "Cap on the per-axis merged-channel width a hit's centroid may "
+            "be built from; a wider hit is treated as unresolved. Off by "
+            "default."
+        ),
+    )
+
+
+def validate_chi2_track_args(args: argparse.Namespace) -> None:
+    """Raise ``ValueError`` if ``--chi2-track``/``--max-cluster-width`` are out of range.
+
+    Mirrors :func:`validate_probe_footprint`'s contract: a pure check the CLI
+    boundary wraps in ``try/except ValueError -> parser.error``.
+    """
+    if args.chi2_track is not None and not args.chi2_track > 0:
+        raise ValueError(f"--chi2-track must be > 0; got {args.chi2_track}")
+    if args.max_cluster_width is not None and args.max_cluster_width < 1:
+        raise ValueError(
+            f"--max-cluster-width must be >= 1; got {args.max_cluster_width}"
+        )
+
+
 def centre_jacobian(theta: float, n_probe_ch: int) -> np.ndarray:
     """The 2×4 Jacobian ``J = d(cx, cy)/d(t_x, t_y, θ, z_p)`` of the corner→centre map.
 

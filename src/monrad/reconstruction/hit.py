@@ -158,11 +158,21 @@ def _tot_weighted_centroid(
     return sum(w * ch for w, ch in zip(weights, candidates)) / total
 
 
-def _axis_candidates(field_or: int, n: int = POS_HALF_BITS) -> list[tuple[float, int]]:
+def _axis_candidates(
+    field_or: int,
+    n: int = POS_HALF_BITS,
+    max_cluster_width: int | None = None,
+) -> list[tuple[float, int]]:
     """
     Return candidate (centroid_ch, width) pairs for an axis that decoded as
     'unresolved'.  centroid_ch is in channel units; width is the number of
     combined channels in the hypothesis, used to compute sigma on selection.
+
+    max_cluster_width : if set, drop any candidate whose width exceeds this
+    cap — mirrors reconstruct_plane_candidates' and _decode_axis's cap
+    semantics, so a caller that combines this fallback path with a capped
+    decode (e.g. disambiguate_telescope_hits) cannot reinstate an over-cap
+    candidate.  None (default) applies no cap (current behaviour).
     """
     fiber_half, ribbon_half = split_half(field_or)
 
@@ -186,6 +196,8 @@ def _axis_candidates(field_or: int, n: int = POS_HALF_BITS) -> list[tuple[float,
                     candidates.append((sum(run) / len(run), len(run)))
                     run = [ch]
             candidates.append((sum(run) / len(run), len(run)))
+    if max_cluster_width is not None:
+        candidates = [c for c in candidates if c[1] <= max_cluster_width]
     return candidates
 
 
@@ -401,12 +413,16 @@ def decode_position(
             # Stage 5 enumerates its own candidates via
             # reconstruct_plane_candidates rather than reading them here.
             cands_x = (
-                _axis_candidates(x_or, n=n_fibers_per_ribbon)
+                _axis_candidates(
+                    x_or, n=n_fibers_per_ribbon, max_cluster_width=max_cluster_width
+                )
                 if qx == "unresolved"
                 else [(cx, max(1, round(sx * math.sqrt(12) / _STRIP_MM)))]
             )
             cands_y = (
-                _axis_candidates(y_or, n=n_fibers_per_ribbon)
+                _axis_candidates(
+                    y_or, n=n_fibers_per_ribbon, max_cluster_width=max_cluster_width
+                )
                 if qy == "unresolved"
                 else [(cy, max(1, round(sy * math.sqrt(12) / _STRIP_MM)))]
             )

@@ -1061,6 +1061,18 @@ def _make_cluster(tel_path, prb_path):
     )
 
 
+def _pose_fitter(tel_paths, prb_paths, **kwargs):
+    return PoseFitter(
+        tel_z=Z_TEL,
+        alignment=AlignmentCorrection.identity(),
+        tel_id=0,
+        prb_id=1,
+        tel_pos_paths=tel_paths,
+        prb_pos_paths=prb_paths,
+        **kwargs,
+    )
+
+
 class TestChi2TrackOverride:
     """
     chi2_track defaults to _CHI2_TRACK (4.0) but PoseFitter.__init__ accepts
@@ -1087,22 +1099,11 @@ class TestChi2TrackOverride:
         prb_path = _one_event_bin(tmp_path, f"{name}_prb.bin", prb_words)
         return _make_cluster(tel_path, prb_path)
 
-    def _fitter(self, tel_paths, prb_paths, **kwargs):
-        return PoseFitter(
-            tel_z=Z_TEL,
-            alignment=AlignmentCorrection.identity(),
-            tel_id=0,
-            prb_id=1,
-            tel_pos_paths=tel_paths,
-            prb_pos_paths=prb_paths,
-            **kwargs,
-        )
-
     def test_default_rejects_offset_triple(self, tmp_path):
         cluster, tel_paths, prb_paths = self._cluster(
             tmp_path, self._CX_OFFSET, "default_reject"
         )
-        fitter = self._fitter(tel_paths, prb_paths)
+        fitter = _pose_fitter(tel_paths, prb_paths)
         assert fitter.chi2_track == pytest.approx(4.0)
         reports = []
         fitter.on_decode = reports.append
@@ -1115,7 +1116,7 @@ class TestChi2TrackOverride:
         cluster, tel_paths, prb_paths = self._cluster(
             tmp_path, self._CX_OFFSET, "loose_accept"
         )
-        fitter = self._fitter(tel_paths, prb_paths, chi2_track=50.0)
+        fitter = _pose_fitter(tel_paths, prb_paths, chi2_track=50.0)
         reports = []
         fitter.on_decode = reports.append
         co = fitter.decode_cluster(cluster)
@@ -1126,7 +1127,7 @@ class TestChi2TrackOverride:
         cluster, tel_paths, prb_paths = self._cluster(
             tmp_path, self._CX_PERFECT, "perfect_default"
         )
-        fitter = self._fitter(tel_paths, prb_paths)
+        fitter = _pose_fitter(tel_paths, prb_paths)
         co = fitter.decode_cluster(cluster)
         assert co is not None
 
@@ -1134,7 +1135,7 @@ class TestChi2TrackOverride:
         cluster, tel_paths, prb_paths = self._cluster(
             tmp_path, self._CX_PERFECT, "perfect_tight"
         )
-        fitter = self._fitter(tel_paths, prb_paths, chi2_track=1e-30)
+        fitter = _pose_fitter(tel_paths, prb_paths, chi2_track=1e-30)
         reports = []
         fitter.on_decode = reports.append
         co = fitter.decode_cluster(cluster)
@@ -1155,17 +1156,6 @@ class TestMaxClusterWidthOverride:
     _CX = (10, 15, 20)  # on-line, golden — chi2 ~ 0
     _CY = (5, 5, 5)
 
-    def _fitter(self, tel_paths, prb_paths, **kwargs):
-        return PoseFitter(
-            tel_z=Z_TEL,
-            alignment=AlignmentCorrection.identity(),
-            tel_id=0,
-            prb_id=1,
-            tel_pos_paths=tel_paths,
-            prb_pos_paths=prb_paths,
-            **kwargs,
-        )
-
     def test_probe_over_wide_hit_rejected_via_probe_quality(self, tmp_path):
         from monrad.synthetic import _ch_to_u64
 
@@ -1177,12 +1167,12 @@ class TestMaxClusterWidthOverride:
         cluster, tel_paths, prb_paths = _make_cluster(tel_path, prb_path)
 
         # Without a cap, a width-3 cluster hit is a good quality ("cluster").
-        fitter_off = self._fitter(tel_paths, prb_paths)
+        fitter_off = _pose_fitter(tel_paths, prb_paths)
         assert fitter_off.decode_cluster(cluster) is not None
 
         # With a cap of 2, the width-3 probe axis becomes "unresolved",
         # which is not in GOOD_QUALITIES -> rejected via "probe_quality".
-        fitter_capped = self._fitter(tel_paths, prb_paths, max_cluster_width=2)
+        fitter_capped = _pose_fitter(tel_paths, prb_paths, max_cluster_width=2)
         reports = []
         fitter_capped.on_decode = reports.append
         co = fitter_capped.decode_cluster(cluster)
@@ -1206,12 +1196,12 @@ class TestMaxClusterWidthOverride:
         cluster, tel_paths, prb_paths = _make_cluster(tel_path, prb_path)
 
         # Without a cap, plane 0's single width-3 candidate is fine.
-        fitter_off = self._fitter(tel_paths, prb_paths)
+        fitter_off = _pose_fitter(tel_paths, prb_paths)
         assert fitter_off.decode_cluster(cluster) is not None
 
         # With a cap of 2, plane 0's only candidate (width 3) is dropped,
         # emptying that plane's candidate list -> "zero_candidate_plane".
-        fitter_capped = self._fitter(tel_paths, prb_paths, max_cluster_width=2)
+        fitter_capped = _pose_fitter(tel_paths, prb_paths, max_cluster_width=2)
         reports = []
         fitter_capped.on_decode = reports.append
         co = fitter_capped.decode_cluster(cluster)
