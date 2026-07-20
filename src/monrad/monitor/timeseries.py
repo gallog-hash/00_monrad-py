@@ -506,6 +506,8 @@ def monitor_probe(
     fibers_per_ribbon: int = 10,
     alignment_path: Path | None = None,
     make_plots: bool = True,
+    chi2_track: float | None = None,
+    max_cluster_width: int | None = None,
 ) -> list[WindowResult]:
     """Stream an acquisition and fit the probe pose in successive batches.
 
@@ -616,6 +618,14 @@ def monitor_probe(
         is z-order-dependent, enforced on load).  When ``None`` (the default),
         the alignment is fit from this acquisition's telescope events as
         before.
+    chi2_track:
+        Telescope line-fit χ² threshold override (see
+        :class:`~monrad.pose.PoseFitter`).  ``None`` (the default) keeps that
+        fitter's built-in 4.0 default.
+    max_cluster_width:
+        Cap on the per-axis merged-channel width a hit's centroid may be
+        built from (see :class:`~monrad.pose.PoseFitter`).  ``None`` (the
+        default) disables the cap — current behaviour.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -671,6 +681,8 @@ def monitor_probe(
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
         fibers_per_ribbon=fibers_per_ribbon,
+        chi2_track=chi2_track,
+        max_cluster_width=max_cluster_width,
     )
     for co in stream:
         acc.push(co)
@@ -924,6 +936,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("./pipeline_out/monitor"),
         help="Output directory (default: ./pipeline_out/monitor).",
     )
+    p.add_argument(
+        "--chi2-track",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Telescope line-fit chi-squared threshold override (default: "
+        "PoseFitter's built-in 4.0).",
+    )
+    p.add_argument(
+        "--max-cluster-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap on the per-axis merged-channel width a hit's centroid may be "
+        "built from; a wider hit is treated as unresolved. Off by default.",
+    )
     p.add_argument("--tot-thresh", type=int, default=1)
     p.add_argument("--tot-weights", action="store_true")
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
@@ -943,6 +971,10 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
             "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
             f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
         )
+    if args.chi2_track is not None and not args.chi2_track > 0:
+        parser.error(f"--chi2-track must be > 0; got {args.chi2_track}")
+    if args.max_cluster_width is not None and args.max_cluster_width < 1:
+        parser.error(f"--max-cluster-width must be >= 1; got {args.max_cluster_width}")
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only
@@ -1006,6 +1038,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
     logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
+    logger.info("  chi2_track:          %s  %s", args.chi2_track, _tag("chi2_track"))
+    logger.info(
+        "  max_cluster_width:   %s  %s",
+        args.max_cluster_width,
+        _tag("max_cluster_width"),
+    )
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
 
     results = monitor_probe(
@@ -1026,6 +1064,8 @@ def main(argv: list[str] | None = None) -> None:
         fibers_per_ribbon=args.fibers_per_ribbon,
         alignment_path=args.alignment,
         make_plots=not args.no_plots,
+        chi2_track=args.chi2_track,
+        max_cluster_width=args.max_cluster_width,
     )
     print(f"Fitted {len(results)} window(s).")
     for r in results:

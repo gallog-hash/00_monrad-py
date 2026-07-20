@@ -1024,3 +1024,196 @@ class TestSharedTelescopeSearch:
         )
         assert calls["n"] == expected
         assert expected > 0
+
+
+# ── --chi2-track / --max-cluster-width override tests ──────────────────────
+#
+# PoseFitter.chi2_track / max_cluster_width are the two new tunable gates
+# (docs/handoffs/*chi2-track*). Build hand-crafted single-cluster inputs
+# (one telescope + one probe event) directly via _ch_to_u64/_write_pos_bin —
+# the same byte-level writers test_corner_probe_edge_cases.py uses — and
+# drive PoseFitter.decode_cluster() straight, without a full stage 1/2 stream.
+
+
+def _one_event_bin(tmp_path, name, words):
+    """Write a *.bin with exactly one event (16 identical rows) and return
+    a PosRef pointing at it. `words` is one u64 per column."""
+    from monrad.synthetic import _write_pos_bin
+
+    path = tmp_path / name
+    _write_pos_bin(path, [words], n_cols=len(words))
+    return path
+
+
+def _make_cluster(tel_path, prb_path):
+    from monrad.timing import PosRef, Quality, TimedEvent
+
+    tel_ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+    prb_ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+    ev = TimedEvent(t_ns=0, evt_seq=0, quality=Quality.GOOD)
+    return (
+        [
+            (0, ev, tel_ref),
+            (1, ev, prb_ref),
+        ],
+        [tel_path],
+        [prb_path],
+    )
+
+
+class TestChi2TrackOverride:
+    """
+    chi2_track defaults to _CHI2_TRACK (4.0) but PoseFitter.__init__ accepts
+    an override — verify it is actually read at the chi2 cut, in both
+    directions, using synthetic telescope triples whose chi2 is computed by
+    the real _tel_line_fit (not hand-derived).
+    """
+
+    # Straight line through channels (10, 15, 20) at z=(0,400,800): exactly
+    # on-line (chi2 ~ 1e-28, floating-point noise around 0).
+    _CX_PERFECT = (10, 15, 20)
+    # Middle plane offset by one channel off the ideal 15: chi2 ~ 8.0
+    # (computed empirically below), safely on both sides of the 4.0 default.
+    _CX_OFFSET = (10, 16, 20)
+    _CY = (5, 5, 5)
+    _CU_GOLDEN = 5  # arbitrary in-range probe golden channel
+
+    def _cluster(self, tmp_path, cx, name):
+        from monrad.synthetic import _ch_to_u64
+
+        tel_words = [_ch_to_u64(cx[k], self._CY[k], gen=0) for k in range(3)]
+        prb_words = [_ch_to_u64(self._CU_GOLDEN, self._CU_GOLDEN, gen=0)]
+        tel_path = _one_event_bin(tmp_path, f"{name}_tel.bin", tel_words)
+        prb_path = _one_event_bin(tmp_path, f"{name}_prb.bin", prb_words)
+        return _make_cluster(tel_path, prb_path)
+
+    def _fitter(self, tel_paths, prb_paths, **kwargs):
+        return PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=tel_paths,
+            prb_pos_paths=prb_paths,
+            **kwargs,
+        )
+
+    def test_default_rejects_offset_triple(self, tmp_path):
+        cluster, tel_paths, prb_paths = self._cluster(
+            tmp_path, self._CX_OFFSET, "default_reject"
+        )
+        fitter = self._fitter(tel_paths, prb_paths)
+        assert fitter.chi2_track == pytest.approx(4.0)
+        reports = []
+        fitter.on_decode = reports.append
+        co = fitter.decode_cluster(cluster)
+        assert co is None
+        assert reports[-1].reason == "chi2_track_cut"
+        assert reports[-1].chi2 > 4.0
+
+    def test_looser_override_accepts_same_triple(self, tmp_path):
+        cluster, tel_paths, prb_paths = self._cluster(
+            tmp_path, self._CX_OFFSET, "loose_accept"
+        )
+        fitter = self._fitter(tel_paths, prb_paths, chi2_track=50.0)
+        reports = []
+        fitter.on_decode = reports.append
+        co = fitter.decode_cluster(cluster)
+        assert co is not None
+        assert reports[-1].reason == "accepted"
+
+    def test_default_accepts_perfect_triple(self, tmp_path):
+        cluster, tel_paths, prb_paths = self._cluster(
+            tmp_path, self._CX_PERFECT, "perfect_default"
+        )
+        fitter = self._fitter(tel_paths, prb_paths)
+        co = fitter.decode_cluster(cluster)
+        assert co is not None
+
+    def test_tighter_override_rejects_perfect_triple(self, tmp_path):
+        cluster, tel_paths, prb_paths = self._cluster(
+            tmp_path, self._CX_PERFECT, "perfect_tight"
+        )
+        fitter = self._fitter(tel_paths, prb_paths, chi2_track=1e-30)
+        reports = []
+        fitter.on_decode = reports.append
+        co = fitter.decode_cluster(cluster)
+        assert co is None
+        assert reports[-1].reason == "chi2_track_cut"
+
+
+class TestMaxClusterWidthOverride:
+    """
+    max_cluster_width caps the per-axis merged-channel width a hit's
+    centroid may be built from.  None (default) is off; a wide hit is
+    rejected on the probe side via "probe_quality" (an over-wide probe axis
+    decodes to "unresolved") and on the telescope side via
+    "zero_candidate_plane" (an over-wide candidate is dropped from that
+    plane's candidate list before the combinatorial search runs).
+    """
+
+    _CX = (10, 15, 20)  # on-line, golden — chi2 ~ 0
+    _CY = (5, 5, 5)
+
+    def _fitter(self, tel_paths, prb_paths, **kwargs):
+        return PoseFitter(
+            tel_z=Z_TEL,
+            alignment=AlignmentCorrection.identity(),
+            tel_id=0,
+            prb_id=1,
+            tel_pos_paths=tel_paths,
+            prb_pos_paths=prb_paths,
+            **kwargs,
+        )
+
+    def test_probe_over_wide_hit_rejected_via_probe_quality(self, tmp_path):
+        from monrad.synthetic import _ch_to_u64
+
+        tel_words = [_ch_to_u64(self._CX[k], self._CY[k], gen=0) for k in range(3)]
+        # Probe X axis is a width-3 cluster (fiber run of 3 contiguous bits).
+        prb_words = [_ch_to_u64(5, 5, gen=0, width_x=3)]
+        tel_path = _one_event_bin(tmp_path, "wide_probe_tel.bin", tel_words)
+        prb_path = _one_event_bin(tmp_path, "wide_probe_prb.bin", prb_words)
+        cluster, tel_paths, prb_paths = _make_cluster(tel_path, prb_path)
+
+        # Without a cap, a width-3 cluster hit is a good quality ("cluster").
+        fitter_off = self._fitter(tel_paths, prb_paths)
+        assert fitter_off.decode_cluster(cluster) is not None
+
+        # With a cap of 2, the width-3 probe axis becomes "unresolved",
+        # which is not in GOOD_QUALITIES -> rejected via "probe_quality".
+        fitter_capped = self._fitter(tel_paths, prb_paths, max_cluster_width=2)
+        reports = []
+        fitter_capped.on_decode = reports.append
+        co = fitter_capped.decode_cluster(cluster)
+        assert co is None
+        assert reports[-1].reason == "probe_quality"
+
+    def test_telescope_over_wide_candidate_rejected_via_zero_candidate_plane(
+        self, tmp_path
+    ):
+        from monrad.synthetic import _ch_to_u64
+
+        # Plane 0's X axis is a width-3 cluster; planes 1-2 stay golden.
+        tel_words = [
+            _ch_to_u64(self._CX[0], self._CY[0], gen=0, width_x=3),
+            _ch_to_u64(self._CX[1], self._CY[1], gen=0),
+            _ch_to_u64(self._CX[2], self._CY[2], gen=0),
+        ]
+        prb_words = [_ch_to_u64(5, 5, gen=0)]
+        tel_path = _one_event_bin(tmp_path, "wide_tel_tel.bin", tel_words)
+        prb_path = _one_event_bin(tmp_path, "wide_tel_prb.bin", prb_words)
+        cluster, tel_paths, prb_paths = _make_cluster(tel_path, prb_path)
+
+        # Without a cap, plane 0's single width-3 candidate is fine.
+        fitter_off = self._fitter(tel_paths, prb_paths)
+        assert fitter_off.decode_cluster(cluster) is not None
+
+        # With a cap of 2, plane 0's only candidate (width 3) is dropped,
+        # emptying that plane's candidate list -> "zero_candidate_plane".
+        fitter_capped = self._fitter(tel_paths, prb_paths, max_cluster_width=2)
+        reports = []
+        fitter_capped.on_decode = reports.append
+        co = fitter_capped.decode_cluster(cluster)
+        assert co is None
+        assert reports[-1].reason == "zero_candidate_plane"

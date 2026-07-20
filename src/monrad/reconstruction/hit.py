@@ -261,6 +261,7 @@ def _decode_axis(
     field_or: int,
     bit_counts: list[int] | None = None,
     n: int = POS_HALF_BITS,
+    max_cluster_width: int | None = None,
 ) -> tuple[float, float, Literal["golden", "cluster", "unresolved"]]:
     """
     Decode one 20-bit fiber×ribbon field (already extracted from u64).
@@ -276,6 +277,10 @@ def _decode_axis(
                  When provided, cluster centroids are TOT-weighted.
     n          : fiber×ribbon combine factor for this detector (DESIGN.md
                  §2.4).
+    max_cluster_width : if set, a resolved candidate whose merged-channel
+                 width exceeds this cap is treated as too ambiguous and
+                 reported as 'unresolved' instead of 'cluster' (None = no
+                 cap, current behaviour).
     """
     fiber_half, ribbon_half = split_half(field_or)
 
@@ -286,6 +291,8 @@ def _decode_axis(
     if res is not None:
         centroid, candidates = res
         width = len(candidates)
+        if max_cluster_width is not None and width > max_cluster_width:
+            return 0.0, 0.0, "unresolved"
         sigma = (_STRIP_MM * width) / math.sqrt(12)
         quality = "golden" if width == 1 else "cluster"
         if bit_counts is not None and width > 1:
@@ -306,6 +313,7 @@ def decode_position(
     tot_thresh: int = 1,
     tot_weights: bool = False,
     n_fibers_per_ribbon: int = POS_HALF_BITS,
+    max_cluster_width: int | None = None,
 ) -> list[Hit]:
     """
     Decode one event's position from its PosRef.
@@ -334,6 +342,9 @@ def decode_position(
                    (DESIGN.md §2.4) — number of fiber positions actually
                    wired per ribbon channel.  Defaults to the raw hardware
                    width (10); probes may wire fewer.
+    max_cluster_width : if set, an axis whose resolved candidate width
+                   exceeds this cap is reported as 'unresolved' instead of
+                   'cluster' (None = no cap, current behaviour).
 
     Returns
     -------
@@ -369,8 +380,18 @@ def decode_position(
             hits.append(Hit(0.0, 0.0, 0.0, 0.0, "invalid"))
             continue
 
-        cx, sx, qx = _decode_axis(x_or, bit_counts=x_counts_col, n=n_fibers_per_ribbon)
-        cy, sy, qy = _decode_axis(y_or, bit_counts=y_counts_col, n=n_fibers_per_ribbon)
+        cx, sx, qx = _decode_axis(
+            x_or,
+            bit_counts=x_counts_col,
+            n=n_fibers_per_ribbon,
+            max_cluster_width=max_cluster_width,
+        )
+        cy, sy, qy = _decode_axis(
+            y_or,
+            bit_counts=y_counts_col,
+            n=n_fibers_per_ribbon,
+            max_cluster_width=max_cluster_width,
+        )
 
         if qx == "unresolved" or qy == "unresolved":
             # An axis that DID resolve is kept as a one-element candidate at

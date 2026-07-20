@@ -51,6 +51,8 @@ class PoseFitter:
         min_anchor_planes: int = 1,
         on_decode: Callable[[DecodeReport], None] | None = None,
         prb_fibers_per_ribbon: int = POS_HALF_BITS,
+        chi2_track: float | None = None,
+        max_cluster_width: int | None = None,
     ) -> None:
         if not 0 <= min_anchor_planes <= N_TEL_PLANES:
             raise ValueError(
@@ -75,6 +77,8 @@ class PoseFitter:
         self.min_anchor_planes = min_anchor_planes
         self.on_decode = on_decode
         self.prb_fibers_per_ribbon = prb_fibers_per_ribbon
+        self.chi2_track = _CHI2_TRACK if chi2_track is None else chi2_track
+        self.max_cluster_width = max_cluster_width
         self._coincs: list[Coincidence] = []
         self._since_last = 0
         self.result: PoseResult | None = None
@@ -225,6 +229,7 @@ class PoseFitter:
             max_per_plane=16,
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
+            max_cluster_width=self.max_cluster_width,
         )
         cand_counts = (len(cands[0]), len(cands[1]), len(cands[2]))
         if any(len(c) == 0 for c in cands):
@@ -275,7 +280,7 @@ class PoseFitter:
                 best_fit = fit
                 best_cands = (c0, c1, c2)
 
-        if best_fit is None or best_chi2 >= _CHI2_TRACK:
+        if best_fit is None or best_chi2 >= self.chi2_track:
             return TelescopeTrackResult(
                 accepted=False,
                 reason="chi2_track_cut",
@@ -331,6 +336,7 @@ class PoseFitter:
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
             n_fibers_per_ribbon=self.prb_fibers_per_ribbon,
+            max_cluster_width=self.max_cluster_width,
         )
         prb_hit = prb_hits[0]
         if prb_hit.quality not in GOOD_QUALITIES:

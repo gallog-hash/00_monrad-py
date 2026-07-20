@@ -43,6 +43,7 @@ def reconstruct_plane_candidates(
     tot_thresh: int = 1,
     tot_weights: bool = False,
     n_fibers_per_ribbon: int = POS_HALF_BITS,
+    max_cluster_width: int | None = None,
 ) -> list[list[PlaneCandidate]]:
     """
     Enumerate per-plane candidate (x_mm, y_mm) positions for one event,
@@ -82,6 +83,11 @@ def reconstruct_plane_candidates(
     n_fibers_per_ribbon : fiber×ribbon combine factor for this detector
     (DESIGN.md §2.4).  Defaults to the raw hardware width (10); callers
     decoding a probe wired with fewer fiber positions pass its actual N.
+
+    max_cluster_width : if set, drop any (x, y) candidate pair whose x-width
+    or y-width exceeds this cap before the max_per_plane slice — an
+    over-wide candidate is too ambiguous to trust even as a fallback.
+    None (default) applies no cap (current behaviour).
     """
     words = _read_block(pos_paths, pos_ref, n_cols)
 
@@ -107,6 +113,8 @@ def reconstruct_plane_candidates(
             (wx + wy, cx, cy, wx, wy, tx, ty)
             for cx, wx, tx in cands_x
             for cy, wy, ty in cands_y
+            if max_cluster_width is None
+            or (wx <= max_cluster_width and wy <= max_cluster_width)
         ]
         points.sort(key=lambda p: p[:3])
 
