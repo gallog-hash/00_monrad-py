@@ -102,6 +102,8 @@ def monitor_probes(
     fibers_per_ribbon: list[int] | None = None,
     alignment_path: Path | None = None,
     make_plots: bool = True,
+    chi2_track: float | None = None,
+    max_cluster_width: int | None = None,
 ) -> list[list[WindowResult]]:
     """Stream one acquisition and fit N probes' poses independently.
 
@@ -130,6 +132,11 @@ def monitor_probes(
         ``monrad-align``.  When given, load it and skip the in-run alignment
         fit (the saved ``z_tel`` must match this run's).  ``None`` (the
         default) fits the alignment from this acquisition.
+    chi2_track, max_cluster_width:
+        Shared cuts (not per-probe) forwarded straight to every probe's
+        :class:`~monrad.pose.PoseFitter`, exactly as in
+        :func:`~monrad.monitor.timeseries.monitor_probe`. ``None`` keeps
+        that fitter's own defaults (4.0 / off).
     Other parameters mirror :func:`~monrad.monitor.timeseries.monitor_probe`
     and apply identically to every probe's independent accumulator.
     """
@@ -187,6 +194,8 @@ def monitor_probes(
             tot_weights=tot_weights,
             min_anchor_planes=min_anchor_planes,
             prb_fibers_per_ribbon=fibers_per_ribbon[k],
+            chi2_track=chi2_track,
+            max_cluster_width=max_cluster_width,
         )
         for k in range(len(probes))
     ]
@@ -202,6 +211,8 @@ def monitor_probes(
     assert all(f.tot_thresh == fitters[0].tot_thresh for f in fitters)
     assert all(f.tot_weights == fitters[0].tot_weights for f in fitters)
     assert all(f.min_anchor_planes == fitters[0].min_anchor_planes for f in fitters)
+    assert all(f.chi2_track == fitters[0].chi2_track for f in fitters)
+    assert all(f.max_cluster_width == fitters[0].max_cluster_width for f in fitters)
     accumulators = [
         _WindowAccumulator(
             z_corr=z_corr,
@@ -405,6 +416,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("./pipeline_out/multiprobe"),
         help="Output directory (default: ./pipeline_out/multiprobe).",
     )
+    p.add_argument(
+        "--chi2-track",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Telescope line-fit chi-squared threshold override, shared "
+        "across every probe (default: PoseFitter's built-in 4.0).",
+    )
+    p.add_argument(
+        "--max-cluster-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap on the per-axis merged-channel width a hit's centroid may be "
+        "built from, shared across every probe; a wider hit is treated as "
+        "unresolved. Off by default.",
+    )
     p.add_argument("--tot-thresh", type=int, default=1)
     p.add_argument("--tot-weights", action="store_true")
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
@@ -433,6 +461,10 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
                 "--fibers-per-ribbon values must be in 1..10 (a probe can "
                 f"wire at most the 10 raw fiber positions); got {n}"
             )
+    if args.chi2_track is not None and not args.chi2_track > 0:
+        parser.error(f"--chi2-track must be > 0; got {args.chi2_track}")
+    if args.max_cluster_width is not None and args.max_cluster_width < 1:
+        parser.error(f"--max-cluster-width must be >= 1; got {args.max_cluster_width}")
 
     # Which flags did the user actually type, vs leave at their default?
     probe = _build_parser()
@@ -494,6 +526,12 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("  window_s:            %s  %s", args.window_s, _tag("window_s"))
     logger.info("  tot_thresh:          %s  %s", args.tot_thresh, _tag("tot_thresh"))
     logger.info("  tot_weights:         %s  %s", args.tot_weights, _tag("tot_weights"))
+    logger.info("  chi2_track:          %s  %s", args.chi2_track, _tag("chi2_track"))
+    logger.info(
+        "  max_cluster_width:   %s  %s",
+        args.max_cluster_width,
+        _tag("max_cluster_width"),
+    )
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
 
     all_results = monitor_probes(
@@ -514,6 +552,8 @@ def main(argv: list[str] | None = None) -> None:
         fibers_per_ribbon=args.fibers_per_ribbon,
         alignment_path=args.alignment,
         make_plots=not args.no_plots,
+        chi2_track=args.chi2_track,
+        max_cluster_width=args.max_cluster_width,
     )
     for k, results in enumerate(all_results):
         print(f"Probe {k + 1}: fitted {len(results)} window(s).")

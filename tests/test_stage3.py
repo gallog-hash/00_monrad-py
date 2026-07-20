@@ -781,6 +781,126 @@ class TestPlaneCandidates:
         assert weighted.sigma_x == pytest.approx(2 * STRIP_MM / math.sqrt(12))
 
 
+# ── --max-cluster-width tests ───────────────────────────────────────────────
+
+
+class TestMaxClusterWidth:
+    """
+    max_cluster_width caps the per-axis merged-channel width a hit's
+    centroid may be built from.  None (default) is off — current behaviour
+    unchanged.  Both decode_position (probe-side single-hit path) and
+    reconstruct_plane_candidates (telescope-side multi-candidate path) must
+    honour the cap independently (Part 2 of the chi2-track/max-cluster-width
+    plan).
+    """
+
+    def _write_block(self, tmp_path, name, word, n_cols=1):
+        import struct
+
+        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+        for _ in range(16):
+            raw += struct.pack("<Q", word)
+        bin_path = tmp_path / name
+        bin_path.write_bytes(raw)
+        return bin_path
+
+    def test_decode_position_over_wide_hit_becomes_unresolved(self, tmp_path):
+        """
+        X is a 2-wide cluster (fiber bits 3,4 on ribbon bit 2 → channels
+        23,24); Y is golden.  Without a cap the hit is 'cluster'; with
+        max_cluster_width=1 the over-wide X axis is reported 'unresolved'
+        instead, downgrading the whole hit from 'cluster' to 'unresolved'
+        (reusing the existing quality string, per the plan — no new
+        quality is introduced).
+        """
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = (1 << 3) | (1 << 4)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "wide_cluster.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit_uncapped = decode_position(ref, [bin_path], n_cols=1)
+        assert hit_uncapped[0].quality == "cluster"
+
+        hit_capped = decode_position(ref, [bin_path], n_cols=1, max_cluster_width=1)
+        assert hit_capped[0].quality == "unresolved"
+
+        # A cap wide enough to admit the width-2 cluster is a no-op.
+        hit_wide_cap = decode_position(ref, [bin_path], n_cols=1, max_cluster_width=2)
+        assert hit_wide_cap[0].quality == "cluster"
+
+    def test_decode_position_golden_hit_unaffected(self, tmp_path):
+        """A width-1 (golden) hit must survive even the tightest cap."""
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "golden_capped.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit = decode_position(ref, [bin_path], n_cols=1, max_cluster_width=1)
+        assert hit[0].quality == "golden"
+
+    def test_reconstruct_plane_candidates_drops_over_wide_pairs(self, tmp_path):
+        """
+        Reuses test_adjacent_ribbons_split_into_separate_runs's word: two
+        width-2 X-runs ([23,24] and [33,34]) crossed with one golden Y
+        candidate, giving 2 candidate points, each width 2 on X.  A cap of 1
+        must drop both (leaving an empty plane); a cap of 2 is a no-op.
+        """
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = (1 << 2) | (1 << 3)
+        x_fib = (1 << 3) | (1 << 4)
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "adjacent_ribbons_capped.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        uncapped = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
+        assert len(uncapped[0]) == 2
+
+        capped_out = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, max_cluster_width=1
+        )
+        assert capped_out == [[]]
+
+        capped_noop = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, max_cluster_width=2
+        )
+        assert len(capped_noop[0]) == 2
+
+    def test_reconstruct_plane_candidates_golden_unaffected(self, tmp_path):
+        """A golden (width-1×1) candidate must survive even the tightest cap."""
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = 1 << 3
+        gen = 0
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
+        bin_path = self._write_block(tmp_path, "golden_cand_capped.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        res = reconstruct_plane_candidates(
+            ref, [bin_path], n_cols=1, max_cluster_width=1
+        )
+        assert len(res[0]) == 1
+        assert res[0][0].quality == "golden"
+
+
 # ── Tests for disambiguate_telescope_hits ─────────────────────────────────
 
 _Z3 = np.array([0.0, 400.0, 800.0])

@@ -244,6 +244,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "probe plane, and the inlier tracks to <out>/pose_3d.html "
         "(requires plotly; no-op if stage 5 is skipped).",
     )
+    p.add_argument(
+        "--chi2-track",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Telescope line-fit chi-squared threshold override (default: "
+        "PoseFitter's built-in 4.0).",
+    )
+    p.add_argument(
+        "--max-cluster-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap on the per-axis merged-channel width a hit's centroid may be "
+        "built from; a wider hit is treated as unresolved. Off by default.",
+    )
     return p
 
 
@@ -259,6 +275,10 @@ def _parse_args() -> tuple[argparse.Namespace, set[str]]:
         validate_probe_footprint(args.n_probe_ch, args.fibers_per_ribbon)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.chi2_track is not None and not args.chi2_track > 0:
+        parser.error(f"--chi2-track must be > 0; got {args.chi2_track}")
+    if args.max_cluster_width is not None and args.max_cluster_width < 1:
+        parser.error(f"--max-cluster-width must be >= 1; got {args.max_cluster_width}")
 
     # Which flags did the user actually type, vs leave at their default?
     # Re-parse the same argv with every default suppressed: a dest only
@@ -491,6 +511,8 @@ def main() -> None:
     max_rigidity_resid_mm: float | None = args.max_rigidity_resid_mm
     n_probe_ch: int = args.n_probe_ch
     max_off_probe_mm: float | None = args.max_off_probe_mm
+    chi2_track: float | None = args.chi2_track
+    max_cluster_width: int | None = args.max_cluster_width
     probe_size_mm = n_probe_ch * 10.0
 
     lines: list[str] = []
@@ -530,6 +552,11 @@ def main() -> None:
         f"  max_off_probe_mm:   {max_off_probe_mm}  {_tag('max_off_probe_mm')}",
     )
     _emit(lines, f"  plot:               {args.plot}  {_tag('plot')}")
+    _emit(lines, f"  chi2_track:         {chi2_track}  {_tag('chi2_track')}")
+    _emit(
+        lines,
+        f"  max_cluster_width:  {max_cluster_width}  {_tag('max_cluster_width')}",
+    )
     _emit(lines)
 
     # ── Load both detectors ──────────────────────────────────────────────
@@ -649,7 +676,7 @@ def main() -> None:
     cand_dist: list[Counter] = [Counter(), Counter(), Counter()]
     prb_q_at_decode: Counter = Counter()
     # The winning triple's χ² is reported for every cluster that reached the
-    # χ² search, both ones that then passed the <_CHI2_TRACK cut ("accepted"/
+    # χ² search, both ones that then passed the chi2_track cut ("accepted"/
     # "probe_quality") and ones that didn't ("chi2_track_cut" — the best of
     # a noisy candidate search, can be huge). Track pass/fail separately:
     # conflating them buries the post-cut population (which should look like
@@ -690,6 +717,8 @@ def main() -> None:
         min_anchor_planes=min_anchor_planes,
         prb_fibers_per_ribbon=fibers_per_ribbon,
         on_decode=_on_decode,
+        chi2_track=chi2_track,
+        max_cluster_width=max_cluster_width,
     )
 
     n_coinc = 0

@@ -514,6 +514,8 @@ def stream_coincidences(
     tot_weights: bool = False,
     min_anchor_planes: int = 1,
     fibers_per_ribbon: int = POS_HALF_BITS,
+    chi2_track: float | None = None,
+    max_cluster_width: int | None = None,
 ) -> Iterator[Coincidence]:
     """Yield decoded probe–telescope coincidences for one acquisition.
 
@@ -527,6 +529,9 @@ def stream_coincidences(
     fibers_per_ribbon : the probe's fiber×ribbon combine factor (DESIGN.md
     §2.4), passed through as ``PoseFitter``'s ``prb_fibers_per_ribbon``.
     Telescope decode is unaffected.
+
+    chi2_track, max_cluster_width : passed straight through to
+    ``PoseFitter``; ``None`` keeps that fitter's own defaults (4.0 / off).
 
     schedule : optional :class:`AlignmentSchedule`. When given, the fitter's
     alignment is switched (via ``update_alignment``) before each cluster
@@ -551,6 +556,8 @@ def stream_coincidences(
         tot_weights=tot_weights,
         min_anchor_planes=min_anchor_planes,
         prb_fibers_per_ribbon=fibers_per_ribbon,
+        chi2_track=chi2_track,
+        max_cluster_width=max_cluster_width,
     )
     label = alignment_label
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
