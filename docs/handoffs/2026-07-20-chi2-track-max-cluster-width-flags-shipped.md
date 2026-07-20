@@ -37,7 +37,36 @@ parallel code review with two bugs found and fixed before commit.
 
   Net effect: loosening χ² dominates the two cap-driven tightenings; more
   coincidences survive, pose stays essentially stable. Confirms the gates are
-  wired correctly and behave as the plan predicted. Full run logs (not
+  wired correctly and behave as the plan predicted.
+
+  **Follow-up: reproduced the plan's exact `~182/2201` baseline.** The run
+  above used the *full* `0_testLab_20210723` acquisition (1449 files), not the
+  specific 3-file-pair subset the MATLAB comparison (memory
+  `matlab-vs-python-coincidence-yield`) used — so it didn't literally check
+  the plan's stated verification target. Built a subset dir from the first 3
+  chronological file pairs of `Base`/`Probe_0` (copies, not symlinks, under
+  `/tmp/claude-1000/subset3/` — gone after reboot, rebuild via `ls | sort |
+  head -3` on each of `Base`/`Probe_0` if needed again) and reran:
+
+  | | default (chi2=4.0, no cap) | `--chi2-track 37 --max-cluster-width 4` |
+  |---|---|---|
+  | raw coincidences | 2201 (exact match to memory) | 2201 |
+  | `no_anchor_plane` rejections | 1070 | 1019 |
+  | `chi2_track_cut` rejections | 207 | 67 |
+  | accepted | 197 (8.9%, memory recorded 182/8.3% — close, likely drifted by
+    PR #22's rigidity/off-probe gates landing after that measurement) | 242 (11.0%) |
+
+  Confirms the plan's letter: raw-coincidence count matches the MATLAB
+  comparison exactly, default acceptance is in the same ballpark as the
+  recorded 182/2201, and loosening moves acceptance up (197→242) — **but**
+  `no_anchor_plane` is now the dominant rejection reason by far (1019 of
+  2201), and neither `--chi2-track` nor `--max-cluster-width` touch it, so
+  this plan alone cannot close the full 5x MATLAB gap. That gate
+  (`--min-anchor-planes`) already exists and is a separate, orthogonal lever
+  — memory `testmili-20220905-anchor-and-gate-interplay` warns it interacts
+  non-obviously with the rigidity gate, so don't tune it in isolation.
+
+  Full run logs (not
   committed, regenerate if needed):
   `/tmp/claude-1000/pipeline_baseline/summary.txt` and
   `/tmp/claude-1000/pipeline_chi2_37/summary.txt` — **these are in `/tmp`,
@@ -108,21 +137,22 @@ regressions or block merge):
 
 ## Next steps
 
-1. Decide whether to push + open a PR now, or keep iterating locally.
+1. Push + open the PR — branch is pushed (`origin/feat/chi2-track-max-cluster-width-flags`),
+   no PR opened yet as of this update.
 2. Optional: act on any of the 5 deferred findings above (all are genuinely
    optional — none block merge). The CLI-validation-triplication one (#1) is
    the most consequential but is explicitly slated for its own follow-up PR
    per the plan, not this one.
-3. The plan's original motivating question — "does loosening
-   `--chi2-track`/`--max-cluster-width` close the ~5x MATLAB-vs-Python
-   stage-3 yield gap?" (memory `matlab-vs-python-coincidence-yield`) — is
-   **not yet answered on the original comparison dataset/window**; this
-   session's real-data run used the full `0_testLab_20210723` acquisition
-   (519k coincidences), not the specific 3-file-pair/2201-coincidence subset
-   the MATLAB comparison used. A follow-up could re-run the exact MATLAB
-   comparison recipe (`matlab-reference-pipeline-how-to-run.md` memory) with
-   `--chi2-track 37 --max-cluster-width 4` to see if accepted count moves
-   toward MATLAB's 969, per the plan's original verification intent.
+3. **Answered, not fully closed:** the plan's motivating question — "does
+   loosening `--chi2-track`/`--max-cluster-width` close the ~5x MATLAB-vs-
+   Python stage-3 yield gap?" — was re-run on the exact 3-file-pair/2201-
+   coincidence subset (see the "Follow-up" note above): acceptance moves from
+   197→242 (8.9%→11.0%) but stays far short of MATLAB's 44% because
+   `no_anchor_plane` (not touched by either new flag) is now the dominant
+   rejection reason on this subset. Closing the rest of the gap needs
+   `--min-anchor-planes` tuning (existing flag) or a new gate — **out of
+   scope for this plan**, which only promised to make the two named
+   thresholds tunable, not to close the yield gap outright.
 
 ## Suggested skills
 
