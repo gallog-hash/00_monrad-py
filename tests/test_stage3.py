@@ -7,9 +7,11 @@ correct.
 """
 
 import math
+import struct
 import pytest
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 
 from monrad.timing import (
     load_header_params,
@@ -70,6 +72,16 @@ def tel_decoded(synth):
         decoded.append(hits)
 
     return decoded, result["tracks"]
+
+
+def _write_block(tmp_path: Path, name: str, word: int, n_cols: int = 1) -> Path:
+    """Write a single 16-row *.bin block encoding one raw position `word`."""
+    raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
+    for _ in range(16):
+        raw += struct.pack("<Q", word)
+    bin_path = tmp_path / name
+    bin_path.write_bytes(raw)
+    return bin_path
 
 
 # ── tests ─────────────────────────────────────────────────────────────
@@ -141,16 +153,6 @@ class TestFibersPerRibbon:
     factor.
     """
 
-    def _write_block(self, tmp_path, name, word, n_cols=1):
-        import struct
-
-        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
-        for _ in range(16):
-            raw += struct.pack("<Q", word)
-        bin_path = tmp_path / name
-        bin_path.write_bytes(raw)
-        return bin_path
-
     def _golden_word(self, x_ribbon_bit, x_fiber_bit, y_ribbon_bit, y_fiber_bit):
         x_rib = 1 << x_ribbon_bit
         x_fib = 1 << x_fiber_bit
@@ -165,7 +167,7 @@ class TestFibersPerRibbon:
         word = self._golden_word(
             x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
         )
-        bin_path = self._write_block(tmp_path, "n5_golden.bin", word)
+        bin_path = _write_block(tmp_path, "n5_golden.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         hit = decode_position(ref, [bin_path], n_cols=1, n_fibers_per_ribbon=5)[0]
@@ -181,7 +183,7 @@ class TestFibersPerRibbon:
         word = self._golden_word(
             x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
         )
-        bin_path = self._write_block(tmp_path, "n5_golden_default.bin", word)
+        bin_path = _write_block(tmp_path, "n5_golden_default.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         hit = decode_position(ref, [bin_path], n_cols=1)[0]
@@ -196,7 +198,7 @@ class TestFibersPerRibbon:
         word = self._golden_word(
             x_ribbon_bit=1, x_fiber_bit=4, y_ribbon_bit=3, y_fiber_bit=2
         )
-        bin_path = self._write_block(tmp_path, "n5_cand.bin", word)
+        bin_path = _write_block(tmp_path, "n5_cand.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         res = reconstruct_plane_candidates(
@@ -230,7 +232,6 @@ class TestFibersPerRibbon:
         channels 23,24 and weighted centroid 23.2 — proving n_fibers_per_ribbon
         is load-bearing on the cluster/tot_weights path, not just golden hits.
         """
-        import struct
 
         from monrad.timing import PosRef
 
@@ -325,7 +326,6 @@ class TestTOTThreshold:
     def test_tot_weighted_centroid_shifts_cluster(self, tmp_path):
         """A two-bit cluster where one bit fires more rows should pull
         the centroid toward the higher-TOT bit."""
-        import struct
         from monrad.timing import PosRef
 
         # Build a minimal *.bin with one event where X has a 2-bit cluster.
@@ -389,7 +389,6 @@ class TestTOTThreshold:
 
     def test_thresh_removes_single_row_noise(self, tmp_path):
         """A bit that fires in only 1 of 16 rows is removed by thresh=2."""
-        import struct
         from monrad.synthetic import _ch_to_u64
         from monrad.timing import PosRef
 
@@ -427,7 +426,6 @@ class TestCandidatesPopulated:
 
     def test_unresolved_candidates_present(self, tmp_path):
         """An unresolved hit (multiple clusters) carries a non-empty candidate list."""
-        import struct
         from monrad.timing import PosRef
 
         # X: two disconnected fiber clusters (bits 0 and 5 both set, ribbon bit 2)
@@ -459,7 +457,6 @@ class TestCandidatesPopulated:
         Same word as above: x is unresolved (fiber bits 0,5 on ribbon bit 2),
         y is golden (ribbon bit 1, fiber bit 1 → channel 10*1+1 = 11).
         """
-        import struct
         from monrad.timing import PosRef
 
         x_rib = 1 << 2
@@ -493,16 +490,6 @@ class TestPlaneCandidates:
     the basis of the Stage 5 combinatorial track finder.
     """
 
-    def _write_block(self, tmp_path, name, word, n_cols=1):
-        import struct
-
-        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
-        for _ in range(16):
-            raw += struct.pack("<Q", word)
-        bin_path = tmp_path / name
-        bin_path.write_bytes(raw)
-        return bin_path
-
     def test_mirror_fold_axis_yields_multiple_candidates(self, tmp_path):
         """
         X is mirror-fold ambiguous: ribbon bits {2, 7} and fiber bits {3, 6}
@@ -518,7 +505,7 @@ class TestPlaneCandidates:
         x_fib = (1 << 3) | (1 << 6)
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "mirror_fold.bin", word)
+        bin_path = _write_block(tmp_path, "mirror_fold.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -562,7 +549,7 @@ class TestPlaneCandidates:
         x_fib = (1 << 3) | (1 << 6) | (1 << 8)  # stray cross-talk bit
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "mirror_fold_crosstalk.bin", word)
+        bin_path = _write_block(tmp_path, "mirror_fold_crosstalk.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -599,7 +586,7 @@ class TestPlaneCandidates:
         x_fib = (1 << 3) | (1 << 6)
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "mirror_fold_both.bin", word)
+        bin_path = _write_block(tmp_path, "mirror_fold_both.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1, max_per_plane=8)
@@ -615,7 +602,7 @@ class TestPlaneCandidates:
         x_fib = 1 << 3
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "invalid.bin", word)
+        bin_path = _write_block(tmp_path, "invalid.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -631,7 +618,7 @@ class TestPlaneCandidates:
         x_fib = 1 << 3
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "golden.bin", word)
+        bin_path = _write_block(tmp_path, "golden.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -653,7 +640,6 @@ class TestPlaneCandidates:
         (2 on X) must downgrade quality from "golden" to "cluster" even
         though Y stays golden.
         """
-        import struct
 
         from monrad.timing import PosRef
 
@@ -711,7 +697,7 @@ class TestPlaneCandidates:
         x_fib = (1 << 3) | (1 << 4)  # adjacent fibers  → one cluster [3,4]
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "adjacent_ribbons.bin", word)
+        bin_path = _write_block(tmp_path, "adjacent_ribbons.bin", word)
 
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
         res = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -739,7 +725,6 @@ class TestPlaneCandidates:
         ch24 = 16*4.  Weighted centroid = (256*23 + 64*24)/320 = 23.2, vs the
         unweighted 23.5.
         """
-        import struct
 
         from monrad.timing import PosRef
 
@@ -794,16 +779,6 @@ class TestMaxClusterWidth:
     plan).
     """
 
-    def _write_block(self, tmp_path, name, word, n_cols=1):
-        import struct
-
-        raw = struct.pack("<I", 16) + struct.pack("<I", n_cols)
-        for _ in range(16):
-            raw += struct.pack("<Q", word)
-        bin_path = tmp_path / name
-        bin_path.write_bytes(raw)
-        return bin_path
-
     def test_decode_position_over_wide_hit_becomes_unresolved(self, tmp_path):
         """
         X is a 2-wide cluster (fiber bits 3,4 on ribbon bit 2 → channels
@@ -821,7 +796,7 @@ class TestMaxClusterWidth:
         x_fib = (1 << 3) | (1 << 4)
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "wide_cluster.bin", word)
+        bin_path = _write_block(tmp_path, "wide_cluster.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         hit_uncapped = decode_position(ref, [bin_path], n_cols=1)
@@ -844,7 +819,7 @@ class TestMaxClusterWidth:
         x_fib = 1 << 3
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "golden_capped.bin", word)
+        bin_path = _write_block(tmp_path, "golden_capped.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         hit = decode_position(ref, [bin_path], n_cols=1, max_cluster_width=1)
@@ -865,7 +840,7 @@ class TestMaxClusterWidth:
         x_fib = (1 << 3) | (1 << 4)
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "adjacent_ribbons_capped.bin", word)
+        bin_path = _write_block(tmp_path, "adjacent_ribbons_capped.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         uncapped = reconstruct_plane_candidates(ref, [bin_path], n_cols=1)
@@ -891,7 +866,7 @@ class TestMaxClusterWidth:
         x_fib = 1 << 3
         gen = 0
         word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42) | (gen << 52)
-        bin_path = self._write_block(tmp_path, "golden_cand_capped.bin", word)
+        bin_path = _write_block(tmp_path, "golden_cand_capped.bin", word)
         ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
 
         res = reconstruct_plane_candidates(
@@ -899,6 +874,41 @@ class TestMaxClusterWidth:
         )
         assert len(res[0]) == 1
         assert res[0][0].quality == "golden"
+
+    def test_decode_position_unresolved_fallback_candidates_respect_cap(self, tmp_path):
+        """
+        decode_position's 'unresolved' fallback populates candidates_x/y via
+        _axis_candidates, a separate code path from the resolved
+        _decode_axis cap above -- verify it independently honours
+        max_cluster_width too. Otherwise a caller combining this fallback
+        with disambiguate_telescope_hits could reinstate an over-cap
+        candidate as quality='cluster' (docs/handoffs/2026-07-20-chi2-track-
+        max-cluster-width-flags-shipped.md, deferred finding #5).
+
+        X has two fiber clusters -- {3} (isolated) and {5,6} (adjacent) --
+        on a single ribbon bit 2, so _reconstruct_coord sees >1 fiber
+        cluster and reports X 'unresolved'; the two clusters give one
+        width-1 candidate (ch 23) and one width-2 candidate (ch 25,26).
+        """
+        from monrad.timing import PosRef
+
+        y_rib = 1 << 1
+        y_fib = 1 << 1
+        x_rib = 1 << 2
+        x_fib = (1 << 3) | (1 << 5) | (1 << 6)
+        word = y_rib | (y_fib << 10) | (x_rib << 32) | (x_fib << 42)
+        bin_path = _write_block(tmp_path, "unresolved_mixed_width.bin", word)
+        ref = PosRef(file_idx=0, row_offset=0, split_rows=0)
+
+        hit_uncapped = decode_position(ref, [bin_path], n_cols=1)[0]
+        assert hit_uncapped.quality == "unresolved"
+        assert hit_uncapped.candidates_x is not None
+        assert sorted(w for _, w in hit_uncapped.candidates_x) == [1, 2]
+
+        hit_capped = decode_position(ref, [bin_path], n_cols=1, max_cluster_width=1)[0]
+        assert hit_capped.quality == "unresolved"
+        assert hit_capped.candidates_x is not None
+        assert sorted(w for _, w in hit_capped.candidates_x) == [1]
 
 
 # ── Tests for disambiguate_telescope_hits ─────────────────────────────────

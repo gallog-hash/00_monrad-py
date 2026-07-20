@@ -43,11 +43,13 @@ from ..pose import PoseFitter, _MIN_COINCS
 from .io import (
     MacroArgumentParser,
     _cluster_tel_time,
+    add_chi2_track_args,
     build_cluster_stream,
     fit_alignment,
     load_alignment_schedule,
     load_detector,
     static_alignment_label,
+    validate_chi2_track_args,
     validate_probe_footprint,
 )
 from .timeseries import (
@@ -416,23 +418,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("./pipeline_out/multiprobe"),
         help="Output directory (default: ./pipeline_out/multiprobe).",
     )
-    p.add_argument(
-        "--chi2-track",
-        type=float,
-        default=None,
-        metavar="X",
-        help="Telescope line-fit chi-squared threshold override, shared "
-        "across every probe (default: PoseFitter's built-in 4.0).",
-    )
-    p.add_argument(
-        "--max-cluster-width",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Cap on the per-axis merged-channel width a hit's centroid may be "
-        "built from, shared across every probe; a wider hit is treated as "
-        "unresolved. Off by default.",
-    )
+    add_chi2_track_args(p, shared_across_probes=True)
     p.add_argument("--tot-thresh", type=int, default=1)
     p.add_argument("--tot-weights", action="store_true")
     p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
@@ -461,10 +447,10 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
                 "--fibers-per-ribbon values must be in 1..10 (a probe can "
                 f"wire at most the 10 raw fiber positions); got {n}"
             )
-    if args.chi2_track is not None and not args.chi2_track > 0:
-        parser.error(f"--chi2-track must be > 0; got {args.chi2_track}")
-    if args.max_cluster_width is not None and args.max_cluster_width < 1:
-        parser.error(f"--max-cluster-width must be >= 1; got {args.max_cluster_width}")
+    try:
+        validate_chi2_track_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Which flags did the user actually type, vs leave at their default?
     probe = _build_parser()

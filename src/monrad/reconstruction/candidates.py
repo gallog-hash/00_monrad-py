@@ -108,13 +108,14 @@ def reconstruct_plane_candidates(
         cands_y = _axis_candidates_with_tot(
             y_or, y_counts, tot_weights, n_fibers_per_ribbon
         )
+        if max_cluster_width is not None:
+            cands_x = [c for c in cands_x if c[1] <= max_cluster_width]
+            cands_y = [c for c in cands_y if c[1] <= max_cluster_width]
 
         points = [
             (wx + wy, cx, cy, wx, wy, tx, ty)
             for cx, wx, tx in cands_x
             for cy, wy, ty in cands_y
-            if max_cluster_width is None
-            or (wx <= max_cluster_width and wy <= max_cluster_width)
         ]
         points.sort(key=lambda p: p[:3])
 
