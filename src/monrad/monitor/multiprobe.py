@@ -39,17 +39,35 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import load_alignment
-from ..pose import PoseFitter, _MIN_COINCS
+from ..pose import PoseFitter
+from .cli_args import (
+    add_alignment_arg,
+    add_chi2_track_args,
+    add_max_off_probe_mm_arg,
+    add_max_pose_jump_deg_arg,
+    add_max_pose_jump_mm_arg,
+    add_max_rigidity_resid_mm_arg,
+    add_min_anchor_planes_arg,
+    add_min_fit_arg,
+    add_no_plots_arg,
+    add_out_arg,
+    add_telescope_arg,
+    add_tot_thresh_arg,
+    add_tot_weights_arg,
+    add_window_s_arg,
+    add_z_tel_arg,
+    validate_chi2_track_args,
+    validate_fibers_per_ribbon,
+    validate_min_fit,
+)
 from .io import (
     MacroArgumentParser,
     _cluster_tel_time,
-    add_chi2_track_args,
     build_cluster_stream,
     fit_alignment,
     load_alignment_schedule,
     load_detector,
     static_alignment_label,
-    validate_chi2_track_args,
     validate_probe_footprint,
 )
 from .timeseries import (
@@ -296,13 +314,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "space-separated list at once, so repeating them (file vs CLI) "
         "replaces rather than appends.",
     )
-    p.add_argument(
-        "--telescope",
-        type=Path,
-        required=True,
-        metavar="DIR",
-        help="Telescope acquisition directory (shared by every probe).",
-    )
+    add_telescope_arg(p, help_suffix=" (shared by every probe).")
     p.add_argument(
         "--probe",
         dest="probe",
@@ -312,14 +324,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Probe acquisition directory.  Repeatable — pass once per probe.",
     )
-    p.add_argument(
-        "--z-tel",
-        nargs="+",
-        type=float,
-        required=True,
-        metavar="Z",
-        help="Telescope plane z-positions (mm).",
-    )
+    add_z_tel_arg(p)
     p.add_argument(
         "--n-probe-ch",
         nargs="+",
@@ -342,112 +347,45 @@ def _build_parser() -> argparse.ArgumentParser:
         "apply it to every probe, or one value per --probe (same order) "
         "(default: 10, all probes).",
     )
-    p.add_argument(
-        "--min-fit",
-        type=int,
-        default=MIN_FIT,
-        metavar="N",
-        help="Minimum coincidences, after any geometric gates, fed to each "
-        f"probe's pose fit (default: {MIN_FIT}).  Same semantics as "
-        "monrad-monitor's --min-fit, applied independently per probe.",
+    add_min_fit_arg(
+        p,
+        help_suffix=(
+            "  Applied independently per probe, same semantics as "
+            "monrad-monitor's --min-fit."
+        ),
     )
-    p.add_argument(
-        "--min-anchor-planes",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Minimum telescope planes with an unambiguous hit for a cluster to "
-        "pass the no_anchor_plane gate.  0 disables the gate (default: 1).",
+    add_min_anchor_planes_arg(p)
+    add_max_rigidity_resid_mm_arg(p, help_suffix=" Applied independently per probe.")
+    add_max_off_probe_mm_arg(p, help_suffix=" Applied independently per probe.")
+    add_max_pose_jump_mm_arg(p)
+    add_max_pose_jump_deg_arg(p)
+    add_window_s_arg(
+        p,
+        help_suffix=(
+            "  Same semantics as monrad-monitor's --window-s, applied "
+            "independently per probe."
+        ),
     )
-    p.add_argument(
-        "--max-rigidity-resid-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm), applied independently per probe.  See "
-        "monrad-monitor's --max-rigidity-resid-mm.  Off by default.",
-    )
-    p.add_argument(
-        "--max-off-probe-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm), applied independently per probe.  See "
-        "monrad-monitor's --max-off-probe-mm.  Off by default.",
-    )
-    p.add_argument(
-        "--max-pose-jump-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Post-fit continuity gate (mm), applied independently per probe.  "
-        "See monrad-monitor's --max-pose-jump-mm.  Off by default.",
-    )
-    p.add_argument(
-        "--max-pose-jump-deg",
-        type=float,
-        default=None,
-        metavar="DEG",
-        help="Post-fit continuity gate (degrees), companion to "
-        "--max-pose-jump-mm.  Off by default.",
-    )
-    p.add_argument(
-        "--window-s",
-        type=float,
-        default=None,
-        metavar="SECS",
-        help="Minimum window duration in seconds.  Omit for count-based batches "
-        "of --min-fit coincidences.  Same semantics as monrad-monitor's "
-        "--window-s, applied independently per probe.",
-    )
-    p.add_argument(
-        "--alignment",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="Path to a telescope alignment correction saved by monrad-align, "
-        "OR a directory of alignment_<label>.json files for time-varying "
-        "correction (the active window is switched as the stream crosses "
-        "boundaries). When given, load it and skip the in-run alignment fit "
-        "(every saved --z-tel must match this run's). Off by default (fit from "
-        "this acquisition).",
-    )
-    p.add_argument(
-        "--out",
-        type=Path,
-        default=Path("./pipeline_out/multiprobe"),
-        help="Output directory (default: ./pipeline_out/multiprobe).",
-    )
+    add_alignment_arg(p)
+    add_out_arg(p, default=Path("./pipeline_out/multiprobe"))
     add_chi2_track_args(p, shared_across_probes=True)
-    p.add_argument("--tot-thresh", type=int, default=1)
-    p.add_argument("--tot-weights", action="store_true")
-    p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
+    add_tot_thresh_arg(p)
+    add_tot_weights_arg(p)
+    add_no_plots_arg(p)
     return p
 
 
 def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[str]]:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.min_fit < _MIN_COINCS:
-        parser.error(
-            f"--min-fit must be >= {_MIN_COINCS} (fit_probe_pose's hard "
-            f"minimum); got {args.min_fit}"
-        )
     n_probes = len(args.probe)
     try:
+        validate_min_fit(args.min_fit)
         _broadcast_per_probe("--n-probe-ch", args.n_probe_ch, 30, n_probes)
         _broadcast_per_probe(
             "--fibers-per-ribbon", args.fibers_per_ribbon, 10, n_probes
         )
-    except ValueError as e:
-        parser.error(str(e))
-    for n in args.fibers_per_ribbon:
-        if not 1 <= n <= 10:
-            parser.error(
-                "--fibers-per-ribbon values must be in 1..10 (a probe can "
-                f"wire at most the 10 raw fiber positions); got {n}"
-            )
-    try:
+        validate_fibers_per_ribbon(args.fibers_per_ribbon)
         validate_chi2_track_args(args)
     except ValueError as exc:
         parser.error(str(exc))

@@ -61,21 +61,38 @@ from ..pose import (
     Coincidence,
     PoseFitter,
     PoseResult,
-    _MIN_COINCS,
     filter_off_probe,
     filter_rigidity,
     fit_probe_pose,
 )
+from .cli_args import (
+    add_alignment_arg,
+    add_chi2_track_args,
+    add_max_off_probe_mm_arg,
+    add_max_pose_jump_deg_arg,
+    add_max_pose_jump_mm_arg,
+    add_max_rigidity_resid_mm_arg,
+    add_min_anchor_planes_arg,
+    add_min_fit_arg,
+    add_no_plots_arg,
+    add_out_arg,
+    add_telescope_arg,
+    add_tot_thresh_arg,
+    add_tot_weights_arg,
+    add_window_s_arg,
+    add_z_tel_arg,
+    validate_chi2_track_args,
+    validate_fibers_per_ribbon,
+    validate_min_fit,
+)
 from .io import (
     MacroArgumentParser,
-    add_chi2_track_args,
     centre_cov_2x2,
     fit_alignment,
     load_alignment_schedule,
     load_detector,
     static_alignment_label,
     stream_coincidences,
-    validate_chi2_track_args,
     validate_probe_footprint,
 )
 
@@ -802,13 +819,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "e.g. 'monrad-monitor @run.args --out other/'. Flags given on the "
         "command line after the @file override lines from the file.",
     )
-    p.add_argument(
-        "--telescope",
-        type=Path,
-        required=True,
-        metavar="DIR",
-        help="Telescope acquisition directory.",
-    )
+    add_telescope_arg(p)
     p.add_argument(
         "--probe",
         type=Path,
@@ -816,94 +827,41 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Probe acquisition directory.",
     )
-    p.add_argument(
-        "--z-tel",
-        nargs="+",
-        type=float,
-        required=True,
-        metavar="Z",
-        help="Telescope plane z-positions (mm).",
+    add_z_tel_arg(p)
+    add_min_fit_arg(
+        p,
+        help_suffix=(
+            "  The raw batch grows past this count (and past --window-s, if "
+            "given) whenever a gate strips it below the floor, up to "
+            f"{RAW_CAP_MULTIPLIER}x --min-fit raw coincidences before the "
+            "window is dropped as contaminated."
+        ),
     )
-    p.add_argument(
-        "--min-fit",
-        type=int,
-        default=MIN_FIT,
-        metavar="N",
-        help="Minimum coincidences, after any geometric gates, fed to a pose "
-        "fit.  The raw batch grows past this count (and past --window-s, if "
-        "given) whenever a gate strips it below the floor, up to "
-        f"{RAW_CAP_MULTIPLIER}x --min-fit raw coincidences before the window "
-        f"is dropped as contaminated (default: {MIN_FIT}).",
+    add_min_anchor_planes_arg(p)
+    add_max_rigidity_resid_mm_arg(
+        p,
+        help_suffix=(
+            "  Pose-free (z_ref = previous accepted window's z_p, or "
+            "mean(z_corr) for the first window); tune from the whole-run "
+            "pairwise-residual distribution."
+        ),
     )
-    p.add_argument(
-        "--min-anchor-planes",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Minimum telescope planes with an unambiguous hit for a cluster to "
-        "pass the no_anchor_plane gate.  0 disables the gate (default: 1).",
+    add_max_off_probe_mm_arg(
+        p,
+        help_suffix=(
+            "  Extrapolate each track to the previous accepted window's pose "
+            "and drop it if it lands too far outside. Skipped on the first "
+            "window (no reference pose yet)."
+        ),
     )
-    p.add_argument(
-        "--max-rigidity-resid-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm).  Drop coincidences whose track-vs-"
-        "probe pairwise distances are inconsistent with a rigid transform — "
-        "catches cross-particle wide-angle tracks that time-matched an "
-        "unrelated probe hit, before they reach the pose fit.  Pose-free "
-        "(z_ref = previous accepted window's z_p, or mean(z_corr) for the "
-        "first window); tune from the whole-run pairwise-residual "
-        "distribution. Off by default.",
-    )
-    p.add_argument(
-        "--max-off-probe-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm), applied after --max-rigidity-resid-"
-        "mm.  Extrapolate each track to the previous accepted window's pose "
-        "and drop it if it lands more than this far outside the probe's "
-        "physical footprint.  Skipped on the first window (no reference pose "
-        "yet). Off by default.",
-    )
-    p.add_argument(
-        "--max-pose-jump-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Post-fit continuity gate (mm), checked after fit_probe_pose runs "
-        "(unlike --max-rigidity-resid-mm/--max-off-probe-mm, which filter "
-        "coincidences before the fit).  Reject a candidate window's fitted "
-        "pose if its (t_x, t_y, z_p) corner has moved more than this far from "
-        "the previous accepted window's pose -- the probe moves slowly, so a "
-        "bigger jump means the window's gate-survivors are still internally "
-        "coherent enough to fool the Mahalanobis cut.  On rejection the raw "
-        "batch keeps growing (diluting the contamination) until it passes or "
-        "hits the raw cap and is dropped.  Skipped on the first window (no "
-        "reference pose yet).  Checked independently of --max-pose-jump-deg. "
-        "Off by default.",
-    )
-    p.add_argument(
-        "--max-pose-jump-deg",
-        type=float,
-        default=None,
-        metavar="DEG",
-        help="Post-fit continuity gate (degrees), companion to "
-        "--max-pose-jump-mm: reject a candidate window if theta has rotated "
-        "more than this many degrees from the previous accepted window's "
-        "pose.  Checked independently because a rotation can partly cancel a "
-        "corner translation when viewed at the probe centre.  Off by "
-        "default.",
-    )
-    p.add_argument(
-        "--window-s",
-        type=float,
-        default=None,
-        metavar="SECS",
-        help="Minimum window duration in seconds.  Omit for count-based batches "
-        "of --min-fit coincidences.  When given, each window spans at least this "
-        "long AND holds at least --min-fit coincidences (whichever is longer).",
+    add_max_pose_jump_mm_arg(p)
+    add_max_pose_jump_deg_arg(p)
+    add_window_s_arg(
+        p,
+        help_suffix=(
+            "  When given, each window spans at least this long AND holds at "
+            "least --min-fit coincidences (whichever is longer)."
+        ),
     )
     p.add_argument(
         "--n-probe-ch",
@@ -920,45 +878,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Probe fiber x ribbon combine factor (DESIGN.md section 2.4) -- "
         "number of fiber positions wired per ribbon channel (default: 10).",
     )
-    p.add_argument(
-        "--alignment",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="Path to a telescope alignment correction saved by monrad-align, "
-        "OR a directory of alignment_<label>.json files for time-varying "
-        "correction (the active window is switched as the stream crosses "
-        "boundaries). When given, load it and skip the in-run alignment fit "
-        "(every saved --z-tel must match this run's). Off by default (fit from "
-        "this acquisition).",
-    )
-    p.add_argument(
-        "--out",
-        type=Path,
-        default=Path("./pipeline_out/monitor"),
-        help="Output directory (default: ./pipeline_out/monitor).",
-    )
+    add_alignment_arg(p)
+    add_out_arg(p, default=Path("./pipeline_out/monitor"))
     add_chi2_track_args(p)
-    p.add_argument("--tot-thresh", type=int, default=1)
-    p.add_argument("--tot-weights", action="store_true")
-    p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
+    add_tot_thresh_arg(p)
+    add_tot_weights_arg(p)
+    add_no_plots_arg(p)
     return p
 
 
 def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[str]]:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.min_fit < _MIN_COINCS:
-        parser.error(
-            f"--min-fit must be >= {_MIN_COINCS} (fit_probe_pose's hard "
-            f"minimum); got {args.min_fit}"
-        )
-    if not 1 <= args.fibers_per_ribbon <= 10:
-        parser.error(
-            "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
-            f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
-        )
     try:
+        validate_min_fit(args.min_fit)
+        validate_fibers_per_ribbon([args.fibers_per_ribbon])
         validate_chi2_track_args(args)
     except ValueError as exc:
         parser.error(str(exc))
