@@ -7,10 +7,8 @@ pass.  Extracting them here keeps the drivers (and the script) from each
 carrying their own copy.
 """
 
-import argparse
 import json
 import math
-import shlex
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -34,30 +32,6 @@ from ..timing import (
     load_header_params,
     reconstruct_stream,
 )
-
-
-class MacroArgumentParser(argparse.ArgumentParser):
-    """``ArgumentParser`` with ``@file`` macro-file expansion built in.
-
-    Any command-line token starting with ``@`` (argparse's
-    ``fromfile_prefix_chars``) is read as a macro file: one flag per line
-    (``--min-fit 50``), ``#`` comments and blank lines ignored, values
-    tokenized with :func:`shlex.split` so quoted paths with spaces survive.
-    This overrides argparse's own default ``convert_arg_line_to_args``, which
-    treats each line as a single argument -- unusable for ``--flag value``
-    pairs. A macro file can be combined with, or overridden by, ordinary CLI
-    flags (later flags win), e.g. ``monrad-monitor @run.args --out other/``.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault("fromfile_prefix_chars", "@")
-        super().__init__(*args, **kwargs)
-
-    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
-        line = arg_line.split("#", 1)[0].strip()
-        if not line:
-            return []
-        return shlex.split(line)
 
 
 # monrad-align's own default: the earliest day's first 3 file pairs (see
@@ -401,60 +375,6 @@ def validate_probe_footprint(n_probe_ch: int, fibers_per_ribbon: int) -> None:
         raise ValueError(
             f"n_probe_ch={n_probe_ch} exceeds the maximum channel range "
             f"10 * fibers_per_ribbon={10 * fibers_per_ribbon}"
-        )
-
-
-def add_chi2_track_args(
-    p: argparse.ArgumentParser, *, shared_across_probes: bool = False
-) -> None:
-    """Add ``--chi2-track``/``--max-cluster-width`` to a driver's parser.
-
-    Shared by ``scripts/run_pipeline.py`` and the ``monrad-monitor``/
-    ``monrad-multiprobe`` drivers so the two flags' type/default/help stay in
-    lockstep. ``shared_across_probes`` selects multiprobe's help wording,
-    where a single override applies to every probe's fitter.
-    """
-    p.add_argument(
-        "--chi2-track",
-        type=float,
-        default=None,
-        metavar="X",
-        help=(
-            "Telescope line-fit chi-squared threshold override, shared "
-            "across every probe (default: PoseFitter's built-in 4.0)."
-            if shared_across_probes
-            else "Telescope line-fit chi-squared threshold override (default: "
-            "PoseFitter's built-in 4.0)."
-        ),
-    )
-    p.add_argument(
-        "--max-cluster-width",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Cap on the per-axis merged-channel width a hit's centroid may be "
-            "built from, shared across every probe; a wider hit is treated as "
-            "unresolved. Off by default."
-            if shared_across_probes
-            else "Cap on the per-axis merged-channel width a hit's centroid may "
-            "be built from; a wider hit is treated as unresolved. Off by "
-            "default."
-        ),
-    )
-
-
-def validate_chi2_track_args(args: argparse.Namespace) -> None:
-    """Raise ``ValueError`` if ``--chi2-track``/``--max-cluster-width`` are out of range.
-
-    Mirrors :func:`validate_probe_footprint`'s contract: a pure check the CLI
-    boundary wraps in ``try/except ValueError -> parser.error``.
-    """
-    if args.chi2_track is not None and not args.chi2_track > 0:
-        raise ValueError(f"--chi2-track must be > 0; got {args.chi2_track}")
-    if args.max_cluster_width is not None and args.max_cluster_width < 1:
-        raise ValueError(
-            f"--max-cluster-width must be >= 1; got {args.max_cluster_width}"
         )
 
 

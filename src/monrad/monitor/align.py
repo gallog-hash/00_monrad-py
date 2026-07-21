@@ -56,10 +56,18 @@ from ..alignment.accumulator import (
     _TILT_THRESH,
     _Z_THRESH,
 )
+from .cli_args import (
+    MacroArgumentParser,
+    add_no_plots_arg,
+    add_out_arg,
+    add_telescope_arg,
+    add_tot_thresh_arg,
+    add_tot_weights_arg,
+    add_z_tel_arg,
+)
 from .io import (
     DAILY_ALIGNMENT_N_FILES,
     DetectorFiles,
-    MacroArgumentParser,
     _parse_file_ts,
     _parse_window_label,
     fit_daily_alignment,
@@ -499,21 +507,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "e.g. 'monrad-align @align.args --date 20230418'. Flags given on the "
         "command line after the @file override lines from the file.",
     )
-    p.add_argument(
-        "--telescope",
-        type=Path,
-        required=True,
-        metavar="DIR",
-        help="Telescope acquisition directory (may span many days).",
-    )
-    p.add_argument(
-        "--z-tel",
-        nargs="+",
-        type=float,
-        required=True,
-        metavar="Z",
-        help="Telescope plane z-positions (mm).  Recorded with the saved "
-        "correction; monitoring runs must reuse it with the same --z-tel.",
+    add_telescope_arg(p, help_suffix=" (may span many days).")
+    add_z_tel_arg(
+        p,
+        help_suffix=(
+            "  Recorded with the saved correction; monitoring runs must "
+            "reuse it with the same --z-tel."
+        ),
     )
     p.add_argument(
         "--date",
@@ -542,15 +542,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Number of each window's first file pairs to fit over "
         f"(default: {DAILY_ALIGNMENT_N_FILES}).",
     )
-    p.add_argument(
-        "--out",
-        type=Path,
-        default=Path("./pipeline_out/alignment"),
-        help="Output directory (default: ./pipeline_out/alignment).",
-    )
-    p.add_argument("--tot-thresh", type=int, default=1)
-    p.add_argument("--tot-weights", action="store_true")
-    p.add_argument("--no-plots", action="store_true", help="Skip matplotlib output.")
+    add_out_arg(p, default=Path("./pipeline_out/alignment"))
+    add_tot_thresh_arg(p)
+    add_tot_weights_arg(p)
+    add_no_plots_arg(p)
     return p
 
 

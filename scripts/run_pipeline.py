@@ -99,12 +99,22 @@ from monrad.timing import (
 )
 from monrad.coincidence import coincidence_stream
 from monrad.alignment import AlignmentCorrection
+from monrad.monitor.cli_args import (
+    add_chi2_track_args,
+    add_max_off_probe_mm_arg,
+    add_max_rigidity_resid_mm_arg,
+    add_min_anchor_planes_arg,
+    add_out_arg,
+    add_telescope_arg,
+    add_tot_thresh_arg,
+    add_tot_weights_arg,
+    validate_chi2_track_args,
+    validate_fibers_per_ribbon,
+)
 from monrad.monitor.io import (
     DetectorFiles,
-    add_chi2_track_args,
     fit_alignment,
     load_detector,
-    validate_chi2_track_args,
     validate_probe_footprint,
 )
 from monrad.pose import (
@@ -135,13 +145,7 @@ _PLOT_PAD_MM = 15.0  # margin (mm) around the inlier hit spread for the probe fo
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="monrad pipeline smoke test")
-    p.add_argument(
-        "--telescope",
-        required=True,
-        type=Path,
-        metavar="DIR",
-        help="Telescope acquisition directory",
-    )
+    add_telescope_arg(p)
     p.add_argument(
         "--probe",
         required=True,
@@ -149,13 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Probe acquisition directory",
     )
-    p.add_argument(
-        "--out",
-        default=Path("./pipeline_out"),
-        type=Path,
-        metavar="DIR",
-        help="Output directory (default: ./pipeline_out)",
-    )
+    add_out_arg(p, default=Path("./pipeline_out"))
     p.add_argument(
         "--z-tel",
         nargs=3,
@@ -164,23 +162,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar=("Z0", "Z1", "Z2"),
         help="Telescope plane z-coords in mm (default: 0 400 800)",
     )
-    p.add_argument(
-        "--tot-thresh",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Minimum number of the 16 rows in which a bit must fire "
-        "to be kept in the OR mask (default: 1 = plain OR). "
-        "Values 2-4 filter single-row cross-talk spikes.",
-    )
-    p.add_argument(
-        "--tot-weights",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Weight cluster centroids by per-bit TOT counts "
-        "(ribbon_count × fiber_count). No effect on golden hits. On by "
-        "default for the combinatorial path; pass --no-tot-weights to disable.",
-    )
+    add_tot_thresh_arg(p)
+    add_tot_weights_arg(p)
     p.add_argument(
         "--fibers-per-ribbon",
         type=int,
@@ -189,31 +172,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Probe fiber x ribbon combine factor (DESIGN.md section 2.4) -- "
         "number of fiber positions wired per ribbon channel (default: 10).",
     )
-    p.add_argument(
-        "--min-anchor-planes",
-        type=int,
-        default=1,
-        metavar="N",
-        choices=range(0, 4),
-        help="Minimum telescope planes that must decode to a single resolved "
-        "candidate (an 'anchor') before the combinatorial track search runs, "
-        "0-3 (default: 1). 1 keeps the original gate; 0 also searches "
-        "all-ambiguous clusters (more tracks, much heavier compute, pile-up "
-        "can fabricate tracks); 3 demands every plane already resolved.",
-    )
-    p.add_argument(
-        "--max-rigidity-resid-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm), applied once to the whole run's "
-        "accepted coincidences before the final pose fit: drops coincidences "
-        "whose track-vs-probe pairwise distances (DESIGN.md docs/handoffs/"
-        "2026-07-07-off-probe-track-gate-strategy.md) are inconsistent with a "
-        "rigid transform -- catches combinatorial telescope-track picks that "
-        "look fine over the telescope's own short baseline but are wrong once "
-        "extrapolated out to z_p. Off by default (see monrad-monitor's flag "
-        "of the same name).",
+    add_min_anchor_planes_arg(p, choices=True)
+    add_max_rigidity_resid_mm_arg(
+        p, help_suffix=" (See monrad-monitor's flag of the same name.)"
     )
     p.add_argument(
         "--n-probe-ch",
@@ -225,18 +186,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "probes -- derive it from the data, e.g. the max decoded golden-hit "
         "coordinate). Only used by --max-off-probe-mm's footprint check.",
     )
-    p.add_argument(
-        "--max-off-probe-mm",
-        type=float,
-        default=None,
-        metavar="MM",
-        help="Pre-fit geometric gate (mm), applied after --max-rigidity-resid-"
-        "mm: drops coincidences whose track projects more than this far "
-        "outside the probe's [0, --n-probe-ch*10]^2 footprint. The reference "
-        "pose is bootstrapped from a fit on the (rigidity-gated) accepted set "
-        "-- there is no prior window to anchor it to, unlike monrad-monitor's "
-        "streaming gate. Off by default (see monrad-monitor's flag of the "
-        "same name).",
+    add_max_off_probe_mm_arg(
+        p,
+        help_suffix=(
+            " (The probe's footprint here is [0, --n-probe-ch*10]^2.) The "
+            "reference pose is bootstrapped from a fit on the "
+            "(rigidity-gated) accepted set -- there is no prior window to "
+            "anchor it to, unlike monrad-monitor's streaming gate. (See "
+            "monrad-monitor's flag of the same name.)"
+        ),
     )
     p.add_argument(
         "--plot",
@@ -253,12 +211,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _parse_args() -> tuple[argparse.Namespace, set[str]]:
     parser = _build_parser()
     args = parser.parse_args()
-    if not 1 <= args.fibers_per_ribbon <= 10:
-        parser.error(
-            "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
-            f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
-        )
     try:
+        validate_fibers_per_ribbon([args.fibers_per_ribbon])
         validate_probe_footprint(args.n_probe_ch, args.fibers_per_ribbon)
     except ValueError as exc:
         parser.error(str(exc))
