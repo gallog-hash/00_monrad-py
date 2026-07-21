@@ -17,6 +17,7 @@ from ..alignment import AlignmentCorrection
 from ..decoders.position import POS_HALF_BITS
 from ..reconstruction import (
     GOOD_QUALITIES,
+    PlaneCandidate,
     decode_position,
     reconstruct_plane_candidates,
 )
@@ -268,7 +269,7 @@ class PoseFitter:
 
         best_chi2 = math.inf
         best_fit = None
-        best_cands: tuple[object, object, object] | None = None
+        best_cands: tuple[PlaneCandidate, PlaneCandidate, PlaneCandidate] | None = None
         for c0, c1, c2 in itertools.product(*cands):
             x_raw = np.array([c0.x_mm, c1.x_mm, c2.x_mm])
             y_raw = np.array([c0.y_mm, c1.y_mm, c2.y_mm])
@@ -310,6 +311,7 @@ class PoseFitter:
             cov_ab_y=cov_y,
             tel_quality=tel_quality,
             t_ns=tel_ev.t_ns,
+            best_cands=best_cands,
         )
 
     def _finish_decode(
