@@ -41,6 +41,7 @@ import numpy as np
 from ..alignment import load_alignment
 from ..pose import PoseFitter
 from .cli_args import (
+    MacroArgumentParser,
     add_alignment_arg,
     add_chi2_track_args,
     add_max_off_probe_mm_arg,
@@ -61,7 +62,6 @@ from .cli_args import (
     validate_min_fit,
 )
 from .io import (
-    MacroArgumentParser,
     _cluster_tel_time,
     build_cluster_stream,
     fit_alignment,

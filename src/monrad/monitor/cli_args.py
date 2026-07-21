@@ -8,11 +8,36 @@ here -- each driver keeps its own ``add_argument`` line for those.
 """
 
 import argparse
+import shlex
 from pathlib import Path
 
 from ..pose import _MIN_COINCS, PoseFitter
 
 MIN_FIT = PoseFitter.MIN_FIT
+
+
+class MacroArgumentParser(argparse.ArgumentParser):
+    """``ArgumentParser`` with ``@file`` macro-file expansion built in.
+
+    Any command-line token starting with ``@`` (argparse's
+    ``fromfile_prefix_chars``) is read as a macro file: one flag per line
+    (``--min-fit 50``), ``#`` comments and blank lines ignored, values
+    tokenized with :func:`shlex.split` so quoted paths with spaces survive.
+    This overrides argparse's own default ``convert_arg_line_to_args``, which
+    treats each line as a single argument -- unusable for ``--flag value``
+    pairs. A macro file can be combined with, or overridden by, ordinary CLI
+    flags (later flags win), e.g. ``monrad-monitor @run.args --out other/``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("fromfile_prefix_chars", "@")
+        super().__init__(*args, **kwargs)
+
+    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
+        line = arg_line.split("#", 1)[0].strip()
+        if not line:
+            return []
+        return shlex.split(line)
 
 
 def add_telescope_arg(p: argparse.ArgumentParser, *, help_suffix: str = "") -> None:

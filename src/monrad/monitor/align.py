@@ -57,6 +57,7 @@ from ..alignment.accumulator import (
     _Z_THRESH,
 )
 from .cli_args import (
+    MacroArgumentParser,
     add_no_plots_arg,
     add_out_arg,
     add_telescope_arg,
@@ -67,7 +68,6 @@ from .cli_args import (
 from .io import (
     DAILY_ALIGNMENT_N_FILES,
     DetectorFiles,
-    MacroArgumentParser,
     _parse_file_ts,
     _parse_window_label,
     fit_daily_alignment,

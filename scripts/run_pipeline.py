@@ -109,6 +109,7 @@ from monrad.monitor.cli_args import (
     add_tot_thresh_arg,
     add_tot_weights_arg,
     validate_chi2_track_args,
+    validate_fibers_per_ribbon,
 )
 from monrad.monitor.io import (
     DetectorFiles,
@@ -210,12 +211,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _parse_args() -> tuple[argparse.Namespace, set[str]]:
     parser = _build_parser()
     args = parser.parse_args()
-    if not 1 <= args.fibers_per_ribbon <= 10:
-        parser.error(
-            "--fibers-per-ribbon must be in 1..10 (a probe can wire at most "
-            f"the 10 raw fiber positions); got {args.fibers_per_ribbon}"
-        )
     try:
+        validate_fibers_per_ribbon([args.fibers_per_ribbon])
         validate_probe_footprint(args.n_probe_ch, args.fibers_per_ribbon)
     except ValueError as exc:
         parser.error(str(exc))

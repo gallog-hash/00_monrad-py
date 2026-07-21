@@ -7,10 +7,8 @@ pass.  Extracting them here keeps the drivers (and the script) from each
 carrying their own copy.
 """
 
-import argparse
 import json
 import math
-import shlex
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -34,30 +32,6 @@ from ..timing import (
     load_header_params,
     reconstruct_stream,
 )
-
-
-class MacroArgumentParser(argparse.ArgumentParser):
-    """``ArgumentParser`` with ``@file`` macro-file expansion built in.
-
-    Any command-line token starting with ``@`` (argparse's
-    ``fromfile_prefix_chars``) is read as a macro file: one flag per line
-    (``--min-fit 50``), ``#`` comments and blank lines ignored, values
-    tokenized with :func:`shlex.split` so quoted paths with spaces survive.
-    This overrides argparse's own default ``convert_arg_line_to_args``, which
-    treats each line as a single argument -- unusable for ``--flag value``
-    pairs. A macro file can be combined with, or overridden by, ordinary CLI
-    flags (later flags win), e.g. ``monrad-monitor @run.args --out other/``.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault("fromfile_prefix_chars", "@")
-        super().__init__(*args, **kwargs)
-
-    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
-        line = arg_line.split("#", 1)[0].strip()
-        if not line:
-            return []
-        return shlex.split(line)
 
 
 # monrad-align's own default: the earliest day's first 3 file pairs (see

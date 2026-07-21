@@ -66,6 +66,7 @@ from ..pose import (
     fit_probe_pose,
 )
 from .cli_args import (
+    MacroArgumentParser,
     add_alignment_arg,
     add_chi2_track_args,
     add_max_off_probe_mm_arg,
@@ -86,7 +87,6 @@ from .cli_args import (
     validate_min_fit,
 )
 from .io import (
-    MacroArgumentParser,
     centre_cov_2x2,
     fit_alignment,
     load_alignment_schedule,
