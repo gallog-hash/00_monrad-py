@@ -35,7 +35,7 @@ without re-running the combinatorial search.
 **`scripts/scan_plots.py`** — the 11 figures, including `sigma_vs_n.png` (the
 decision plot: real gain tracks 1/√N, junk rises above it).
 
-**`tests/test_scan_geometric_cuts.py`** — 36 tests. The linchpin is
+**`tests/test_scan_geometric_cuts.py`** — 40 tests. The linchpin is
 `TestReplayEquivalence`, which asserts the offline replay reproduces a **live**
 `PoseFitter` run exactly (funnel counts, accepted `Coincidence` list, and
 `n_inliers`) across 7 `(chi2_track, min_anchor_planes)` points.
@@ -54,35 +54,51 @@ and the probe's begin 12:20:00 after its own. That is a 2 s skew against a
 200 ns coincidence window: **zero coincidences, no error raised, a
 perfectly healthy-looking decode of 0 clusters.**
 
-Fix, in `reanchor_window`:
+### The fix: never slice the file list
 
-1. *Absolute* — advance each detector by its own file-name elapsed time. Good
-   to a few seconds, which is ample for 5-minute bins and multi-hour alignment
-   windows.
-2. *Relative* — the part that must be exact, and is **measured, not assumed**.
-   Both detectors' PPS are the same physical GPS pulses on whole UTC seconds,
-   so the residual is an integer number of seconds; `calibrate_shift` finds it
-   by maximising raw coincidence yield over whole-second probe shifts
-   (`count_matches`, two `searchsorted` calls per candidate, one extra stage-1
-   pass total).
+`decode_pass` requires the **whole** acquisition and takes a `file_range`
+instead. It streams from file 0 and gates each cluster on the telescope's
+`PosRef.file_idx`, so times are correct *by construction* — no estimation, no
+calibration, no heuristic — and stops as soon as it leaves the range. Only
+stage 1 and the coincidence merge are paid for the skipped prefix; no position
+decoding happens outside the window.
 
-Measured on real data — the peaks are unambiguous, and **the shift differs per
-window**, so a single global constant would not have worked:
+This is cheap: **3.2 s** of stage 1 for both detectors across the CLEAN
+window's entire 154-file prefix. A day-3 window (~600 files) would be ~15 s.
 
-| window | files | file-name estimate | measured | coincidences at best | next best |
-|---|---|---|---|---|---|
-| `20210724_0000`–`0030` | 6 | +2 s | **+3 s** | 4120 | 2 |
-| `20210723_1900`–`2035` | 19 | — | **+1 s** | 13603 | 5 |
+`slice_detector` survives only for the two places absolute time is irrelevant:
+the no-`--alignment` fallback fit (position decoding only) and the
+window-pairing sanity check.
 
-Note the CLEAN window's file-name estimate was **off by one second** — trusting
-file names alone (`--trust-file-names`) would have produced zero coincidences.
-`ShiftCalibration.is_confident` requires the winner to stand 5× above every
-other shift, and the CLI aborts rather than scan cuts against accidentals.
+### The check that it worked
 
-Synthetic data cannot exercise the success path here: `synthetic.generate`
+`decode_pass` then tallies, free from the events it already streamed, how many
+raw coincidences survive each whole-second probe shift (`window_shift_scan`).
+Whole seconds only: both detectors' PPS are the same physical GPS pulses on
+whole UTC seconds, so any misanchoring is an exact integer number of them. A
+correctly-timed pair peaks sharply at zero, and the CLI aborts if it does not:
+
+| window | files | shift 0 | next best |
+|---|---|---|---|
+| `20210724_0000`–`0030` | [148, 154) | 110 484 | 25 |
+| `20210723_1900`–`2040` | [88, 108) | 77 846 | 19 |
+
+(The tally covers the streamed range, prefix included, so it exceeds the cached
+cluster count — deliberately, since it checks the clocks agree run-wide.)
+
+An earlier revision instead re-anchored the sliced lists and *measured* the
+residual offset by maximising coincidence yield. That worked — it found +3 s on
+CLEAN where the file-name estimate said +2 s, i.e. **trusting file names alone
+would have produced zero coincidences** — but streaming from file 0 is exact,
+simpler and cheaper, so it replaced it. The two agree: identical `accepted`
+(385) on the CLEAN 6-pair window, differing only by ±2–4 clusters at the window
+edges.
+
+Synthetic data cannot exercise the check's success path: `synthetic.generate`
 emits tracks on an exact 0.1 s grid, so whole-second shifts alias perfectly and
-every shift ties. The calibration correctly reports that as inconclusive, and
-`TestReanchoring::test_periodic_data_is_reported_as_inconclusive` pins it.
+every shift ties. The check correctly reports that as inconclusive
+(`--no-window-check` is the documented escape hatch, used by the CLI tests) and
+`TestWindowCheck::test_periodic_data_is_reported_as_inconclusive` pins it.
 
 ## Real-data sanity checks passed
 
@@ -95,15 +111,17 @@ as `2026-07-20-chi2-track-max-cluster-width-flags-shipped.md` reported:
 | 4.0 | 1 | 880 | 1530 | 642 | 682 | 385 (9.34 %) |
 | 37.0 | 1 | 880 | 1530 | 158 | 1011 | 540 (13.11 %) |
 
-Timing: Tier-A decode runs ~280 clusters/s (19 file pairs → 13.6k clusters in
-15 s), so the 72-pair CLEAN window is ~1 min, not the ~30 min the plan budgeted
-— the `--decode-anchor 0` variant will be far slower and is still uncalibrated.
-Tier-B replay costs ~0.7 s per grid point at 419 coincidences and scales with
-the coincidence count; the default grid is ~170 points per cache.
+Timing: Tier-A decode runs ~800 clusters/s (20 file pairs → 14.3k clusters in
+17.8 s, including ~4 s of stage 1 over the 88-file prefix), so the 72-pair CLEAN
+window is ~1–2 min, not the ~30 min the plan budgeted. The `--decode-anchor 0`
+variant will be far slower and is still uncalibrated. Tier-B replay costs ~0.7 s
+per grid point at 419 coincidences and scales with the coincidence count; the
+default grid is ~170 points per cache, so budget accordingly at CLEAN's much
+larger coincidence count.
 
 ## Test status
 
-`ruff check` / `ruff format --check` clean. **354 tests pass**, covering every
+`ruff check` / `ruff format --check` clean. **358 tests pass**, covering every
 file in the suite.
 
 **10 tests were not verified**: the `test_real_*` tests in
@@ -127,13 +145,19 @@ rather than ~2.
    reproduces raw **2201** / accepted **197** on the 3-file-pair MATLAB subset.
    Not yet run.
 3. `--start/--end` are half-open, so the plan's `…2035*` window needs
-   `--end 20210723_204000` to include the 20:35 batch (19 pairs came back, not
-   20).
-4. Absolute UTC after re-anchoring is good to a few seconds only. The DAQ
-   file-name clock is **not** exactly UTC+2 on this dataset — the acquisition's
-   first file is named `11:40:32` while its `utc0` is `09:36:19`, i.e. an offset
-   of 2 h 04 m 13 s. Any CLEAN/ANOMALY window boundary quoted in UTC from a
-   file name is therefore ~4 minutes out.
+   `--end 20210723_204000` to include the 20:35 batch; that gives the intended
+   20 pairs (files [88, 108), 14 307 clusters).
+4. Absolute UTC is good to a few minutes only, which matters for the ANOMALY
+   veto: the 17:15 and 18:10 UTC bad bins must be located empirically from the
+   reconstructed stream, **not** by subtracting 2 h from file names — the error
+   is enough to land on the adjacent 5-minute bin. Two independent effects: the
+   header's UBX-TM2 frame (which seeds `utc0`) was captured **5m03s before the
+   first data file opened**, identically on both detectors, so every
+   reconstructed time is ~5 min early; and the DAQ
+   file-name clock is **not** exactly UTC+2 — the first file is named
+   `11:40:32` while its `utc0` is `09:36:19`, an offset of 2 h 04 m 13 s.
+   (`monrad.monitor.align._daq_utc_offset` already compensates for this when
+   labelling alignment windows.)
 
 ## Checked and dismissed: GPS/position block-count warnings
 
