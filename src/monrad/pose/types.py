@@ -15,6 +15,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from ..reconstruction import PlaneCandidate
+
 
 # ── Internal data structure ───────────────────────────────────────────────
 
@@ -114,6 +116,13 @@ class TelescopeTrackResult(NamedTuple):
     telescope entries in the cluster, "zero_candidate_plane",
     "no_anchor_plane", "chi2_track_cut"). The line-fit / covariance /
     tel_quality / t_ns fields are only meaningful when accepted=True.
+
+    best_cands is the winning candidate triple itself (one PlaneCandidate per
+    plane), carried alongside the line fit it produced so offline diagnostics
+    can recompute per-plane mm residuals and cluster widths without re-running
+    the combinatorial search.  None on every rejection path, and for any caller
+    that constructs the result without one -- so it is additive, never load-
+    bearing for the pipeline itself.
     """
 
     accepted: bool
@@ -128,6 +137,7 @@ class TelescopeTrackResult(NamedTuple):
     cov_ab_y: tuple[float, float, float] = (0.0, 0.0, 0.0)
     tel_quality: tuple[str, str, str] | None = None
     t_ns: int = 0
+    best_cands: tuple[PlaneCandidate, PlaneCandidate, PlaneCandidate] | None = None
 
 
 # ── Result bundle ─────────────────────────────────────────────────────────
