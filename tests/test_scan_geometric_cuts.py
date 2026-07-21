@@ -13,7 +13,7 @@ detector files are required.
 import csv
 import sys
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -353,14 +353,15 @@ class TestWindowSlicing:
             scan._parse_window_bound("2021-07-24")
 
 
-class TestReanchoring:
-    """Mid-acquisition slices must be re-anchored, and the shift *measured*.
+class TestWindowCheck:
+    """A mistimed window must be caught, not silently decoded as zero clusters.
 
     Stage 1 anchors a stream's first PPS to the header ``utc0`` and counts PPS
-    from there, so a slice starting mid-run comes back timed as though it were
-    the start of the run.  The two detectors' slices do not start at the same
-    instant, so the skew differs between them and every coincidence is lost --
-    silently.  These tests pin the detection and the correction.
+    from there, so a *sliced* file list is timed as though the slice were the
+    start of the run -- and the skew differs between detectors, losing every
+    coincidence.  ``decode_pass`` sidesteps it by always streaming from file 0
+    and gating on telescope file index; these tests pin the check that proves
+    it worked.
     """
 
     def test_count_matches_finds_the_true_shift(self):
@@ -372,49 +373,89 @@ class TestReanchoring:
         assert max(counts, key=lambda s: counts[s]) == -3
         assert counts[-3] > 20 * max(n for s, n in counts.items() if s != -3)
 
-    def test_shift_calibration_confidence(self):
-        sharp = scan.ShiftCalibration(
-            best_shift_ns=3 * 10**9, nominal_shift_ns=2 * 10**9, counts={2: 2, 3: 4120}
-        )
-        assert sharp.is_confident
-        flat = scan.ShiftCalibration(
-            best_shift_ns=0, nominal_shift_ns=0, counts={-1: 9, 0: 11, 1: 8}
-        )
-        assert not flat.is_confident
-        tiny = scan.ShiftCalibration(
-            best_shift_ns=0, nominal_shift_ns=0, counts={-1: 0, 0: 4, 1: 0}
-        )
-        assert not tiny.is_confident  # too few matches to call
+    def test_shift_scan_is_centred_on_zero(self):
+        rng = np.random.default_rng(1)
+        t_tel = np.sort(rng.integers(0, 10**12, size=5000)).astype(np.int64)
+        t_prb = np.sort(t_tel + rng.integers(-50, 50, size=t_tel.size))
+        scanned = scan.window_shift_scan(t_tel, t_prb)
+        assert max(scanned, key=lambda s: scanned[s]) == "0"
+        assert scan.window_check_ok(scanned)
+
+    def test_a_shifted_window_is_rejected(self):
+        """A window whose streams are a second apart must fail the check."""
+        rng = np.random.default_rng(2)
+        t_tel = np.sort(rng.integers(0, 10**12, size=5000)).astype(np.int64)
+        t_prb = np.sort(t_tel + 10**9 + rng.integers(-50, 50, size=t_tel.size))
+        assert not scan.window_check_ok(scan.window_shift_scan(t_tel, t_prb))
+
+    def test_window_check_ok_rejects_flat_and_tiny_scans(self):
+        assert scan.window_check_ok({"-1": 2, "0": 4120, "1": 2})
+        assert not scan.window_check_ok({"-1": 9, "0": 11, "1": 8})  # flat
+        assert not scan.window_check_ok({"-1": 0, "0": 4, "1": 0})  # too few
+        assert not scan.window_check_ok({})
 
     def test_periodic_data_is_reported_as_inconclusive(self, dataset):
-        """Perfectly regular event times alias, and must not be called confident.
+        """Perfectly regular event times alias, and must not be called ok.
 
         ``synthetic.generate`` emits tracks on an exact 0.1 s grid, so shifting
         the probe by a whole second maps every event onto a *different*
         telescope event and reproduces the true match count exactly.  There is
-        genuinely no information to pick a shift from, and the calibration has
-        to say so rather than pick the first maximum -- which is what makes it
-        safe to rely on for real (Poisson-timed) acquisitions.
+        genuinely no information to pick a shift from, and the check has to say
+        so rather than bless it -- which is what makes it trustworthy on real
+        (Poisson-timed) acquisitions.
         """
-        tel, prb, _alignment, _cache = dataset
-        _tel_a, _prb_a, cal = scan.reanchor_window(
-            tel, prb, full_tel=tel, full_prb=prb, search_s=2
-        )
-        assert cal is not None
-        assert len(set(cal.counts.values())) <= 2  # aliased: all shifts tie
-        assert not cal.is_confident
+        _tel, _prb, _alignment, cache = dataset
+        scanned = cache.meta["window_check"]
+        assert len(set(scanned.values())) <= 2  # aliased: every shift ties
+        assert not scan.window_check_ok(scanned)
 
-    def test_reanchor_without_measuring_uses_file_names_only(self, dataset):
-        tel, prb, _alignment, _cache = dataset
-        tel_a, prb_a, cal = scan.reanchor_window(
-            tel, prb, full_tel=tel, full_prb=prb, measure=False
-        )
-        assert cal is None
-        assert (tel_a.utc0, prb_a.utc0) == (tel.utc0, prb.utc0)
 
-    def test_file_name_elapsed_is_relative_to_the_full_acquisition(self, dataset):
-        tel, _prb, _alignment, _cache = dataset
-        assert scan.file_name_elapsed(tel, tel) == timedelta(0)
+class TestFileRange:
+    """Window selection by telescope file index (never by slicing the list)."""
+
+    def _det(self, names: list[str]) -> DetectorFiles:
+        return DetectorFiles(
+            utc0=datetime(2021, 7, 23, 11, 40),
+            f0=100,
+            gps_paths=[Path(f"{n}_GPS.bin") for n in names],
+            pos_paths=[Path(f"{n}.bin") for n in names],
+        )
+
+    def test_range_is_half_open(self):
+        det = self._det(
+            ["20210723_235500", "20210724_000000", "20210724_055500", "20210724_060000"]
+        )
+        assert scan.resolve_file_range(
+            det,
+            scan._parse_window_bound("20210724_000000"),
+            scan._parse_window_bound("20210724_060000"),
+        ) == (1, 3)
+
+    def test_unbounded_range_is_the_whole_acquisition(self):
+        det = self._det(["20210723_235500", "20210724_000000"])
+        assert scan.resolve_file_range(det, None, None) == (0, 2)
+
+    def test_range_past_the_end_is_empty(self):
+        det = self._det(["20210723_235500", "20210724_000000"])
+        i0, i1 = scan.resolve_file_range(
+            det, scan._parse_window_bound("20211231"), None
+        )
+        assert i0 == i1
+
+    def test_decode_honours_the_file_range(self, dataset):
+        """A range covering no files yields an empty cache, not a mistimed one."""
+        tel, prb, alignment, _cache = dataset
+        empty = scan.decode_pass(
+            tel,
+            prb,
+            z_tel=Z_TEL,
+            alignment=alignment,
+            min_anchor_planes=0,
+            file_range=(0, 0),
+            verify_window=False,
+            log_every=0,
+        )
+        assert len(empty) == 0
 
 
 class TestBinSeries:
@@ -467,6 +508,10 @@ class TestCli:
             "4",
             "--log-every",
             "0",
+            # Synthetic events sit on an exact 0.1 s grid, so every whole-second
+            # shift ties and the window check cannot judge them (see
+            # TestWindowCheck::test_periodic_data_is_reported_as_inconclusive).
+            "--no-window-check",
         ]
 
     def test_full_run_writes_cache_grid_and_figures(self, dataset, tmp_path):

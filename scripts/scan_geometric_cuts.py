@@ -55,7 +55,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -341,6 +341,33 @@ def _triple_residuals(
     return np.column_stack([x - (a_x + b_x * z_x), y - (a_y + b_y * z_y)])
 
 
+def _cluster_tel_file_idx(cluster: list, tel_id: int = 0) -> int | None:
+    """Which telescope ``*.bin`` file a cluster's telescope event came from.
+
+    Reads ``PosRef.file_idx`` off the same ``det_id == tel_id`` entry the decode
+    path uses.  ``None`` when the cluster carries no (or more than one)
+    telescope entry -- an ``ambiguous_cluster`` the decode will reject anyway.
+    """
+    refs = [ref for det_id, _ev, ref in cluster if det_id == tel_id]
+    if len(refs) != 1:
+        return None
+    return refs[0].file_idx
+
+
+def _tee_times(stream, sink: list[int] | None):
+    """Pass a stage-1 stream through, optionally recording each event's time.
+
+    Lets the window self-check reuse the events the decode is already
+    streaming, instead of paying a second stage-1 pass for them.
+    """
+    if sink is None:
+        yield from stream
+        return
+    for ev, ref in stream:
+        sink.append(ev.t_ns)
+        yield ev, ref
+
+
 def decode_pass(
     tel: DetectorFiles,
     prb: DetectorFiles,
@@ -355,6 +382,8 @@ def decode_pass(
     fibers_per_ribbon: int = POS_HALF_BITS,
     min_anchor_planes: int = 0,
     window_ns: int = 200,
+    file_range: tuple[int, int] | None = None,
+    verify_window: bool = True,
     log_every: int = 0,
 ) -> ClusterCache:
     """Stream stages 1->2->3 once and cache one record per stage-2 cluster.
@@ -368,6 +397,30 @@ def decode_pass(
     everything (and searches every all-ambiguous cluster, which is expensive --
     up to 16^3 triples), 1 matches the pipeline default and is much cheaper.
     :func:`replay` refuses to go below whatever is baked in here.
+
+    **``tel``/``prb`` must be the *whole* acquisition, not a sliced subset.**
+    Stage 1 anchors a stream's first PPS to ``utc0`` and counts PPS from there,
+    so handing it a mid-acquisition slice times every event as though the slice
+    were the start of the run -- and the error differs per detector (on
+    testLab_20210723 the telescope's window files begin 12:20:02 after its own
+    first file and the probe's 12:20:00 after its own), skewing the two streams
+    by seconds against a 200 ns window and losing every coincidence *silently*.
+
+    ``file_range`` restricts the decode to telescope files ``[i0, i1)`` while
+    still streaming from file 0, so timing stays correct by construction. Only
+    stage 1 and the coincidence merge are paid for the skipped prefix -- no
+    position decoding happens outside the range -- and the stream stops as soon
+    as it leaves it. Measured on testLab_20210723: 3.2 s of stage 1 for both
+    detectors across the 154-file prefix of the CLEAN window.
+
+    ``verify_window`` additionally tallies, for free from the events already
+    streamed, how many coincidences survive whole-second probe shifts. A
+    correctly-timed pair of streams peaks sharply at shift 0; anything else
+    means they are misanchored. The tally covers the whole *streamed* range --
+    the skipped prefix as well as the window -- which makes it a stronger check
+    than the window alone, and is why its count exceeds the cached cluster
+    count. The table lands in ``meta["window_check"]``. Costs one int64 per
+    streamed event in memory (~12 MB per detector per 150 file pairs).
     """
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -403,11 +456,21 @@ def decode_pass(
             "window_ns": window_ns,
             "alignment_label": alignment_label,
             "time_varying_alignment": schedule is not None,
+            "file_range": list(file_range) if file_range is not None else None,
         }
     )
 
-    tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
-    prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
+    i0, i1 = file_range if file_range is not None else (0, len(tel.pos_paths))
+    t_tel: list[int] = []
+    t_prb: list[int] = []
+    tel_stream = _tee_times(
+        reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0),
+        t_tel if verify_window else None,
+    )
+    prb_stream = _tee_times(
+        reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0),
+        t_prb if verify_window else None,
+    )
     label = alignment_label
     t0 = time.monotonic()
     for i, cluster in enumerate(
@@ -415,6 +478,18 @@ def decode_pass(
             [tel_stream, prb_stream], detector_ids=[0, 1], window_ns=window_ns
         )
     ):
+        # Gate on the telescope file the cluster came from, not on time: it is
+        # exact, needs no clock arithmetic, and indexes the same full pos_paths
+        # list the PoseFitter decodes against.
+        idx = _cluster_tel_file_idx(cluster, tel_id=0)
+        if idx is not None:
+            if idx >= i1:
+                break  # past the window; files are in time order
+            if idx < i0:
+                continue
+        elif not builder.rows:
+            continue  # ambiguous cluster before the window was ever entered
+
         if schedule is not None:
             t_cluster = _cluster_tel_time(cluster, tel_id=0)
             if t_cluster is not None:
@@ -456,6 +531,12 @@ def decode_pass(
             rate = (i + 1) / max(time.monotonic() - t0, 1e-9)
             print(f"    {i + 1:>8} clusters  ({rate:.0f}/s)", flush=True)
 
+    if verify_window:
+        builder.meta["window_check"] = window_shift_scan(
+            np.array(t_tel, dtype=np.int64),
+            np.array(t_prb, dtype=np.int64),
+            window_ns=window_ns,
+        )
     return builder.finalize()
 
 
@@ -1046,11 +1127,42 @@ def _parse_window_bound(text: str) -> datetime:
     raise ValueError(f"unparseable window bound {text!r} (want YYYYMMDD[_HHMMSS])")
 
 
+def resolve_file_range(
+    det: DetectorFiles, start: datetime | None, end: datetime | None
+) -> tuple[int, int]:
+    """The ``[i0, i1)`` file-index range whose acquisition time is in ``[start, end)``.
+
+    An index range rather than a sliced file list, because the decode must be
+    handed the *whole* acquisition -- slicing the list re-anchors stage 1 and
+    silently mistimes the detectors (see :func:`decode_pass`).  Indices are into
+    the detector's own sorted file lists, which is what ``PosRef.file_idx``
+    refers to.
+    """
+    names = [p.name for p in sorted(det.gps_paths)]
+    i0 = 0
+    i1 = len(names)
+    if start is not None:
+        i0 = next(
+            (i for i, n in enumerate(names) if _parse_file_ts(n) >= start), len(names)
+        )
+    if end is not None:
+        i1 = next(
+            (i for i, n in enumerate(names) if _parse_file_ts(n) >= end), len(names)
+        )
+    return i0, i1
+
+
 def slice_detector(
     det: DetectorFiles, start: datetime | None, end: datetime | None
 ) -> DetectorFiles:
     """Restrict a detector to the file pairs whose acquisition time is in
     ``[start, end)``.
+
+    **Not for the decode path** -- a sliced detector fed to
+    :func:`~monrad.timing.reconstruct_stream` is anchored on the slice's first
+    PPS and comes back mistimed.  Used only where absolute time is irrelevant:
+    the alignment fallback (position decoding only) and the window-pairing
+    sanity check.
 
     Applied *per detector*, never by a shared filename prefix: the probe DAQ
     starts ~25 s after the telescope on this dataset, so a common prefix picks
@@ -1100,34 +1212,33 @@ def check_window_pairing(
     return problems
 
 
-# ── Mid-stream re-anchoring ───────────────────────────────────────────────
+# ── Window self-check ─────────────────────────────────────────────────────
 #
 # Stage 1 anchors a stream's *first* PPS to the header's ``utc0`` and then
-# counts PPS edges (``monrad.timing.reconstruct_stream``).  Feed it a slice
+# counts PPS edges (``monrad.timing.reconstruct_stream``).  Hand it a slice
 # that starts mid-acquisition and every event comes back timed as though the
-# slice were the start of the run -- shifted early by however long the real
-# acquisition had already been running.
+# slice were the start of the run.
 #
 # That shift is per detector, and the two detectors do not share it: on
 # testLab_20210723 the telescope's window files begin 12:20:02 after its own
-# first file and the probe's 12:20:00 after its own, so slicing skews the two
-# streams by 2 s against a 200 ns coincidence window -- every coincidence is
-# lost, silently, with a perfectly healthy-looking decode of zero clusters.
+# first file and the probe's 12:20:00 after its own.  A 2 s skew against a
+# 200 ns coincidence window loses every coincidence -- silently, as a
+# perfectly healthy-looking decode of zero clusters.
 #
-# The fix has two parts:
-#   * absolute -- shift each detector forward by its own file-name elapsed
-#     time.  File rotation is not PPS-locked, so this lands within a few
-#     seconds of true UTC, which is ample for 5-minute time bins and for
-#     picking the right multi-hour alignment window;
-#   * relative -- the part that must be exact.  PPS edges are simultaneous
-#     across detectors and land on whole UTC seconds, so the residual probe-vs-
-#     telescope error is an integer number of seconds.  It is *measured* from
-#     the data by maximising raw coincidence yield over candidate shifts,
-#     rather than trusted from the file names.
+# ``decode_pass`` avoids this entirely by always streaming from file 0 and
+# gating on telescope file index, so times are right by construction.  What
+# follows is the *check* that it worked, not a correction: a correctly-timed
+# window peaks sharply at shift 0, and anything else means the streams are
+# misanchored.  It reuses the events the decode already streamed, so it is
+# free.
 
 
 def event_times(det: DetectorFiles) -> np.ndarray:
-    """Every stage-1 reconstructed event time (integer ns) for one detector."""
+    """Every stage-1 reconstructed event time (integer ns) for one detector.
+
+    Standalone counterpart to the tee inside :func:`decode_pass`, for callers
+    that want the shift scan without decoding anything.
+    """
     return np.fromiter(
         (
             ev.t_ns
@@ -1146,7 +1257,7 @@ def count_matches(
 
     The same pairing :func:`~monrad.coincidence.coincidence_stream` performs,
     reduced to a count -- cheap enough (two ``searchsorted`` calls) to evaluate
-    over a whole range of candidate shifts from one decode of the event times.
+    over a whole range of candidate shifts from one pass of event times.
     """
     shifted = t_prb + shift_ns
     lo = np.searchsorted(shifted, t_tel - window_ns, side="left")
@@ -1154,122 +1265,45 @@ def count_matches(
     return int(np.count_nonzero(hi > lo))
 
 
-@dataclass
-class ShiftCalibration:
-    """Result of measuring a window's probe-vs-telescope clock shift."""
-
-    best_shift_ns: int
-    nominal_shift_ns: int
-    counts: dict[int, int]  # shift (whole seconds) -> raw coincidence count
-
-    @property
-    def best_count(self) -> int:
-        return self.counts[self.best_shift_ns // 10**9]
-
-    @property
-    def runner_up_count(self) -> int:
-        others = [n for s, n in self.counts.items() if s != self.best_shift_ns // 10**9]
-        return max(others) if others else 0
-
-    @property
-    def is_confident(self) -> bool:
-        """True when the winning shift stands clearly above every other.
-
-        A genuine alignment produces a sharp peak: neighbouring whole-second
-        shifts move every event a full second away from its partner, so they
-        retain only accidental matches.  A flat or near-tied scan means the
-        window is not really aligned and the counts are accidentals -- better
-        to refuse than to scan cuts against noise.
-        """
-        return self.best_count >= 10 and self.best_count > 5 * self.runner_up_count
-
-
-def calibrate_shift(
-    tel: DetectorFiles,
-    prb: DetectorFiles,
+def window_shift_scan(
+    t_tel: np.ndarray,
+    t_prb: np.ndarray,
     *,
-    nominal_shift_ns: int,
-    search_s: int = 5,
+    search_s: int = 3,
     window_ns: int = 200,
-) -> ShiftCalibration:
-    """Measure the probe clock shift that maximises raw coincidence yield.
+) -> dict[str, int]:
+    """Raw coincidence count at each whole-second probe shift around zero.
 
-    Scans whole-second shifts within ``search_s`` of ``nominal_shift_ns`` (the
-    file-name estimate).  Whole seconds only: both detectors' PPS edges are the
-    same physical GPS pulses, so any residual misanchoring is an exact integer
-    number of them.
+    Whole seconds only: both detectors' PPS edges are the same physical GPS
+    pulses landing on whole UTC seconds, so any misanchoring is an exact
+    integer number of them.  Keys are stringified shifts, because this goes
+    into the cache's JSON metadata.
     """
-    t_tel = event_times(tel)
-    t_prb = event_times(prb)
-    nominal_s = int(round(nominal_shift_ns / 1e9))
-    counts = {
-        s: count_matches(t_tel, t_prb, s * 10**9, window_ns)
-        for s in range(nominal_s - search_s, nominal_s + search_s + 1)
+    if t_tel.size == 0 or t_prb.size == 0:
+        return {}
+    return {
+        str(s): count_matches(t_tel, t_prb, s * 10**9, window_ns)
+        for s in range(-search_s, search_s + 1)
     }
-    best_s = max(counts, key=lambda s: counts[s])
-    return ShiftCalibration(
-        best_shift_ns=best_s * 10**9,
-        nominal_shift_ns=nominal_shift_ns,
-        counts=counts,
-    )
 
 
-def file_name_elapsed(det: DetectorFiles, full: DetectorFiles) -> timedelta:
-    """How long the acquisition had been running when this slice's first file opened.
+def window_check_ok(scan: dict[str, int]) -> bool:
+    """True when a shift scan shows a correctly-anchored window.
 
-    Measured from the DAQ's own file-name clock, so it is independent of
-    whatever offset that clock carries against UTC -- only the *difference*
-    between two file names matters.  Good to a few seconds, since rotation is
-    not PPS-locked; that residual is exactly what the measured correction in
-    :func:`reanchor_window` removes.  (Observed on testLab_20210723: the
-    file-name estimate put the probe 2 s from the telescope, the measured
-    answer was 3 s -- trusting file names alone would have yielded zero
-    coincidences.)
+    Requires the peak to sit at shift 0 and to stand clearly above every other
+    shift.  A neighbouring whole-second shift moves every event a full second
+    from its partner, so it should retain only accidentals; a flat or
+    off-centre scan means the two streams are not on the same clock.
+
+    Perfectly periodic event times defeat this and are reported as *not* ok:
+    ``synthetic.generate`` emits tracks on an exact 0.1 s grid, so every
+    whole-second shift aliases onto a different event and ties exactly.
     """
-    return _parse_file_ts(det.gps_paths[0].name) - _parse_file_ts(
-        full.gps_paths[0].name
-    )
-
-
-def reanchor_window(
-    tel: DetectorFiles,
-    prb: DetectorFiles,
-    *,
-    full_tel: DetectorFiles,
-    full_prb: DetectorFiles,
-    search_s: int = 5,
-    window_ns: int = 200,
-    measure: bool = True,
-) -> tuple[DetectorFiles, DetectorFiles, ShiftCalibration | None]:
-    """Re-anchor a sliced window so its two streams share a clock (and UTC).
-
-    Step 1 advances each detector by its *own* file-name elapsed time, which
-    puts both roughly back on true UTC and removes the bulk of the skew.
-
-    Step 2 measures what is left.  Both detectors' PPS edges are the same
-    physical GPS pulses landing on whole UTC seconds, so the residual is an
-    exact integer number of seconds; it is found by scanning whole-second
-    probe shifts for the one that maximises raw coincidence yield.  This costs
-    one extra stage-1 pass over the window and is what turns a silent
-    zero-coincidence window into a measured, checkable number.
-
-    ``measure=False`` skips step 2 and trusts the file names alone -- only
-    correct if file rotation happens to be PPS-aligned on both detectors.
-
-    Returns the re-anchored detectors and the calibration (``None`` when
-    ``measure=False``).
-    """
-    tel_a = tel._replace(utc0=tel.utc0 + file_name_elapsed(tel, full_tel))
-    prb_a = prb._replace(utc0=prb.utc0 + file_name_elapsed(prb, full_prb))
-    if not measure:
-        return tel_a, prb_a, None
-    cal = calibrate_shift(
-        tel_a, prb_a, nominal_shift_ns=0, search_s=search_s, window_ns=window_ns
-    )
-    prb_a = prb_a._replace(
-        utc0=prb_a.utc0 + timedelta(microseconds=cal.best_shift_ns / 1000)
-    )
-    return tel_a, prb_a, cal
+    if not scan:
+        return False
+    best = scan.get("0", 0)
+    others = [n for s, n in scan.items() if s != "0"]
+    return best >= 10 and best > 5 * max(others, default=0)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
@@ -1336,33 +1370,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", default=None, metavar="YYYYMMDD[_HHMMSS]")
     p.add_argument("--end", default=None, metavar="YYYYMMDD[_HHMMSS]")
     p.add_argument(
-        "--allow-unpaired-window",
+        "--no-window-check",
         action="store_true",
-        help="Proceed even if the sliced telescope/probe file lists don't pair up.",
-    )
-    p.add_argument(
-        "--no-reanchor",
-        action="store_true",
-        help="Skip mid-stream re-anchoring of a --start/--end window. Stage 1 "
-        "times a slice as though it were the start of the run, which skews the "
-        "two detectors against each other by seconds and yields zero "
-        "coincidences -- only pass this if the slice starts at the acquisition "
-        "start.",
-    )
-    p.add_argument(
-        "--trust-file-names",
-        action="store_true",
-        help="Re-anchor from file names alone, skipping the measured "
-        "whole-second correction (and the stage-1 pass it costs). Only correct "
-        "if file rotation is PPS-aligned on both detectors.",
-    )
-    p.add_argument(
-        "--reanchor-search-s",
-        type=int,
-        default=5,
-        metavar="N",
-        help="Half-width, in whole seconds, of the clock-shift search used to "
-        "re-anchor a window (default: 5).",
+        help="Skip the free post-decode check that raw coincidence yield peaks "
+        "at zero clock shift. The check is what catches a mistimed window; only "
+        "skip it for data it cannot judge, such as perfectly periodic synthetic "
+        "events.",
     )
     p.add_argument("--chi2-grid", type=float, nargs="+", default=list(CHI2_GRID))
     p.add_argument("--anchor-grid", type=int, nargs="+", default=list(ANCHOR_GRID))
@@ -1440,64 +1453,31 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     probe_size_mm = args.n_probe_ch * STRIP_MM
 
-    full_tel = load_detector(args.telescope)
-    full_prb = load_detector(args.probe)
-    tel, prb = full_tel, full_prb
+    tel = load_detector(args.telescope)
+    prb = load_detector(args.probe)
     start = _parse_window_bound(args.start) if args.start else None
     end = _parse_window_bound(args.end) if args.end else None
-    if start or end:
-        tel = slice_detector(full_tel, start, end)
-        prb = slice_detector(full_prb, start, end)
-        if not tel.gps_paths or not prb.gps_paths:
-            parser.error(f"window [{args.start}, {args.end}) selects no file pairs")
-        problems = check_window_pairing(tel, prb)
-        if problems:
-            msg = "window pairing check failed:\n  " + "\n  ".join(problems)
-            if not args.allow_unpaired_window:
-                parser.error(msg + "\n(pass --allow-unpaired-window to proceed anyway)")
-            print("  ! " + msg)
+
+    # The window is expressed as a telescope *file index* range, and the full
+    # file lists are handed to the decode unchanged.  Slicing the lists instead
+    # would re-anchor stage 1 on the slice's first PPS and silently mistime the
+    # two detectors against each other -- see `decode_pass`.
+    file_range = resolve_file_range(tel, start, end)
+    i0, i1 = file_range
+    if i0 >= i1:
+        parser.error(f"window [{args.start}, {args.end}) selects no file pairs")
+    window_tel = slice_detector(tel, start, end)
+    window_prb = slice_detector(prb, start, end)
+    for problem in check_window_pairing(window_tel, window_prb):
+        print(f"  ! window pairing: {problem}")
     print(
-        f"  window '{args.label}': {len(tel.gps_paths)} telescope / "
-        f"{len(prb.gps_paths)} probe file pairs"
+        f"  window '{args.label}': telescope files [{i0}, {i1}) of "
+        f"{len(tel.gps_paths)} ({i1 - i0} pairs), streamed from file 0"
     )
 
-    # A mid-acquisition slice must be re-anchored before anything else touches
-    # it -- otherwise stage 1 times both streams as though the window were the
-    # start of the run, skewing them against each other by seconds and yielding
-    # exactly zero coincidences with no error raised.  See `reanchor_window`.
-    # Only the decode stage streams events, so only it needs (or should pay
-    # the extra stage-1 pass for) re-anchoring; replay and plots work from the
-    # cache, whose t_ns were already written with the corrected clock.
-    if (start or end) and not args.no_reanchor and args.stage in ("decode", "all"):
-        tel, prb, cal = reanchor_window(
-            tel,
-            prb,
-            full_tel=full_tel,
-            full_prb=full_prb,
-            search_s=args.reanchor_search_s,
-            measure=not args.trust_file_names,
-        )
-        if cal is not None:
-            ranked = sorted(cal.counts.items(), key=lambda kv: -kv[1])[:3]
-            print(
-                "  clock calibration: shift "
-                f"{cal.best_shift_ns / 1e9:+.0f} s -> {cal.best_count} raw "
-                "coincidences  (top: "
-                + ", ".join(f"{s:+d}s={n}" for s, n in ranked)
-                + ")"
-            )
-            if not cal.is_confident:
-                parser.error(
-                    "window clock calibration is not conclusive -- the best "
-                    "shift does not stand clearly above the others, so the "
-                    "matches are consistent with accidentals. Widen "
-                    "--reanchor-search-s, choose a window with more data, or "
-                    "pass --no-reanchor if you know the slice is already "
-                    "anchored."
-                )
-        print(f"  re-anchored to UTC {tel.utc0} (telescope stream start)")
-
-    alignment, schedule, align_label = load_run_alignment(args, tel, z_tel)
+    # The no---alignment fallback fits from the window's own files (position
+    # decoding only, so the stage-1 anchoring above is irrelevant to it).
+    alignment, schedule, align_label = load_run_alignment(args, window_tel, z_tel)
 
     paths = {
         w: cache_path(out, args.label, args.tot_thresh, args.tot_weights, w)
@@ -1520,6 +1500,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_cluster_width=w,
                 fibers_per_ribbon=args.fibers_per_ribbon,
                 min_anchor_planes=args.decode_anchor,
+                file_range=file_range,
+                verify_window=not args.no_window_check,
                 log_every=args.log_every,
             )
             cache.save(paths[w])
@@ -1527,6 +1509,27 @@ def main(argv: list[str] | None = None) -> int:
                 f"    {len(cache)} clusters in {time.monotonic() - t0:.1f} s "
                 f"-> {paths[w]}"
             )
+            check = cache.meta.get("window_check") or {}
+            if check:
+                ranked = sorted(check.items(), key=lambda kv: -kv[1])[:3]
+                print(
+                    "    window check (streamed range): "
+                    + ", ".join(f"{s_}s={n}" for s_, n in ranked)
+                    + (
+                        "  (peak at 0 -- streams share a clock)"
+                        if window_check_ok(check)
+                        else "  ! NOT peaked at 0"
+                    )
+                )
+                if not window_check_ok(check):
+                    parser.error(
+                        "window self-check failed: raw coincidence yield does "
+                        "not peak sharply at shift 0, so the telescope and "
+                        "probe streams are not on the same clock and the "
+                        "cached window is not what it claims to be. Pass "
+                        "--no-window-check only if you know why (e.g. "
+                        "perfectly periodic synthetic data, which aliases)."
+                    )
 
     if args.stage in ("replay", "plots", "all"):
         caches = {}
