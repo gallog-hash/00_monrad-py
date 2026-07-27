@@ -17,6 +17,7 @@ from ..alignment import AlignmentCorrection
 from ..decoders.position import POS_HALF_BITS
 from ..reconstruction import (
     GOOD_QUALITIES,
+    MAX_PER_PLANE_DEFAULT,
     PlaneCandidate,
     decode_position,
     reconstruct_plane_candidates,
@@ -54,12 +55,18 @@ class PoseFitter:
         prb_fibers_per_ribbon: int = POS_HALF_BITS,
         chi2_track: float | None = None,
         max_cluster_width: int | None = None,
+        mahal_cut: float | None = None,
+        max_per_plane: int = MAX_PER_PLANE_DEFAULT,
     ) -> None:
         if not 0 <= min_anchor_planes <= N_TEL_PLANES:
             raise ValueError(
                 f"min_anchor_planes must be in [0, {N_TEL_PLANES}], "
                 f"got {min_anchor_planes}"
             )
+        if max_per_plane < 1:
+            raise ValueError(f"max_per_plane must be >= 1, got {max_per_plane}")
+        if mahal_cut is not None and mahal_cut <= 0:
+            raise ValueError(f"mahal_cut must be > 0, got {mahal_cut}")
         self.tel_z = tel_z
         self.alignment = alignment
         self.tel_id = tel_id
@@ -80,6 +87,9 @@ class PoseFitter:
         self.prb_fibers_per_ribbon = prb_fibers_per_ribbon
         self.chi2_track = _CHI2_TRACK if chi2_track is None else chi2_track
         self.max_cluster_width = max_cluster_width
+        # None = keep fit_probe_pose's own default (DESIGN.md §8.4's d > 4).
+        self.mahal_cut = mahal_cut
+        self.max_per_plane = max_per_plane
         self._coincs: list[Coincidence] = []
         self._since_last = 0
         self.result: PoseResult | None = None
@@ -227,7 +237,7 @@ class PoseFitter:
             tel_ref,
             self.tel_pos_paths,
             n_cols=3,
-            max_per_plane=16,
+            max_per_plane=self.max_per_plane,
             tot_thresh=self.tot_thresh,
             tot_weights=self.tot_weights,
             max_cluster_width=self.max_cluster_width,
@@ -374,10 +384,12 @@ class PoseFitter:
         )
 
     def _refit(self) -> "PoseResult":
+        kwargs = {} if self.mahal_cut is None else {"mahal_cut": self.mahal_cut}
         result = fit_probe_pose(
             self._coincs,
             self.alignment.corrected_z_tel(self.tel_z),
             self.alignment,
+            **kwargs,
         )
         self._since_last = 0
         self.result = result

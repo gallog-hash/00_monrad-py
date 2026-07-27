@@ -157,6 +157,17 @@ monrad-multiprobe \
     --out       pipeline_out/multiprobe
 ```
 
+Three physics cuts default to the values baked into the library and can be
+overridden on `monrad-monitor`, `monrad-multiprobe` and
+`scripts/run_pipeline.py` alike (omitting a flag keeps the built-in, so a run
+without them is bit-for-bit what it was before they existed):
+
+| Flag | Default | What it changes |
+|---|---|---|
+| `--mahal-cut D` | 4.0 | Mahalanobis outlier cut in the probe pose fit. Independent of `--chi2-track`: that one scores the telescope *line* fit, this one the probe-vs-track residual, so a coherent wrong-fold pick that lies on the fitted line is invisible to `--chi2-track` and only `--mahal-cut` can reject it. |
+| `--max-per-plane N` | 16 | Cap on telescope candidates enumerated per plane before the combinatorial triple search. The default only covers the single-particle mirror fold; on real pile-up data it binds and discards candidates (12.4% of planes on testLab, max 768 observed), so raising it changes which triple wins — at up to N³ line fits per cluster. |
+| `--coincidence-window-ns NS` | 200 | The stage-2 hardware coincidence window (DESIGN.md §5). **Not** `--window-s`, which is the monitoring window a pose is fitted over. |
+
 Both scripts' flag lists have grown long enough that a run is easier to keep
 in a macro file than to retype: any `@path/to/file.args` argument is expanded
 as one flag per line (`#` comments and blank lines ignored), and flags typed

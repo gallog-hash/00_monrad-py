@@ -36,6 +36,19 @@ python scripts/run_pipeline.py --telescope <tel_dir> --probe <prb_dir> \
 monrad-monitor @macros/monitor.args --out pipeline_out/monitor
 monrad-multiprobe @macros/multiprobe.args --out pipeline_out/multiprobe
 
+# Three physics cuts default to the library's built-ins and are overridable on
+# monitor, multiprobe and run_pipeline.py alike (omit = unchanged behaviour):
+#   --mahal-cut D              pose-fit Mahalanobis outlier cut (default 4.0).
+#                              Orthogonal to --chi2-track, which scores the
+#                              telescope LINE fit — a coherent wrong-fold pick
+#                              lies on that line and contributes ~0 chi2.
+#   --max-per-plane N          telescope candidates enumerated per plane before
+#                              the triple search (default 16). NOT a lossless
+#                              bound: it binds on real pile-up data.
+#   --coincidence-window-ns NS stage-2 coincidence window (default 200). NOT
+#                              --window-s, which is the monitoring window.
+monrad-monitor @macros/monitor.args --mahal-cut 3.0 --max-per-plane 64
+
 # Telescope alignment calibration + hardware-drift monitor. By default fits
 # ONE AlignmentCorrection per --interval-hours window (default 24, i.e. once
 # per day) across the ENTIRE --telescope directory, each from that window's

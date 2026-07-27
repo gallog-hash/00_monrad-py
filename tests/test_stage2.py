@@ -222,3 +222,77 @@ class TestTransitiveClosure:
         clusters = self._run(tel, prb)
         assert len(clusters) == 1
         assert {d for d, _, _ in clusters[0]} == {TEL_ID, PRB_ID}
+
+
+class TestWindowNsReachesCoincidenceStream:
+    """``window_ns`` must be forwarded by the monitor drivers, not dropped.
+
+    ``monrad.monitor.io.stream_coincidences`` used to call
+    ``coincidence_stream`` with no ``window_ns`` at all, so a driver-level
+    override could never reach stage 2.  These pin the wiring by capturing
+    the kwarg the real call site passes.
+    """
+
+    def _capture(self, monkeypatch):
+        from monrad.monitor import io as monitor_io
+
+        seen: list = []
+
+        def _fake(streams, detector_ids, window_ns=None):
+            seen.append(window_ns)
+            return iter(())
+
+        monkeypatch.setattr(monitor_io, "coincidence_stream", _fake)
+        return seen
+
+    def _detector(self):
+        """A DetectorFiles whose streams are never consumed (stream is faked)."""
+        from monrad.monitor.io import DetectorFiles
+
+        return DetectorFiles(gps_paths=[], pos_paths=[], utc0=0, f0=F0)
+
+    def test_stream_coincidences_forwards_window_ns(self, monkeypatch):
+        import numpy as np
+
+        from monrad.alignment import AlignmentCorrection
+        from monrad.monitor.io import stream_coincidences
+
+        seen = self._capture(monkeypatch)
+        det = self._detector()
+        list(
+            stream_coincidences(
+                det,
+                det,
+                z_tel=np.array([0.0, 400.0, 800.0]),
+                alignment=AlignmentCorrection.identity(),
+                window_ns=137,
+            )
+        )
+        assert seen == [137]
+
+    def test_stream_coincidences_defaults_to_200(self, monkeypatch):
+        import numpy as np
+
+        from monrad.alignment import AlignmentCorrection
+        from monrad.coincidence import WINDOW_NS_DEFAULT
+        from monrad.monitor.io import stream_coincidences
+
+        seen = self._capture(monkeypatch)
+        det = self._detector()
+        list(
+            stream_coincidences(
+                det,
+                det,
+                z_tel=np.array([0.0, 400.0, 800.0]),
+                alignment=AlignmentCorrection.identity(),
+            )
+        )
+        assert seen == [WINDOW_NS_DEFAULT] == [200]
+
+    def test_build_cluster_stream_forwards_window_ns(self, monkeypatch):
+        from monrad.monitor.io import build_cluster_stream
+
+        seen = self._capture(monkeypatch)
+        det = self._detector()
+        list(build_cluster_stream(det, [det], window_ns=99))
+        assert seen == [99]

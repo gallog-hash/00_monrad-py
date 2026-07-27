@@ -19,6 +19,7 @@ from .optimize import (
     _sigma_tel_at_z as _sigma_tel_at_z,
     _tel_line_fit as _tel_line_fit,
     _MIN_COINCS as _MIN_COINCS,
+    _MAHAL_CUT as _MAHAL_CUT,
 )
 from .fitter import (
     PoseFitter as PoseFitter,

@@ -11,7 +11,9 @@ import argparse
 import shlex
 from pathlib import Path
 
-from ..pose import _MIN_COINCS, PoseFitter
+from ..coincidence import WINDOW_NS_DEFAULT
+from ..pose import _MAHAL_CUT, _MIN_COINCS, PoseFitter
+from ..reconstruction import MAX_PER_PLANE_DEFAULT
 
 MIN_FIT = PoseFitter.MIN_FIT
 
@@ -247,6 +249,78 @@ def add_chi2_track_args(
             "default."
         ),
     )
+
+
+def add_mahal_cut_arg(
+    p: argparse.ArgumentParser, *, shared_across_probes: bool = False
+) -> None:
+    p.add_argument(
+        "--mahal-cut",
+        type=float,
+        default=None,
+        metavar="D",
+        help=(
+            "Mahalanobis outlier-cut distance for the probe pose fit"
+            + (", shared across every probe" if shared_across_probes else "")
+            + f" (default: fit_probe_pose's built-in {_MAHAL_CUT}). Independent "
+            "of --chi2-track: that cut measures the telescope line fit, this one "
+            "the probe-vs-track residual, so a coherent wrong-fold pick that "
+            "lies on the fitted line is invisible to --chi2-track but cut here."
+        ),
+    )
+
+
+def add_max_per_plane_arg(
+    p: argparse.ArgumentParser, *, shared_across_probes: bool = False
+) -> None:
+    p.add_argument(
+        "--max-per-plane",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap on the telescope candidate positions enumerated per plane "
+            "before the combinatorial track search"
+            + (", shared across every probe" if shared_across_probes else "")
+            + f" (default: {MAX_PER_PLANE_DEFAULT}). The default covers the "
+            "single-particle mirror fold only; on real pile-up it binds and "
+            "discards candidates, so raising it changes which triple wins at a "
+            "cost of up to N^3 line fits per cluster."
+        ),
+    )
+
+
+def add_coincidence_window_ns_arg(
+    p: argparse.ArgumentParser, *, help_suffix: str = ""
+) -> None:
+    p.add_argument(
+        "--coincidence-window-ns",
+        type=int,
+        default=None,
+        metavar="NS",
+        help=f"Stage-2 coincidence window in nanoseconds (default: "
+        f"{WINDOW_NS_DEFAULT}). This is the hardware coincidence window, NOT "
+        f"--window-s, which is the monitoring window a pose is fitted over."
+        + help_suffix,
+    )
+
+
+def validate_mahal_cut(mahal_cut: float | None) -> None:
+    """Raise ``ValueError`` if ``--mahal-cut`` is not > 0 (``None`` allowed)."""
+    if mahal_cut is not None and not mahal_cut > 0:
+        raise ValueError(f"--mahal-cut must be > 0; got {mahal_cut}")
+
+
+def validate_max_per_plane(max_per_plane: int | None) -> None:
+    """Raise ``ValueError`` if ``--max-per-plane`` is not >= 1 (``None`` allowed)."""
+    if max_per_plane is not None and max_per_plane < 1:
+        raise ValueError(f"--max-per-plane must be >= 1; got {max_per_plane}")
+
+
+def validate_coincidence_window_ns(window_ns: int | None) -> None:
+    """Raise ``ValueError`` if ``--coincidence-window-ns`` is not > 0 (``None`` ok)."""
+    if window_ns is not None and window_ns <= 0:
+        raise ValueError(f"--coincidence-window-ns must be > 0; got {window_ns}")
 
 
 def validate_chi2_track_args(args: argparse.Namespace) -> None:

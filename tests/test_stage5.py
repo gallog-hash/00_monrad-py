@@ -35,6 +35,7 @@ from monrad.pose import (
     _linear_solve_fixed_theta,
     _sigma_tel_at_z,
 )
+from monrad.reconstruction import MAX_PER_PLANE_DEFAULT
 from monrad.synthetic import generate, F0, Z_TEL, STRIP_MM
 
 _START_UTC = datetime(2023, 4, 18, 19, 21, 0)
@@ -1207,3 +1208,132 @@ class TestMaxClusterWidthOverride:
         co = fitter_capped.decode_cluster(cluster)
         assert co is None
         assert reports[-1].reason == "zero_candidate_plane"
+
+
+class TestMahalCutTunable:
+    """
+    fit_probe_pose's Mahalanobis outlier cut defaults to _MAHAL_CUT (4.0) but
+    is a keyword parameter -- verify it is actually read at the cut, and that
+    PoseFitter forwards its own override to it.
+    """
+
+    _TRUE_TX = 30.0
+    _TRUE_TY = -20.0
+    _TRUE_ZP = 500.0
+
+    def _coincs(self, n=40, outlier_mm=0.0):
+        """n on-pose coincidences at theta=0; the last one shifted by outlier_mm.
+
+        Every telescope line is built to intersect the probe plane exactly at
+        the point the probe reports, so residuals are ~0 and the Mahalanobis
+        distance of an inlier is ~0 -- the planted outlier is then the only
+        thing either cut can act on.
+        """
+        rng = np.random.default_rng(7)
+        sigma = 2.0
+        cov = (sigma**2, 0.0, 1e-8)
+        out = []
+        for i in range(n):
+            u = float(rng.uniform(-100.0, 100.0))
+            v = float(rng.uniform(-100.0, 100.0))
+            b_x = float(rng.uniform(-0.05, 0.05))
+            b_y = float(rng.uniform(-0.05, 0.05))
+            shift = outlier_mm if i == n - 1 else 0.0
+            # theta = 0 => x_meas = t_x + u, y_meas = t_y + v.
+            a_x = (self._TRUE_TX + u + shift) - b_x * self._TRUE_ZP
+            a_y = (self._TRUE_TY + v) - b_y * self._TRUE_ZP
+            out.append(
+                Coincidence(
+                    a_x=a_x,
+                    b_x=b_x,
+                    a_y=a_y,
+                    b_y=b_y,
+                    cov_ab_x=cov,
+                    cov_ab_y=cov,
+                    u=u,
+                    v=v,
+                    sigma_prb_x=sigma,
+                    sigma_prb_y=sigma,
+                )
+            )
+        return out
+
+    def test_cut_value_changes_n_inliers(self):
+        # The planted point sits ~3.5 sigma out: kept by d<=4, cut by d<=3.
+        coincs = self._coincs(outlier_mm=10.0)
+        z = np.array(Z_TEL, dtype=float)
+        align = AlignmentCorrection.identity()
+        loose = fit_probe_pose(coincs, z, align, mahal_cut=4.0)
+        tight = fit_probe_pose(coincs, z, align, mahal_cut=3.0)
+        assert tight.n_inliers < loose.n_inliers
+        assert len(tight.outliers) > len(loose.outliers)
+
+    def test_default_matches_explicit_4(self):
+        coincs = self._coincs(outlier_mm=10.0)
+        z = np.array(Z_TEL, dtype=float)
+        align = AlignmentCorrection.identity()
+        assert (
+            fit_probe_pose(coincs, z, align).n_inliers
+            == fit_probe_pose(coincs, z, align, mahal_cut=4.0).n_inliers
+        )
+
+    def test_pose_fitter_forwards_mahal_cut(self):
+        """PoseFitter(mahal_cut=...) reaches fit_probe_pose in _refit."""
+        coincs = self._coincs(outlier_mm=10.0)
+
+        def _fitter(**kw):
+            f = _pose_fitter([], [], refit_every=10**9, **kw)
+            f._coincs = list(coincs)
+            return f._refit()
+
+        assert _fitter(mahal_cut=3.0).n_inliers < _fitter().n_inliers
+
+
+class TestPoseFitterParameterValidation:
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_rejects_max_per_plane_below_one(self, bad):
+        with pytest.raises(ValueError, match="max_per_plane"):
+            _pose_fitter([], [], max_per_plane=bad)
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_rejects_non_positive_mahal_cut(self, bad):
+        with pytest.raises(ValueError, match="mahal_cut"):
+            _pose_fitter([], [], mahal_cut=bad)
+
+    def test_defaults(self):
+        f = _pose_fitter([], [])
+        assert f.max_per_plane == MAX_PER_PLANE_DEFAULT
+        assert f.mahal_cut is None
+
+
+class TestMaxPerPlaneOverride:
+    """
+    max_per_plane caps each plane's candidate list before the combinatorial
+    triple search.  A mirror-fold-ambiguous plane produces 4 candidates
+    (2 ribbon x 2 fiber); capping to 1 truncates it to the single most compact
+    one, which is observable in DecodeReport.cand_counts.
+    """
+
+    def test_cap_truncates_candidate_lists(self, tmp_path):
+        from monrad.synthetic import _ch_to_u64
+
+        # Every plane folded on both axes -> 4x4 = 16 candidates each.
+        tel_words = [_ch_to_u64(10 + 5 * k, 5, gen=0, fold=True) for k in range(3)]
+        prb_words = [_ch_to_u64(5, 5, gen=0)]
+        tel_path = _one_event_bin(tmp_path, "cap_tel.bin", tel_words)
+        prb_path = _one_event_bin(tmp_path, "cap_prb.bin", prb_words)
+        cluster, tel_paths, prb_paths = _make_cluster(tel_path, prb_path)
+
+        counts = {}
+        for cap in (16, 2):
+            f = _pose_fitter(
+                tel_paths, prb_paths, max_per_plane=cap, min_anchor_planes=0
+            )
+            reports = []
+            f.on_decode = reports.append
+            f.decode_cluster(cluster)
+            counts[cap] = reports[-1].cand_counts
+
+        assert max(counts[16]) > 2, f"unfolded plane was not ambiguous: {counts[16]}"
+        assert all(c <= 2 for c in counts[2]), counts[2]
+        assert counts[2] != counts[16]

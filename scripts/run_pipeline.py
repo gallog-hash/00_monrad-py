@@ -97,11 +97,15 @@ from monrad.timing import (
     Quality,
     reconstruct_stream,
 )
-from monrad.coincidence import coincidence_stream
+from monrad.coincidence import WINDOW_NS_DEFAULT, coincidence_stream
 from monrad.alignment import AlignmentCorrection
+from monrad.reconstruction import MAX_PER_PLANE_DEFAULT
 from monrad.monitor.cli_args import (
     add_chi2_track_args,
+    add_coincidence_window_ns_arg,
+    add_mahal_cut_arg,
     add_max_off_probe_mm_arg,
+    add_max_per_plane_arg,
     add_max_rigidity_resid_mm_arg,
     add_min_anchor_planes_arg,
     add_out_arg,
@@ -109,7 +113,10 @@ from monrad.monitor.cli_args import (
     add_tot_thresh_arg,
     add_tot_weights_arg,
     validate_chi2_track_args,
+    validate_coincidence_window_ns,
     validate_fibers_per_ribbon,
+    validate_mahal_cut,
+    validate_max_per_plane,
 )
 from monrad.monitor.io import (
     DetectorFiles,
@@ -205,6 +212,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "(requires plotly; no-op if stage 5 is skipped).",
     )
     add_chi2_track_args(p)
+    add_mahal_cut_arg(p)
+    add_max_per_plane_arg(p)
+    add_coincidence_window_ns_arg(p)
     return p
 
 
@@ -218,6 +228,9 @@ def _parse_args() -> tuple[argparse.Namespace, set[str]]:
         parser.error(str(exc))
     try:
         validate_chi2_track_args(args)
+        validate_mahal_cut(args.mahal_cut)
+        validate_max_per_plane(args.max_per_plane)
+        validate_coincidence_window_ns(args.coincidence_window_ns)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -454,7 +467,19 @@ def main() -> None:
     max_off_probe_mm: float | None = args.max_off_probe_mm
     chi2_track: float | None = args.chi2_track
     max_cluster_width: int | None = args.max_cluster_width
+    mahal_cut: float | None = args.mahal_cut
+    max_per_plane: int = (
+        MAX_PER_PLANE_DEFAULT if args.max_per_plane is None else args.max_per_plane
+    )
+    window_ns: int = (
+        WINDOW_NS_DEFAULT
+        if args.coincidence_window_ns is None
+        else args.coincidence_window_ns
+    )
     probe_size_mm = n_probe_ch * 10.0
+    # None keeps fit_probe_pose's own built-in cut, so the bootstrap and final
+    # fits below stay byte-identical when --mahal-cut is not given.
+    pose_kwargs = {} if mahal_cut is None else {"mahal_cut": mahal_cut}
 
     lines: list[str] = []
 
@@ -497,6 +522,12 @@ def main() -> None:
     _emit(
         lines,
         f"  max_cluster_width:  {max_cluster_width}  {_tag('max_cluster_width')}",
+    )
+    _emit(lines, f"  mahal_cut:          {mahal_cut}  {_tag('mahal_cut')}")
+    _emit(lines, f"  max_per_plane:      {max_per_plane}  {_tag('max_per_plane')}")
+    _emit(
+        lines,
+        f"  coincidence_window_ns: {window_ns}  {_tag('coincidence_window_ns')}",
     )
     _emit(lines)
 
@@ -660,6 +691,8 @@ def main() -> None:
         on_decode=_on_decode,
         chi2_track=chi2_track,
         max_cluster_width=max_cluster_width,
+        mahal_cut=mahal_cut,
+        max_per_plane=max_per_plane,
     )
 
     n_coinc = 0
@@ -669,6 +702,7 @@ def main() -> None:
     for cluster in coincidence_stream(
         [tel_stream, prb_stream],
         detector_ids=[0, 1],
+        window_ns=window_ns,
     ):
         n_coinc += 1
         total_cluster_size += len(cluster)
@@ -689,7 +723,7 @@ def main() -> None:
     z_ref_bootstrap: float | None = None
     if max_rigidity_resid_mm is not None and len(coincs) >= 3:
         z_ref_bootstrap = fit_probe_pose(
-            coincs, alignment.corrected_z_tel(z_tel), alignment
+            coincs, alignment.corrected_z_tel(z_tel), alignment, **pose_kwargs
         ).z_p
         kept, dropped = filter_rigidity(coincs, z_ref_bootstrap, max_rigidity_resid_mm)
         if len(kept) >= 3:
@@ -713,7 +747,7 @@ def main() -> None:
     ref_pose_bootstrap: PoseResult | None = None
     if max_off_probe_mm is not None and len(coincs) >= 3:
         ref_pose_bootstrap = fit_probe_pose(
-            coincs, alignment.corrected_z_tel(z_tel), alignment
+            coincs, alignment.corrected_z_tel(z_tel), alignment, **pose_kwargs
         )
         kept, dropped = filter_off_probe(
             coincs, ref_pose_bootstrap, probe_size_mm, max_off_probe_mm
@@ -727,7 +761,9 @@ def main() -> None:
             off_probe_fallback = True
 
     pose = (
-        fit_probe_pose(coincs, alignment.corrected_z_tel(z_tel), alignment)
+        fit_probe_pose(
+            coincs, alignment.corrected_z_tel(z_tel), alignment, **pose_kwargs
+        )
         if len(coincs) >= PoseFitter.MIN_FIT
         else None
     )

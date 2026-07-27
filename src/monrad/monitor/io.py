@@ -19,10 +19,10 @@ from typing import NamedTuple
 import numpy as np
 
 from ..alignment import AlignmentAccumulator, AlignmentCorrection, load_alignment
-from ..coincidence import coincidence_stream
+from ..coincidence import WINDOW_NS_DEFAULT, coincidence_stream
 from ..decoders.position import POS_HALF_BITS
 from ..pose import Coincidence, PoseFitter
-from ..reconstruction import decode_position
+from ..reconstruction import MAX_PER_PLANE_DEFAULT, decode_position
 from ..synthetic.generate import STRIP_MM
 from ..timing import (
     PosRef,
@@ -449,7 +449,7 @@ def build_cluster_stream(
     tel: DetectorFiles,
     probes: list[DetectorFiles],
     *,
-    window_ns: int = 200,
+    window_ns: int = WINDOW_NS_DEFAULT,
 ) -> Iterator[list[tuple[int, TimedEvent, PosRef]]]:
     """Yield coincidence clusters over one telescope and N probes.
 
@@ -490,6 +490,9 @@ def stream_coincidences(
     fibers_per_ribbon: int = POS_HALF_BITS,
     chi2_track: float | None = None,
     max_cluster_width: int | None = None,
+    mahal_cut: float | None = None,
+    max_per_plane: int = MAX_PER_PLANE_DEFAULT,
+    window_ns: int = WINDOW_NS_DEFAULT,
 ) -> Iterator[Coincidence]:
     """Yield decoded probe–telescope coincidences for one acquisition.
 
@@ -504,8 +507,13 @@ def stream_coincidences(
     §2.4), passed through as ``PoseFitter``'s ``prb_fibers_per_ribbon``.
     Telescope decode is unaffected.
 
-    chi2_track, max_cluster_width : passed straight through to
-    ``PoseFitter``; ``None`` keeps that fitter's own defaults (4.0 / off).
+    chi2_track, max_cluster_width, mahal_cut, max_per_plane : passed straight
+    through to ``PoseFitter``; ``None`` keeps that fitter's own defaults (4.0 /
+    off / ``fit_probe_pose``'s d > 4).
+
+    window_ns : the stage-2 coincidence window (DESIGN.md §5), forwarded to
+    :func:`~monrad.coincidence.coincidence_stream`.  Unrelated to the
+    *monitoring* window the timeseries driver calls ``window_s``.
 
     schedule : optional :class:`AlignmentSchedule`. When given, the fitter's
     alignment is switched (via ``update_alignment``) before each cluster
@@ -532,11 +540,15 @@ def stream_coincidences(
         prb_fibers_per_ribbon=fibers_per_ribbon,
         chi2_track=chi2_track,
         max_cluster_width=max_cluster_width,
+        mahal_cut=mahal_cut,
+        max_per_plane=max_per_plane,
     )
     label = alignment_label
     tel_stream = reconstruct_stream(tel.gps_paths, tel.pos_paths, tel.utc0, tel.f0)
     prb_stream = reconstruct_stream(prb.gps_paths, prb.pos_paths, prb.utc0, prb.f0)
-    for cluster in coincidence_stream([tel_stream, prb_stream], detector_ids=[0, 1]):
+    for cluster in coincidence_stream(
+        [tel_stream, prb_stream], detector_ids=[0, 1], window_ns=window_ns
+    ):
         if schedule is not None:
             t_ns = _cluster_tel_time(cluster, tel_id=0)
             if t_ns is not None:

@@ -25,6 +25,9 @@ from .hit import (
 )
 
 
+MAX_PER_PLANE_DEFAULT = 16  # per-plane candidate cap — see reconstruct_plane_candidates
+
+
 class PlaneCandidate(NamedTuple):
     x_mm: float
     y_mm: float
@@ -39,7 +42,7 @@ def reconstruct_plane_candidates(
     pos_ref: PosRef,
     pos_paths: list[Path],
     n_cols: int,
-    max_per_plane: int = 16,
+    max_per_plane: int = MAX_PER_PLANE_DEFAULT,
     tot_thresh: int = 1,
     tot_weights: bool = False,
     n_fibers_per_ribbon: int = POS_HALF_BITS,
@@ -58,10 +61,18 @@ def reconstruct_plane_candidates(
     width_x + width_y, ties broken by channel) — used by the Stage 5
     combinatorial track finder in place of a single resolved Hit per plane.
 
-    The default cap of 16 is the worst-case mirror-fold count: each axis can
-    fold into at most 2 ribbon × 2 fiber = 4 candidates, so a plane folded on
-    both axes yields 4 × 4 = 16 (DESIGN.md §10).  A smaller cap can silently
-    drop the true candidate when every candidate is equally compact.
+    The default cap of 16 covers the *single-particle* mirror fold: each axis
+    can fold into at most 2 ribbon × 2 fiber = 4 candidates, so one particle
+    folded on both axes yields 4 × 4 = 16 (DESIGN.md §10).  It is **not** a
+    lossless bound in real data: under pile-up an axis can carry several
+    cluster halves, and their cross-product blows past 16.  Measured on 30,464
+    real telescope events (testLab_20210723, cap lifted to 10⁶), 12.4% of
+    planes exceed 16 candidates with a maximum of 768, and 17.2% of the events
+    that actually reach the χ² track search (all planes non-empty, ≥ 1 anchor)
+    have at least one plane truncated.  The cap is therefore a compute guard
+    and a deliberate bias toward compact candidates, not a bound that happens
+    never to bind.  A smaller cap can silently drop the true candidate when
+    every candidate is equally compact.
 
     Each candidate carries `quality` ("golden" if both axes are width 1,
     else "cluster") and `tot_x`/`tot_y` (per-axis TOT score, see

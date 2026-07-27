@@ -57,6 +57,8 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import AlignmentCorrection, load_alignment
+from ..coincidence import WINDOW_NS_DEFAULT
+from ..reconstruction import MAX_PER_PLANE_DEFAULT
 from ..pose import (
     Coincidence,
     PoseFitter,
@@ -69,7 +71,10 @@ from .cli_args import (
     MacroArgumentParser,
     add_alignment_arg,
     add_chi2_track_args,
+    add_coincidence_window_ns_arg,
+    add_mahal_cut_arg,
     add_max_off_probe_mm_arg,
+    add_max_per_plane_arg,
     add_max_pose_jump_deg_arg,
     add_max_pose_jump_mm_arg,
     add_max_rigidity_resid_mm_arg,
@@ -83,7 +88,10 @@ from .cli_args import (
     add_window_s_arg,
     add_z_tel_arg,
     validate_chi2_track_args,
+    validate_coincidence_window_ns,
     validate_fibers_per_ribbon,
+    validate_mahal_cut,
+    validate_max_per_plane,
     validate_min_fit,
 )
 from .io import (
@@ -227,6 +235,7 @@ class _WindowAccumulator:
         max_off_probe_mm: float | None = None,
         max_pose_jump_mm: float | None = None,
         max_pose_jump_deg: float | None = None,
+        mahal_cut: float | None = None,
         label: str = "",
     ) -> None:
         self.z_corr = z_corr
@@ -240,6 +249,11 @@ class _WindowAccumulator:
         self.max_off_probe_mm = max_off_probe_mm
         self.max_pose_jump_mm = max_pose_jump_mm
         self.max_pose_jump_deg = max_pose_jump_deg
+        # Mahalanobis outlier cut for this accumulator's own fit_probe_pose
+        # calls.  Unrelated to window_ns above, which is the *monitoring*
+        # window; None keeps fit_probe_pose's built-in d > 4.
+        self._pose_kwargs = {} if mahal_cut is None else {"mahal_cut": mahal_cut}
+        self.mahal_cut = mahal_cut
         self.label = label
         self._prefix = f"{label}: " if label else ""
         self.raw_cap = min_fit * RAW_CAP_MULTIPLIER
@@ -277,7 +291,7 @@ class _WindowAccumulator:
                     or len(coincs) - self.cold_start_n >= COLD_START_REFIT_STRIDE
                 ):
                     self.cold_start_z_ref = fit_probe_pose(
-                        working, self.z_corr, self.alignment
+                        working, self.z_corr, self.alignment, **self._pose_kwargs
                     ).z_p
                     self.cold_start_n = len(coincs)
                 z_ref = self.cold_start_z_ref
@@ -429,7 +443,7 @@ class _WindowAccumulator:
             # re-gate on the next coincidence.
             return None
 
-        pose = fit_probe_pose(working, self.z_corr, self.alignment)
+        pose = fit_probe_pose(working, self.z_corr, self.alignment, **self._pose_kwargs)
         if pose.outliers:
             logger.info(
                 "%sWindow %s–%s: fit accepted %d/%d gate-survivor(s), rejected "
@@ -527,6 +541,9 @@ def monitor_probe(
     make_plots: bool = True,
     chi2_track: float | None = None,
     max_cluster_width: int | None = None,
+    mahal_cut: float | None = None,
+    max_per_plane: int = MAX_PER_PLANE_DEFAULT,
+    coincidence_window_ns: int = WINDOW_NS_DEFAULT,
 ) -> list[WindowResult]:
     """Stream an acquisition and fit the probe pose in successive batches.
 
@@ -645,6 +662,19 @@ def monitor_probe(
         Cap on the per-axis merged-channel width a hit's centroid may be
         built from (see :class:`~monrad.pose.PoseFitter`).  ``None`` (the
         default) disables the cap — current behaviour.
+    mahal_cut:
+        Mahalanobis outlier-cut distance applied by every
+        :func:`~monrad.pose.fit_probe_pose` call this run makes (the
+        per-window fit and the rigidity gate's cold-start bootstrap).
+        ``None`` (the default) keeps that function's built-in ``d > 4``.
+    max_per_plane:
+        Cap on telescope candidates enumerated per plane before the
+        combinatorial track search (see
+        :func:`~monrad.reconstruction.reconstruct_plane_candidates`).
+    coincidence_window_ns:
+        The stage-2 hardware coincidence window (DESIGN.md §5).  Distinct
+        from ``window_s``, which is the *monitoring* window a pose is fitted
+        over.
     """
     tel_dir = Path(tel_dir)
     prb_dir = Path(prb_dir)
@@ -687,6 +717,7 @@ def monitor_probe(
         max_off_probe_mm=max_off_probe_mm,
         max_pose_jump_mm=max_pose_jump_mm,
         max_pose_jump_deg=max_pose_jump_deg,
+        mahal_cut=mahal_cut,
     )
 
     stream = stream_coincidences(
@@ -702,6 +733,9 @@ def monitor_probe(
         fibers_per_ribbon=fibers_per_ribbon,
         chi2_track=chi2_track,
         max_cluster_width=max_cluster_width,
+        mahal_cut=mahal_cut,
+        max_per_plane=max_per_plane,
+        window_ns=coincidence_window_ns,
     )
     for co in stream:
         acc.push(co)
@@ -881,6 +915,9 @@ def _build_parser() -> argparse.ArgumentParser:
     add_alignment_arg(p)
     add_out_arg(p, default=Path("./pipeline_out/monitor"))
     add_chi2_track_args(p)
+    add_mahal_cut_arg(p)
+    add_max_per_plane_arg(p)
+    add_coincidence_window_ns_arg(p)
     add_tot_thresh_arg(p)
     add_tot_weights_arg(p)
     add_no_plots_arg(p)
@@ -894,6 +931,9 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
         validate_min_fit(args.min_fit)
         validate_fibers_per_ribbon([args.fibers_per_ribbon])
         validate_chi2_track_args(args)
+        validate_mahal_cut(args.mahal_cut)
+        validate_max_per_plane(args.max_per_plane)
+        validate_coincidence_window_ns(args.coincidence_window_ns)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -965,6 +1005,15 @@ def main(argv: list[str] | None = None) -> None:
         args.max_cluster_width,
         _tag("max_cluster_width"),
     )
+    logger.info("  mahal_cut:           %s  %s", args.mahal_cut, _tag("mahal_cut"))
+    logger.info(
+        "  max_per_plane:       %s  %s", args.max_per_plane, _tag("max_per_plane")
+    )
+    logger.info(
+        "  coincidence_window_ns: %s  %s",
+        args.coincidence_window_ns,
+        _tag("coincidence_window_ns"),
+    )
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
 
     results = monitor_probe(
@@ -987,6 +1036,15 @@ def main(argv: list[str] | None = None) -> None:
         make_plots=not args.no_plots,
         chi2_track=args.chi2_track,
         max_cluster_width=args.max_cluster_width,
+        mahal_cut=args.mahal_cut,
+        max_per_plane=(
+            MAX_PER_PLANE_DEFAULT if args.max_per_plane is None else args.max_per_plane
+        ),
+        coincidence_window_ns=(
+            WINDOW_NS_DEFAULT
+            if args.coincidence_window_ns is None
+            else args.coincidence_window_ns
+        ),
     )
     print(f"Fitted {len(results)} window(s).")
     for r in results:

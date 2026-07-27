@@ -11,6 +11,7 @@ from .hit import (
     decode_position as decode_position,
 )
 from .candidates import (
+    MAX_PER_PLANE_DEFAULT as MAX_PER_PLANE_DEFAULT,
     PlaneCandidate as PlaneCandidate,
     disambiguate_telescope_hits as disambiguate_telescope_hits,
     reconstruct_plane_candidates as reconstruct_plane_candidates,

@@ -270,21 +270,27 @@ class TestResidualsAndMetrics:
         assert np.isnan(row["z_p"])
 
 
-class TestMahalPatch:
-    def test_mahal_cut_is_restored_after_evaluate(self, dataset):
-        """``evaluate`` patches ``optimize._MAHAL_CUT``; it must always restore it."""
+class TestMahalCut:
+    def test_mahal_cut_is_a_real_parameter_not_a_global_patch(self, dataset):
+        """``evaluate`` passes ``mahal_cut`` through; it never mutates the global.
+
+        ``mahal_cut`` used to be applied by monkeypatching
+        ``optimize._MAHAL_CUT`` around the fits.  It is now a keyword argument
+        of :func:`~monrad.pose.fit_probe_pose`, so two ``evaluate`` calls over
+        the *same* cache must disagree on the inlier count while the module
+        global stays untouched.
+        """
         from monrad.pose import optimize as pose_optimize
 
         _tel, _prb, alignment, cache = dataset
         before = pose_optimize._MAHAL_CUT
-        scan.evaluate(
-            cache,
-            chi2_track=4.0,
-            min_anchor_planes=1,
-            mahal_cut=2.0,
-            alignment=alignment,
-        )
+        kw = dict(chi2_track=4.0, min_anchor_planes=1, alignment=alignment)
+        tight = scan.evaluate(cache, mahal_cut=3.0, **kw)
+        loose = scan.evaluate(cache, mahal_cut=4.0, **kw)
+        assert tight["fit"] == loose["fit"] == "ok"
+        assert tight["n_inliers"] != loose["n_inliers"]
         assert pose_optimize._MAHAL_CUT == before
+
         with pytest.raises(ValueError):
             scan.evaluate(
                 cache,
