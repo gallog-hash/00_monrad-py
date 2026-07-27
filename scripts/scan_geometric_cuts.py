@@ -15,10 +15,13 @@ the cuts this script scans:
 Two tiers, because a dense grid of full decodes is unaffordable:
 
 **Tier A (decode)** streams stage 1->2->3 once per
-``(tot_thresh, tot_weights, max_cluster_width)`` config at the *loosest*
+``(tot_thresh, tot_weights, max_cluster_width, max_per_plane,
+coincidence_window_ns)`` config at the *loosest*
 ``chi2_track``/``min_anchor_planes``, caching one record per stage-2 cluster to
-an ``.npz``.  Those three parameters are the only ones that change candidate
-enumeration.
+an ``.npz``.  Those are the parameters that change *which* clusters and
+candidates exist, so each value costs its own decode pass -- only
+``max_cluster_width`` is repeatable in one invocation; the other two are
+scalars and a scan means separate runs whose caches you compare.
 
 **Tier B (replay)** reproduces any *tighter* ``(chi2_track,
 min_anchor_planes)`` and any post-fit gate combination exactly from that cache,
@@ -65,7 +68,7 @@ sys.path.insert(0, str(_HERE.parent / "src"))
 sys.path.insert(0, str(_HERE))  # so `import scan_plots` works from any cwd
 
 from monrad.alignment import AlignmentCorrection, load_alignment  # noqa: E402
-from monrad.coincidence import coincidence_stream  # noqa: E402
+from monrad.coincidence import WINDOW_NS_DEFAULT, coincidence_stream  # noqa: E402
 from monrad.decoders.position import POS_HALF_BITS  # noqa: E402
 from monrad.monitor import cli_args as ca  # noqa: E402
 from monrad.monitor.io import (  # noqa: E402
@@ -88,9 +91,11 @@ from monrad.pose import (  # noqa: E402
     filter_rigidity,
     fit_probe_pose,
 )
-from monrad.pose import optimize as pose_optimize  # noqa: E402
 from monrad.pose.optimize import tel_align_arrays  # noqa: E402
-from monrad.reconstruction import GOOD_QUALITIES  # noqa: E402
+from monrad.reconstruction import (  # noqa: E402
+    MAX_PER_PLANE_DEFAULT,
+    GOOD_QUALITIES,
+)
 from monrad.timing import reconstruct_stream  # noqa: E402
 
 STRIP_MM = 10.0  # mm per channel strip -- DESIGN.md §6.5
@@ -381,7 +386,8 @@ def decode_pass(
     max_cluster_width: int | None = None,
     fibers_per_ribbon: int = POS_HALF_BITS,
     min_anchor_planes: int = 0,
-    window_ns: int = 200,
+    max_per_plane: int = MAX_PER_PLANE_DEFAULT,
+    window_ns: int = WINDOW_NS_DEFAULT,
     file_range: tuple[int, int] | None = None,
     verify_window: bool = True,
     log_every: int = 0,
@@ -435,6 +441,7 @@ def decode_pass(
         prb_fibers_per_ribbon=fibers_per_ribbon,
         chi2_track=DECODE_CHI2,
         max_cluster_width=max_cluster_width,
+        max_per_plane=max_per_plane,
     )
     reports: list = []
     fitter.on_decode = reports.append
@@ -450,6 +457,7 @@ def decode_pass(
             "tot_thresh": tot_thresh,
             "tot_weights": bool(tot_weights),
             "max_cluster_width": max_cluster_width,
+            "max_per_plane": max_per_plane,
             "fibers_per_ribbon": fibers_per_ribbon,
             "min_anchor_planes": min_anchor_planes,
             "chi2_track": None,  # inf -- JSON has no infinity literal
@@ -789,9 +797,8 @@ def evaluate_with_pose(
     unfiltered fit's ``z_p``), then off-probe (anchored on a fit of the
     rigidity-gated set), then the pose fit itself.
 
-    ``mahal_cut`` has no CLI flag in the pipeline (``optimize._MAHAL_CUT`` is a
-    module global read inside ``fit_probe_pose``), so it is patched around the
-    fits here rather than by editing source.
+    ``mahal_cut`` is passed straight to every ``fit_probe_pose`` call below,
+    matching the pipeline's own ``--mahal-cut`` flag; nothing is monkeypatched.
     """
     rep = replay(
         cache,
@@ -821,41 +828,36 @@ def evaluate_with_pose(
     n_off_probe_dropped = 0
     rigidity_fallback = off_probe_fallback = False
 
-    prev_mahal = pose_optimize._MAHAL_CUT
-    pose_optimize._MAHAL_CUT = float(mahal_cut)
-    try:
-        if max_rigidity_resid_mm is not None and len(coincs) >= 3:
-            z_ref = fit_probe_pose(coincs, z_corr, alignment).z_p
-            kept, dropped = filter_rigidity(coincs, z_ref, max_rigidity_resid_mm)
-            if len(kept) >= 3:
-                n_rigidity_dropped = len(dropped)
-                coincs = kept
-            else:
-                rigidity_fallback = True
-        if max_off_probe_mm is not None and len(coincs) >= 3:
-            ref_pose = fit_probe_pose(coincs, z_corr, alignment)
-            kept, dropped = filter_off_probe(
-                coincs, ref_pose, probe_size_mm, max_off_probe_mm
-            )
-            if len(kept) >= 3:
-                n_off_probe_dropped = len(dropped)
-                coincs = kept
-            else:
-                off_probe_fallback = True
-
-        pose = (
-            fit_probe_pose(coincs, z_corr, alignment)
-            if len(coincs) >= min_fit
-            else None
+    if max_rigidity_resid_mm is not None and len(coincs) >= 3:
+        z_ref = fit_probe_pose(coincs, z_corr, alignment, mahal_cut=mahal_cut).z_p
+        kept, dropped = filter_rigidity(coincs, z_ref, max_rigidity_resid_mm)
+        if len(kept) >= 3:
+            n_rigidity_dropped = len(dropped)
+            coincs = kept
+        else:
+            rigidity_fallback = True
+    if max_off_probe_mm is not None and len(coincs) >= 3:
+        ref_pose = fit_probe_pose(coincs, z_corr, alignment, mahal_cut=mahal_cut)
+        kept, dropped = filter_off_probe(
+            coincs, ref_pose, probe_size_mm, max_off_probe_mm
         )
-        # Purity is judged on the *ungated* accepted set: --max-off-probe-mm
-        # empties the pedestal annulus by construction, which would report a
-        # spurious ~100% purity for exactly the configurations it is applied to.
-        purity_pose = pose
-        if pose is not None and max_off_probe_mm is not None and len(original) >= 3:
-            purity_pose = fit_probe_pose(original, z_corr, alignment)
-    finally:
-        pose_optimize._MAHAL_CUT = prev_mahal
+        if len(kept) >= 3:
+            n_off_probe_dropped = len(dropped)
+            coincs = kept
+        else:
+            off_probe_fallback = True
+
+    pose = (
+        fit_probe_pose(coincs, z_corr, alignment, mahal_cut=mahal_cut)
+        if len(coincs) >= min_fit
+        else None
+    )
+    # Purity is judged on the *ungated* accepted set: --max-off-probe-mm
+    # empties the pedestal annulus by construction, which would report a
+    # spurious ~100% purity for exactly the configurations it is applied to.
+    purity_pose = pose
+    if pose is not None and max_off_probe_mm is not None and len(original) >= 3:
+        purity_pose = fit_probe_pose(original, z_corr, alignment, mahal_cut=mahal_cut)
 
     row.update(
         {
@@ -1357,6 +1359,26 @@ def build_parser() -> argparse.ArgumentParser:
         "enumeration, so it cannot be replayed). Omit for no cap.",
     )
     p.add_argument(
+        "--max-per-plane",
+        type=int,
+        default=MAX_PER_PLANE_DEFAULT,
+        metavar="N",
+        help=f"Cap on telescope candidates enumerated per plane before the "
+        f"triple search (default: {MAX_PER_PLANE_DEFAULT}). NOT a grid axis: "
+        f"it changes the decode itself (which triple wins), so scanning it "
+        f"means re-running --stage decode per value and comparing caches -- "
+        f"unlike --mahal-grid, which replays over one cache.",
+    )
+    p.add_argument(
+        "--coincidence-window-ns",
+        type=int,
+        default=WINDOW_NS_DEFAULT,
+        metavar="NS",
+        help=f"Stage-2 coincidence window (default: {WINDOW_NS_DEFAULT} ns). "
+        f"NOT a grid axis: it changes which clusters exist at all, so scanning "
+        f"it means re-running --stage decode per value and comparing caches.",
+    )
+    p.add_argument(
         "--decode-anchor",
         type=int,
         default=1,
@@ -1440,6 +1462,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ca.validate_fibers_per_ribbon([args.fibers_per_ribbon])
         ca.validate_min_fit(args.min_fit)
+        ca.validate_max_per_plane(args.max_per_plane)
+        ca.validate_coincidence_window_ns(args.coincidence_window_ns)
         validate_probe_footprint(args.n_probe_ch, args.fibers_per_ribbon)
     except ValueError as exc:
         parser.error(str(exc))
@@ -1500,6 +1524,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_cluster_width=w,
                 fibers_per_ribbon=args.fibers_per_ribbon,
                 min_anchor_planes=args.decode_anchor,
+                max_per_plane=args.max_per_plane,
+                window_ns=args.coincidence_window_ns,
                 file_range=file_range,
                 verify_window=not args.no_window_check,
                 log_every=args.log_every,

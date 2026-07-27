@@ -15,13 +15,13 @@ from ..timing import TimedEvent, PosRef
 
 log = logging.getLogger(__name__)
 
-_WINDOW_NS_DEFAULT = 200  # ns — see DESIGN.md §4
+WINDOW_NS_DEFAULT = 200  # ns — see DESIGN.md §4
 
 
 def coincidence_stream(
     streams: list[Iterator[tuple[TimedEvent, PosRef]]],
     detector_ids: list[int],
-    window_ns: int = _WINDOW_NS_DEFAULT,
+    window_ns: int = WINDOW_NS_DEFAULT,
 ) -> Iterator[list[tuple[int, TimedEvent, PosRef]]]:
     """
     k-way min-heap merge over n+1 stage-1 generators.

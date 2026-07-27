@@ -344,6 +344,8 @@ def fit_probe_pose(
     coincidences: list[Coincidence],
     tel_z: np.ndarray,
     alignment: AlignmentCorrection,
+    *,
+    mahal_cut: float = _MAHAL_CUT,
 ) -> PoseResult:
     """
     Four-step probe pose optimizer.  Implements DESIGN.md §8.4.
@@ -354,7 +356,7 @@ def fit_probe_pose(
     Step 4 — Levenberg-Marquardt polish on all four parameters,
               with full σ²(z_p) weights.
 
-    After step 4: Mahalanobis outlier cut at d > 4, one-pass refit.
+    After step 4: Mahalanobis outlier cut at d > mahal_cut, one-pass refit.
 
     Parameters
     ----------
@@ -362,6 +364,12 @@ def fit_probe_pose(
     tel_z        : telescope plane z-coordinates (mm), shape (3,)
     alignment    : applied before building coincidences in PoseFitter;
                    carried here for API completeness
+    mahal_cut    : Mahalanobis distance above which a coincidence is treated
+                   as an outlier (default 4.0, DESIGN.md §8.4).  This is a
+                   2-dof radial distance in the probe-vs-track residual plane,
+                   independent of PoseFitter's telescope line-fit chi2_track:
+                   a coherent wrong-fold pick lies *on* the fitted line and so
+                   contributes ~0 to chi2_track while still being cut here.
     """
     coincs = coincidences
     if len(coincs) < 3:
@@ -430,7 +438,7 @@ def fit_probe_pose(
             (x_meas - x_pred) ** 2 / var_x + (y_meas - y_pred) ** 2 / var_y
         )
 
-    mask = maha <= _MAHAL_CUT
+    mask = maha <= mahal_cut
     inliers = [co for co, m in zip(coincs, mask) if m]
     outliers = [co for co, m in zip(coincs, mask) if not m]
     if len(inliers) < 3:

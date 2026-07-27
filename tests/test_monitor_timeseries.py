@@ -905,3 +905,94 @@ def test_csv_has_alignment_label_column(align_synth, tmp_path):
     assert len(lines) == len(results) + 1
     for line in lines[1:]:
         assert line.split(",")[col] != ""
+
+
+# ── CLI: --mahal-cut / --max-per-plane / --coincidence-window-ns ────────────
+
+_BASE_ARGV = ["--telescope", "unused", "--probe", "unused", "--z-tel", "0"]
+
+
+def test_cli_new_cut_flags_parse():
+    args, explicit = _parse_args(
+        _BASE_ARGV
+        + [
+            "--mahal-cut",
+            "3.0",
+            "--max-per-plane",
+            "64",
+            "--coincidence-window-ns",
+            "100",
+        ]
+    )
+    assert args.mahal_cut == 3.0
+    assert args.max_per_plane == 64
+    assert args.coincidence_window_ns == 100
+    assert {"mahal_cut", "max_per_plane", "coincidence_window_ns"} <= explicit
+
+
+def test_cli_new_cut_flags_default_to_none():
+    """``None`` means "keep the built-in", so a plain run is unchanged."""
+    args, explicit = _parse_args(_BASE_ARGV)
+    assert args.mahal_cut is None
+    assert args.max_per_plane is None
+    assert args.coincidence_window_ns is None
+    assert not {"mahal_cut", "max_per_plane", "coincidence_window_ns"} & explicit
+
+
+@pytest.mark.parametrize(
+    "flag,bad",
+    [
+        ("--mahal-cut", "0"),
+        ("--mahal-cut", "-1"),
+        ("--max-per-plane", "0"),
+        ("--max-per-plane", "-3"),
+        ("--coincidence-window-ns", "0"),
+        ("--coincidence-window-ns", "-200"),
+    ],
+)
+def test_cli_new_cut_flags_reject_out_of_range(flag, bad):
+    with pytest.raises(SystemExit):
+        _parse_args(_BASE_ARGV + [flag, bad])
+
+
+def test_cli_values_reach_the_fitter_and_the_accumulator(monkeypatch, count_run):
+    """The parsed values must arrive at PoseFitter / _WindowAccumulator.
+
+    Captures the two constructors ``monitor_probe`` drives, so a flag wired
+    to the parser but never threaded down is caught.
+    """
+    from monrad.monitor import io as monitor_io
+    from monrad.monitor import timeseries as ts
+
+    seen: dict = {}
+
+    real_fitter = monitor_io.PoseFitter
+    real_acc = ts._WindowAccumulator
+
+    def _fitter(*a, **kw):
+        seen["fitter"] = kw
+        return real_fitter(*a, **kw)
+
+    def _acc(*a, **kw):
+        seen["acc"] = kw
+        return real_acc(*a, **kw)
+
+    monkeypatch.setattr(monitor_io, "PoseFitter", _fitter)
+    monkeypatch.setattr(ts, "_WindowAccumulator", _acc)
+    monkeypatch.setattr(monitor_io, "coincidence_stream", lambda *a, **kw: iter(()))
+
+    _, _, info = count_run
+    ts.monitor_probe(
+        info["tel_dir"],
+        info["probe_dir"],
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=40,
+        make_plots=False,
+        mahal_cut=3.0,
+        max_per_plane=64,
+        coincidence_window_ns=100,
+        alignment_path=None,
+    )
+    assert seen["fitter"]["mahal_cut"] == 3.0
+    assert seen["fitter"]["max_per_plane"] == 64
+    assert seen["acc"]["mahal_cut"] == 3.0

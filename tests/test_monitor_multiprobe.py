@@ -522,3 +522,123 @@ def test_multiprobe_alignment_label_reflects_switch(multiprobe_run, tmp_path):
         for r in probe_results:
             assert set(r.alignment_label.split(",")) <= {label0, label1}
         assert any(label1 in r.alignment_label.split(",") for r in probe_results)
+
+
+# ── CLI: --mahal-cut / --max-per-plane / --coincidence-window-ns ────────────
+
+_BASE_ARGV = [
+    "--telescope",
+    "unused",
+    "--probe",
+    "unused1",
+    "--probe",
+    "unused2",
+    "--z-tel",
+    "0",
+    "400",
+    "800",
+]
+
+
+def test_cli_new_cut_flags_parse():
+    args, explicit = _parse_args(
+        _BASE_ARGV
+        + [
+            "--mahal-cut",
+            "3.0",
+            "--max-per-plane",
+            "64",
+            "--coincidence-window-ns",
+            "100",
+        ]
+    )
+    assert args.mahal_cut == 3.0
+    assert args.max_per_plane == 64
+    assert args.coincidence_window_ns == 100
+    assert {"mahal_cut", "max_per_plane", "coincidence_window_ns"} <= explicit
+
+
+def test_cli_new_cut_flags_default_to_none():
+    args, explicit = _parse_args(_BASE_ARGV)
+    assert args.mahal_cut is None
+    assert args.max_per_plane is None
+    assert args.coincidence_window_ns is None
+    assert not {"mahal_cut", "max_per_plane", "coincidence_window_ns"} & explicit
+
+
+@pytest.mark.parametrize(
+    "flag,bad",
+    [
+        ("--mahal-cut", "0"),
+        ("--max-per-plane", "0"),
+        ("--coincidence-window-ns", "0"),
+    ],
+)
+def test_cli_new_cut_flags_reject_out_of_range(flag, bad):
+    with pytest.raises(SystemExit):
+        _parse_args(_BASE_ARGV + [flag, bad])
+
+
+def test_values_reach_every_fitter_and_accumulator(monkeypatch, multiprobe_run):
+    """Both shared cuts reach every probe's PoseFitter / _WindowAccumulator.
+
+    ``max_per_plane`` is telescope-side (it is also asserted equal across
+    fitters, since the telescope search is run once and shared);
+    ``mahal_cut`` is probe-side and additionally reaches each accumulator.
+    """
+    from monrad.monitor import multiprobe as mp
+
+    _all, _out, info1, info2 = multiprobe_run
+    fitters: list = []
+    accs: list = []
+
+    real_fitter = mp.PoseFitter
+    real_acc = mp._WindowAccumulator
+
+    def _fitter(*a, **kw):
+        fitters.append(kw)
+        return real_fitter(*a, **kw)
+
+    def _acc(*a, **kw):
+        accs.append(kw)
+        return real_acc(*a, **kw)
+
+    monkeypatch.setattr(mp, "PoseFitter", _fitter)
+    monkeypatch.setattr(mp, "_WindowAccumulator", _acc)
+    monkeypatch.setattr(mp, "build_cluster_stream", lambda *a, **kw: iter(()))
+
+    monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=[30, 40],
+        make_plots=False,
+        mahal_cut=3.0,
+        max_per_plane=64,
+    )
+    assert len(fitters) == len(accs) == 2
+    assert all(kw["mahal_cut"] == 3.0 for kw in fitters)
+    assert all(kw["max_per_plane"] == 64 for kw in fitters)
+    assert all(kw["mahal_cut"] == 3.0 for kw in accs)
+
+
+def test_coincidence_window_ns_reaches_the_cluster_stream(monkeypatch, multiprobe_run):
+    from monrad.monitor import multiprobe as mp
+
+    _all, _out, info1, info2 = multiprobe_run
+    seen: list = []
+
+    def _stream(tel, probes, *, window_ns):
+        seen.append(window_ns)
+        return iter(())
+
+    monkeypatch.setattr(mp, "build_cluster_stream", _stream)
+    monitor_probes(
+        info1["tel_dir"],
+        [info1["probe_dir"], info2["probe_dir"]],
+        z_tel=np.array(Z_TEL, dtype=float),
+        n_probe_ch=[30, 40],
+        make_plots=False,
+        coincidence_window_ns=137,
+    )
+    assert seen == [137]

@@ -39,12 +39,17 @@ from pathlib import Path
 import numpy as np
 
 from ..alignment import load_alignment
+from ..coincidence import WINDOW_NS_DEFAULT
 from ..pose import PoseFitter
+from ..reconstruction import MAX_PER_PLANE_DEFAULT
 from .cli_args import (
     MacroArgumentParser,
     add_alignment_arg,
     add_chi2_track_args,
+    add_coincidence_window_ns_arg,
+    add_mahal_cut_arg,
     add_max_off_probe_mm_arg,
+    add_max_per_plane_arg,
     add_max_pose_jump_deg_arg,
     add_max_pose_jump_mm_arg,
     add_max_rigidity_resid_mm_arg,
@@ -58,7 +63,10 @@ from .cli_args import (
     add_window_s_arg,
     add_z_tel_arg,
     validate_chi2_track_args,
+    validate_coincidence_window_ns,
     validate_fibers_per_ribbon,
+    validate_mahal_cut,
+    validate_max_per_plane,
     validate_min_fit,
 )
 from .io import (
@@ -124,6 +132,9 @@ def monitor_probes(
     make_plots: bool = True,
     chi2_track: float | None = None,
     max_cluster_width: int | None = None,
+    mahal_cut: float | None = None,
+    max_per_plane: int = MAX_PER_PLANE_DEFAULT,
+    coincidence_window_ns: int = WINDOW_NS_DEFAULT,
 ) -> list[list[WindowResult]]:
     """Stream one acquisition and fit N probes' poses independently.
 
@@ -152,11 +163,17 @@ def monitor_probes(
         ``monrad-align``.  When given, load it and skip the in-run alignment
         fit (the saved ``z_tel`` must match this run's).  ``None`` (the
         default) fits the alignment from this acquisition.
-    chi2_track, max_cluster_width:
+    chi2_track, max_cluster_width, mahal_cut, max_per_plane:
         Shared cuts (not per-probe) forwarded straight to every probe's
         :class:`~monrad.pose.PoseFitter`, exactly as in
         :func:`~monrad.monitor.timeseries.monitor_probe`. ``None`` keeps
-        that fitter's own defaults (4.0 / off).
+        that fitter's own defaults (4.0 / off / ``fit_probe_pose``'s d > 4).
+        ``mahal_cut`` additionally reaches each probe's ``_WindowAccumulator``
+        fits.
+    coincidence_window_ns:
+        The stage-2 hardware coincidence window (DESIGN.md §5), shared by the
+        single merged cluster stream.  Distinct from ``window_s``, the
+        *monitoring* window each probe's accumulator fits a pose over.
     Other parameters mirror :func:`~monrad.monitor.timeseries.monitor_probe`
     and apply identically to every probe's independent accumulator.
     """
@@ -216,6 +233,8 @@ def monitor_probes(
             prb_fibers_per_ribbon=fibers_per_ribbon[k],
             chi2_track=chi2_track,
             max_cluster_width=max_cluster_width,
+            mahal_cut=mahal_cut,
+            max_per_plane=max_per_plane,
         )
         for k in range(len(probes))
     ]
@@ -233,6 +252,11 @@ def monitor_probes(
     assert all(f.min_anchor_planes == fitters[0].min_anchor_planes for f in fitters)
     assert all(f.chi2_track == fitters[0].chi2_track for f in fitters)
     assert all(f.max_cluster_width == fitters[0].max_cluster_width for f in fitters)
+    # max_per_plane is telescope-side (it caps reconstruct_plane_candidates in
+    # the shared search), so it must match too.  mahal_cut is probe-side --
+    # it only reaches each probe's own pose fit -- and is deliberately not
+    # asserted here.
+    assert all(f.max_per_plane == fitters[0].max_per_plane for f in fitters)
     accumulators = [
         _WindowAccumulator(
             z_corr=z_corr,
@@ -245,13 +269,14 @@ def monitor_probes(
             max_off_probe_mm=max_off_probe_mm,
             max_pose_jump_mm=max_pose_jump_mm,
             max_pose_jump_deg=max_pose_jump_deg,
+            mahal_cut=mahal_cut,
             label=f"probe{k + 1}",
         )
         for k in range(len(probes))
     ]
 
     label = static_alignment_label(alignment_path)
-    for cluster in build_cluster_stream(tel, probes):
+    for cluster in build_cluster_stream(tel, probes, window_ns=coincidence_window_ns):
         if schedule is not None:
             t_ns = _cluster_tel_time(cluster, tel_id=0)
             if t_ns is not None:
@@ -369,6 +394,9 @@ def _build_parser() -> argparse.ArgumentParser:
     add_alignment_arg(p)
     add_out_arg(p, default=Path("./pipeline_out/multiprobe"))
     add_chi2_track_args(p, shared_across_probes=True)
+    add_mahal_cut_arg(p, shared_across_probes=True)
+    add_max_per_plane_arg(p, shared_across_probes=True)
+    add_coincidence_window_ns_arg(p)
     add_tot_thresh_arg(p)
     add_tot_weights_arg(p)
     add_no_plots_arg(p)
@@ -387,6 +415,9 @@ def _parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, set[
         )
         validate_fibers_per_ribbon(args.fibers_per_ribbon)
         validate_chi2_track_args(args)
+        validate_mahal_cut(args.mahal_cut)
+        validate_max_per_plane(args.max_per_plane)
+        validate_coincidence_window_ns(args.coincidence_window_ns)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -456,6 +487,15 @@ def main(argv: list[str] | None = None) -> None:
         args.max_cluster_width,
         _tag("max_cluster_width"),
     )
+    logger.info("  mahal_cut:           %s  %s", args.mahal_cut, _tag("mahal_cut"))
+    logger.info(
+        "  max_per_plane:       %s  %s", args.max_per_plane, _tag("max_per_plane")
+    )
+    logger.info(
+        "  coincidence_window_ns: %s  %s",
+        args.coincidence_window_ns,
+        _tag("coincidence_window_ns"),
+    )
     logger.info("  no_plots:            %s  %s", args.no_plots, _tag("no_plots"))
 
     all_results = monitor_probes(
@@ -478,6 +518,15 @@ def main(argv: list[str] | None = None) -> None:
         make_plots=not args.no_plots,
         chi2_track=args.chi2_track,
         max_cluster_width=args.max_cluster_width,
+        mahal_cut=args.mahal_cut,
+        max_per_plane=(
+            MAX_PER_PLANE_DEFAULT if args.max_per_plane is None else args.max_per_plane
+        ),
+        coincidence_window_ns=(
+            WINDOW_NS_DEFAULT
+            if args.coincidence_window_ns is None
+            else args.coincidence_window_ns
+        ),
     )
     for k, results in enumerate(all_results):
         print(f"Probe {k + 1}: fitted {len(results)} window(s).")
