@@ -17,6 +17,13 @@ uv run pytest
 pytest tests/test_foo.py
 pytest tests/test_foo.py::test_bar
 
+# Inspect a header. Run-aware: one acquisition run may write several
+# *_headerNNN.txt files sharing a yyyyMMdd_hhmmss stem, and the [GPS] UBX
+# frame may be complete in _header000, split across two of them, or alone in
+# a higher-numbered sibling. Pass ANY one file of the run — the siblings are
+# merged and the frame reassembled. Same for load_header_params().
+monrad-decode-header data/.../20260910_094906_header000.txt
+
 # Inspect a GPS timing file
 monrad-decode-gps data/.../20230418_192121_GPS.bin
 monrad-decode-gps data/.../20230418_192121_GPS.bin --csv out.csv
@@ -77,7 +84,10 @@ Astral's recommended usage.
 src/monrad/                 # each stage is a domain package; its public API is
                             # re-exported from the package __init__.py
     decoders/        # low-level format readers
-        header.py    # parse_header() + decode_ubx_tm2()
+        header.py    # parse_header() (one file) + find_header_files()/
+                     # parse_header_group() (a whole acquisition run, whose
+                     # GPS frame may be split across *_headerNNN.txt siblings)
+                     # + decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder  — reads *.bin, reconstructs hits
     timing/          # stage 1: reconstruct_stream(), load_header_params(), find_file_pairs()

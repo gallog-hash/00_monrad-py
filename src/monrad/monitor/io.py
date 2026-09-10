@@ -59,7 +59,10 @@ def load_detector(d: Path) -> DetectorFiles:
     library counterpart of the ``sys.exit`` guards in ``run_pipeline.py``.
     """
     d = Path(d)
-    headers = list(d.glob("*_header*.txt"))
+    # Sorted so the earliest acquisition run wins deterministically when the
+    # directory holds several: a run may write more than one _header<NNN>.txt,
+    # and load_header_params merges the rest of the group itself.
+    headers = sorted(d.glob("*_header*.txt"))
     if not headers:
         raise FileNotFoundError(f"no *_header.txt found in {d}")
     utc0, f0 = load_header_params(headers[0])

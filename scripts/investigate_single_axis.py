@@ -39,7 +39,7 @@ PRB_DIR = Path("data/0_testLab_20210723/Probe_0")
 
 
 def _load(d: Path) -> tuple[datetime, int, list[Path], list[Path]]:
-    headers = list(d.glob("*_header*.txt"))
+    headers = sorted(d.glob("*_header*.txt"))
     utc0, f0 = load_header_params(headers[0])
     gps, pos = find_file_pairs(d)
     return utc0, f0, gps, pos

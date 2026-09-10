@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from ..decoders.gps import GPSDecoder, unpack_gps_word
-from ..decoders.header import parse_header, decode_ubx_tm2
+from ..decoders.header import decode_ubx_tm2, find_header_files, parse_header_group
 from ..decoders.position import unpack_position_word
 
 log = logging.getLogger(__name__)
@@ -243,8 +243,14 @@ def load_header_params(
 
     f0 is the nominal clock frequency in Hz.  Falls back to
     F0_DEFAULT (100 MHz) when the header has no explicit field.
+
+    ``header_path`` names any one file of an acquisition run; every
+    ``<stem>_header<NNN>.txt`` sibling is merged, because the DAQ may split
+    the GPS string across two of them or park it in a higher-numbered file
+    on its own.
     """
-    modules = parse_header(str(header_path))
+    header_files = find_header_files(header_path)
+    modules = parse_header_group(header_files)
 
     # Real hardware headers carry no clock frequency field; F0_DEFAULT is
     # always the live fallback.  The key-search below exists solely to read
@@ -265,7 +271,10 @@ def load_header_params(
             gps_bytes = val
             break
     if gps_bytes is None:
-        raise ValueError(f"No GPS_String found in {header_path}")
+        inspected = ", ".join(p.name for p in header_files)
+        raise ValueError(
+            f"No GPS_String found in {header_files[0].parent} ({inspected})"
+        )
     tm2 = decode_ubx_tm2(gps_bytes)
     utc0_raw: datetime = tm2["timeR"]
     # The header's TIMEPULSE is a 100 Hz calibration pulse, not a 1 Hz PPS.

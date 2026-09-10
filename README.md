@@ -27,20 +27,41 @@ An acquisition produces one directory per detector, each containing:
 
 | File | Description |
 |---|---|
-| `*_header.txt` | INI-style config: clock frequency, GPS UBX-TIM-TM2 anchor |
+| `yyyyMMdd_hhmmss_headerNNN.txt` | INI-style config: clock frequency, GPS UBX-TIM-TM2 anchor. One run may write **several** of these (see below) |
 | `yyyyMMdd_hhmmss_GPS.bin` | Timing stream — 64-bit records (52-bit clock, 11-bit GEN, 1-bit FLAG) |
 | `yyyyMMdd_hhmmss.bin` | Position stream — rows of 64-bit words (20-bit X, 20-bit Y, 11-bit GEN), grouped in blocks of 16 |
 
 Files are written in 5-minute chunks; the pipeline stitches them into one logical stream per detector.
+
+### Header files come in groups
+
+An acquisition run writes one *or more* header files sharing its
+`yyyyMMdd_hhmmss` stem, numbered `_headerNNN.txt` in write order (the numbering
+is not contiguous — `000` + `030` occurs). The DAQ cuts its capture buffer
+wherever the GPS receiver delivered, so the `[GPS]` UBX frame may be complete in
+`_header000.txt`, **split across** two files that each repeat their own `[GPS]`
+/ `GPS_String_00 = "…"` prefix, or absent from `_header000.txt` and alone in a
+higher-numbered sibling.
+
+Use the run-aware entry points and this is handled for you — they reassemble the
+frame regardless of where the cut fell or how many files it spans:
+
+- `load_header_params(path)` — pass **any one file** of a run.
+- `parse_header_run(path)` / `find_header_files(path)` + `parse_header_group(paths)`.
+
+`parse_header(path)` remains single-file and pure, so it will hand back a
+partial frame (or no `[GPS]` at all) when the run is split. See `DESIGN.md` §2.1.
 
 ## Quick usage
 
 ### Inspect raw files
 
 ```python
-from monrad.decoders.header import parse_header, decode_ubx_tm2
+from monrad.decoders.header import parse_header_run, decode_ubx_tm2
 
-modules = parse_header("20230418_191621_header.txt")
+# parse_header_run() merges every *_headerNNN.txt of the run and reassembles a
+# GPS frame the DAQ may have split across them.  Pass any one file of the run.
+modules = parse_header_run("20260910_094906_header000.txt")
 # GPS string keys are named GPS_String_00, GPS_String_01, …
 gps_bytes = next(v for k, v in modules["GPS"].items()
                  if k.startswith("GPS_String"))
@@ -50,7 +71,8 @@ print(gps_frame["accEst"])  # timing accuracy estimate in ns
 ```
 
 ```bash
-monrad-decode-header data/.../20230418_191621_header.txt
+# Also run-aware: prints which files were merged when a run spans several.
+monrad-decode-header data/.../20260910_094906_header000.txt
 
 monrad-decode-gps data/.../20230418_192121_GPS.bin
 monrad-decode-gps data/.../20230418_192121_GPS.bin --csv out.csv
@@ -86,9 +108,12 @@ from monrad.pose import PoseFitter
 tel_dir = Path("data/telescope")
 prb_dir = Path("data/probe")
 
-# Header files may carry a numeric suffix (e.g. *_header000.txt).
-tel_utc0, tel_f0 = load_header_params(next(tel_dir.glob("*_header*.txt")))
-prb_utc0, prb_f0 = load_header_params(next(prb_dir.glob("*_header*.txt")))
+# A run's header may span several *_headerNNN.txt files; load_header_params
+# merges the group itself, so pass any one of them.  sorted() rather than
+# next(glob(...)) so the earliest run wins deterministically when a directory
+# holds more than one — utc0 must anchor the first PPS of the stream.
+tel_utc0, tel_f0 = load_header_params(sorted(tel_dir.glob("*_header*.txt"))[0])
+prb_utc0, prb_f0 = load_header_params(sorted(prb_dir.glob("*_header*.txt"))[0])
 tel_gps, tel_pos = find_file_pairs(tel_dir)
 prb_gps, prb_pos = find_file_pairs(prb_dir)
 
@@ -252,7 +277,8 @@ Each stage is a domain package whose public API is re-exported from its
 ```
 src/monrad/
     decoders/         # low-level format readers
-        header.py     # header.txt parser and UBX-TIM-TM2 decoder
+        header.py     # header.txt parser (single file + whole run) and
+                      # UBX-TIM-TM2 decoder/reassembler
         gps.py        # *_GPS.bin reader (clock ticks, GEN, FLAG)
         position.py   # *.bin reader, OR-fold, hit reconstruction
     timing/           # stage 1: time reconstruction → reconstruct_stream()

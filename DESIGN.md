@@ -45,7 +45,8 @@ respect to the telescope's; recovering that orientation is the goal of stage 5.
 
 Each detector has its own management system, its own GPS receiver, and its
 own data acquisition. Acquisition starts independently per detector. Once
-running, the system writes one `*_header.txt` once at start, then
+running, the system writes the run's header once at start (as one or more
+`yyyyMMdd_hhmmss_headerNNN.txt` files — see §2.1), then
 every five minutes saves a pair of files — `yyyyMMdd_hhmmss.bin` (positions)
 and `yyyyMMdd_hhmmss_GPS.bin` (timing) — until acquisition stops. The 5-minute
 file boundaries do not align across detectors.
@@ -62,11 +63,63 @@ A small INI-like text file with bracketed module sections (`[J11]`, `[GPS]`,
 …) and `key=value` entries. The only field the pipeline needs is:
 
 - The **GPS string** in the `[GPS]` section, written as latin-1 with `\XX` hex
-  escapes for non-printable bytes. This is a UBX-TIM-TM2 binary frame from
-  the receiver, decoded by `decode_ubx_tm2()` in `decoders/header.py`. There is
-  exactly **one such GPS string per acquisition**, capturing the absolute UTC
-  time of one TIMEPULSE rising edge near the start of the run, plus an
-  accuracy estimate `accEst` (in ns). Typical `accEst` is 20–50 ns.
+  escapes (uppercase) and `\\` for a literal `0x5C`. This is a UBX-TIM-TM2
+  binary frame from the receiver, decoded by `decode_ubx_tm2()` in
+  `decoders/header.py`. There is at most **one such GPS string per
+  acquisition**, capturing the absolute UTC time of one TIMEPULSE rising edge
+  near the start of the run, plus an accuracy estimate `accEst` (in ns).
+  Typical `accEst` is 20–50 ns. A run can carry **no** GPS string at all
+  (observed in `01_data_2026`); `load_header_params()` raises rather than
+  borrowing a neighbouring run's anchor, which would silently corrupt stage-1
+  timing.
+
+  Which bytes get escaped differs between writers, so a parser must accept
+  both: real hardware escapes control bytes but writes `0x09` (tab) and every
+  byte `≥ 0x80` **raw**, whereas `monrad.synthetic.generate()` escapes
+  everything outside `0x20`–`0x7E`. `_decode_escaped_bytes()` handles either.
+  A consequence is that raw `0x09`/`0x20`/`0x22` bytes can sit at a value's
+  edges, so the line parser must not `strip()` inside a quoted value.
+
+**One acquisition run may span several header files.** They share the run's
+`yyyyMMdd_hhmmss` stem and are numbered `_headerNNN.txt` in write order; the
+numbering is not contiguous (`000` + `030` has been observed). The DAQ cuts its
+capture buffer wherever the GPS receiver happened to deliver, so the frame can
+be laid out three ways:
+
+1. complete in `_header000.txt` alongside the module sections;
+2. split across `_header000.txt` and `_header001.txt`, each carrying its own
+   `[GPS]` / `GPS_String_00 = "…"` prefix around its slice — the observed cuts
+   fall where a payload byte happens to be `0x0A`;
+3. absent from `_header000.txt` and alone in a higher-numbered sibling.
+
+`find_header_files()` collects a run's files in `NNN` order and
+`parse_header_group()` merges them, handing the per-key `GPS_String` chunks to
+`assemble_gps_frame()`. That helper returns a chunk that is already a complete,
+checksum-valid UBX frame if there is one, and otherwise joins the chunks in
+order and returns the first complete frame found *anywhere* in the buffer.
+`parse_header()` itself stays single-file and pure; `load_header_params()` is
+run-aware, so callers may pass any one file of a run.
+
+Nothing in this path is tuned to the two breakpoints that happen to occur in
+`01_data_2026`. The frame is self-delimiting (sync chars, length field,
+Fletcher-8 checksum), which is what lets the assembly terminate on evidence
+rather than on an assumed layout, so the reconstruction is independent of:
+
+- **where the cut fell** — any byte offset, including inside the sync chars,
+  the length field or the checksum;
+- **how many files it spans** — two, three, or one byte per file;
+- **where the frame sits in the buffer** — a leading chunk that is not part of
+  the frame does not defeat it, and trailing bytes past the frame are dropped.
+
+`tests/test_decoders_header.py::TestArbitraryBreakpoints` sweeps every 2-way
+breakpoint and a strided sample of the 3- and 4-way ones against a frame whose
+payload deliberately contains `0x09`/`0x0A`/`0x20`/`0x22`/`0x5C`, so each cut
+exercises the escaping and the line parser too, not just the assembly.
+
+The one thing the text layer cannot resolve is a chunk written **without** its
+closing quote whose last payload byte is `0x22` — that is indistinguishable
+from a properly terminated value. The DAQ always closes the quote, so this does
+not arise in practice.
 
 ### 2.2 `*_GPS.bin` — the timing stream
 
@@ -915,7 +968,9 @@ time; it is applied to telescope hits at the next refit.
 src/monrad/                  # each stage is a domain package; the public API
                              # listed below is re-exported from its __init__.py
     decoders/
-        header.py    # parse_header(), decode_ubx_tm2()
+        header.py    # parse_header(), find_header_files(),
+                     # parse_header_group()/parse_header_run(),
+                     # assemble_gps_frame(), decode_ubx_tm2()
         gps.py       # GPSDecoder — reads *_GPS.bin
         position.py  # BinDecoder — reads *.bin, reconstructs hits
     timing/          # stage 1
