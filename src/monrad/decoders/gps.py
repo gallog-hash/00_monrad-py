@@ -89,9 +89,22 @@ class GPSDecoder:
         print(f"Exported {n_rows} rows (CLK/GEN/FLAG) to {output_file}")
 
 
+def _print_usage():
+    print("Usage: monrad-decode-gps <gps_bin_file> [--csv [output.csv]]")
+    print(
+        "  --csv [output.csv]      export records as CSV instead of printing "
+        "the analysis\n"
+        "                          (default: <input>_decoded.csv)"
+    )
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python decode_gps.py <gps_bin_file> [--csv]")
+    argv = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in argv):
+        _print_usage()
+        sys.exit(0)
+    if not argv:
+        _print_usage()
         sys.exit(1)
 
     decoder = GPSDecoder(sys.argv[1])
