@@ -400,12 +400,26 @@ def print_header_info(modules: Dict[str, Dict[str, Any]]) -> None:
                 print(f"{key}: {value}")
 
 
+def _print_usage() -> None:
+    print("Usage: monrad-decode-header <header_file>")
+    print("Example: monrad-decode-header 20230418_191621_header.txt")
+    print()
+    print(
+        "One acquisition run may write several *_headerNNN.txt files sharing a\n"
+        "yyyyMMdd_hhmmss stem; pass any one of them and the siblings are merged\n"
+        "and the [GPS] UBX frame reassembled."
+    )
+
+
 def main() -> None:
     import sys
 
-    if len(sys.argv) < 2:
-        print("Usage: monrad-decode-header <header_file>")
-        print("Example: monrad-decode-header 20230418_191621_header.txt")
+    argv = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in argv):
+        _print_usage()
+        sys.exit(0)
+    if not argv:
+        _print_usage()
         sys.exit(1)
 
     group = find_header_files(sys.argv[1])

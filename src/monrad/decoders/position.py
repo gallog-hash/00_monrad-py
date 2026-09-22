@@ -398,20 +398,33 @@ class BinDecoder:
         print(f"Exported {n_rows} rows × {n_cols} u64s (Y/X/GEN) to {output_file}")
 
 
+def _print_usage():
+    print(
+        "Usage: monrad-decode-bin <bin_file> [--csv [output.csv]] "
+        "[--or [N]] [--fibers-per-ribbon N]"
+    )
+    print(
+        "  --csv [output.csv]      export rows as CSV instead of printing the "
+        "analysis\n"
+        "                          (default: <input>_decoded.csv)"
+    )
+    print(
+        "  --or [N]                bitwise-OR visual for each GEN group "
+        "(optionally limit to N groups)"
+    )
+    print(
+        "  --fibers-per-ribbon N   fiber x ribbon combine factor used to "
+        "reconstruct channel indices in --or output (default: 10)"
+    )
+
+
 def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python decode_bin.py <bin_file> [--csv [output.csv]] "
-            "[--or [N]] [--fibers-per-ribbon N]"
-        )
-        print(
-            "  --or [N]                bitwise-OR visual for each GEN group "
-            "(optionally limit to N groups)"
-        )
-        print(
-            "  --fibers-per-ribbon N   fiber x ribbon combine factor used to "
-            "reconstruct channel indices in --or output (default: 10)"
-        )
+    argv = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in argv):
+        _print_usage()
+        sys.exit(0)
+    if not argv:
+        _print_usage()
         sys.exit(1)
 
     bin_file = sys.argv[1]
