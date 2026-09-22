@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Editable install + dev tooling (run once, or after adding dependencies)
-# All dev deps (pytest, scipy, matplotlib, ruff) live in the `dev`
-# dependency-group, which uv installs by default.
+# All dev deps (pytest, scipy, matplotlib, plotly, ruff) live in the `dev`
+# dependency-group, which uv installs by default. numpy is the only runtime
+# dependency. Use `uv sync --frozen` to match CI exactly.
 uv sync
 
 # Run all tests
@@ -72,7 +73,14 @@ Astral's recommended usage.
 - Lint: `uv run ruff check .`
 - Lint and auto-fix: `uv run ruff check --fix .`
 - Format: `uv run ruff format .`
-- Configuration lives in `pyproject.toml` under `[tool.ruff]`.
+- There is **no Ruff configuration**: no `[tool.ruff]` section in
+  `pyproject.toml`, no `ruff.toml`/`.ruff.toml`. Ruff runs on its defaults,
+  and the tree is currently clean under them. Don't introduce a config
+  section as a side effect of some other change.
+- CI runs `ruff check .` and `ruff format --check .`; both must pass before a
+  PR can merge. `.pre-commit-config.yaml` runs the same two hooks, but
+  `pre-commit` is not in the `dev` group — it installs separately
+  (`uv tool install pre-commit && pre-commit install`).
 
 ## Architecture
 
@@ -84,7 +92,8 @@ Astral's recommended usage.
 src/monrad/                 # each stage is a domain package; its public API is
                             # re-exported from the package __init__.py
     decoders/        # low-level format readers
-        header.py    # parse_header() (one file) + find_header_files()/
+        header.py    # parse_header() (one file) + parse_header_run() — pass
+                     # ANY one file of a run — over find_header_files()/
                      # parse_header_group() (a whole acquisition run, whose
                      # GPS frame may be split across *_headerNNN.txt siblings)
                      # + decode_ubx_tm2()
@@ -153,6 +162,6 @@ Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 ### Detector geometry
 
 - Telescope: 3 planes, 99 channels per axis, 100 cm × 100 cm active area.
-- Probe: 1 plane, 30 cm × 30 cm active area, channel count unknown a priori.
+- Probe: 1 plane. Channel count is **not** known a priori and the active area is derived from it, not fixed: `probe_size_mm = n_probe_ch × 10`. `n_probe_ch` defaults to 30 (→ 300 mm), settable per probe via `--n-probe-ch`. Treat 30 cm × 30 cm as the default, never as the hardware — real acquisitions include 40-channel (400 mm) probes.
 - Channel → coordinate: `coord_mm = (ch + 0.5) × 10 mm`, channel 0 at one physical edge.
 - Fiber × ribbon encoding: `ch = N × ribbon_bit + fiber_bit` (both are LSB-indexed bit positions in the respective 10-bit half of the 20-bit X or Y field). `N` (fibers wired per ribbon channel) defaults to 10 but is configurable per probe via `n_fibers_per_ribbon`/`--fibers-per-ribbon`; the telescope is fixed at `N = 10`.

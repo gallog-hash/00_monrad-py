@@ -21,6 +21,10 @@ Installs the package (editable) together with the `dev` dependency group
 (pytest, scipy, matplotlib, plotly, ruff). Requires Python ≥ 3.10 and
 NumPy ≥ 1.24.
 
+New to the project? `docs/onboarding.md` walks through the whole setup —
+installing uv, the pinned Python version, Ruff, pre-commit, and the
+contribution workflow.
+
 ## Data layout
 
 An acquisition produces one directory per detector, each containing:
