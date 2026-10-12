@@ -20,6 +20,12 @@ from .optimize import (
     _tel_line_fit as _tel_line_fit,
     _MIN_COINCS as _MIN_COINCS,
 )
+from .dt import (
+    DtStats as DtStats,
+    dt_counter as dt_counter,
+    dt_histogram as dt_histogram,
+    dt_stats as dt_stats,
+)
 from .fitter import (
     PoseFitter as PoseFitter,
     _CHI2_TRACK as _CHI2_TRACK,

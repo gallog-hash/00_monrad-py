@@ -123,6 +123,8 @@ from monrad.pose import (
     DecodeReport,
     PoseFitter,
     PoseResult,
+    dt_histogram,
+    dt_stats,
     filter_off_probe,
     filter_rigidity,
     fit_probe_pose,
@@ -629,6 +631,14 @@ def main() -> None:
     # (see stage5.py).  tel_q_dist[k] is the golden/cluster breakdown of
     # accepted winning triples on plane k (the winning candidate's own label).
     tel_q_dist: list[Counter] = [Counter(), Counter(), Counter()]
+    # Probe-minus-telescope event time (DecodeReport.dt_ns), as a Counter
+    # keyed by the integer ns value.  Two populations: every cluster that had
+    # a unique one-telescope/one-probe pairing, and the accepted subset — the
+    # former is the unbiased timing sample, the latter is what the pose fit
+    # actually used, and comparing them shows whether the geometric cuts
+    # select on timing.  Diagnostic only; no gate reads dt_ns.
+    dt_hist_all: Counter = Counter()
+    dt_hist_acc: Counter = Counter()
 
     def _on_decode(r: DecodeReport) -> None:
         gate_counts[r.reason] += 1
@@ -645,6 +655,10 @@ def main() -> None:
         if r.accepted and r.tel_quality is not None:
             for k in range(3):
                 tel_q_dist[k][r.tel_quality[k]] += 1
+        if r.dt_ns is not None:
+            dt_hist_all[r.dt_ns] += 1
+            if r.accepted:
+                dt_hist_acc[r.dt_ns] += 1
 
     fitter = PoseFitter(
         tel_z=z_tel,
@@ -812,6 +826,55 @@ def main() -> None:
                 lines,
                 f"    {label}: mean={mean:.3f}  std={math.sqrt(var):.3f}  n={n}",
             )
+
+    # ── Probe − telescope event time ──
+    # Pure diagnostic: no stage of the pipeline gates on Δt.  Printed here
+    # because DESIGN.md §5 defers tightening the 200 ns coincidence window
+    # until this distribution has been measured on real data.
+    if dt_hist_all:
+        _emit(lines)
+        _emit(lines, "  Probe − telescope event time  Δt = t_prb − t_tel  [ns]:")
+        for lbl, hist in (
+            ("one-tel/one-probe clusters", dt_hist_all),
+            ("accepted subset           ", dt_hist_acc),
+        ):
+            st = dt_stats(hist)
+            if st.n:
+                _emit(
+                    lines,
+                    f"    {lbl}: n={st.n:<7} mean={st.mean:+8.2f}  "
+                    f"std={st.std:7.2f}  median={st.median:+8.1f}  "
+                    f"range=[{st.min_ns:+d}, {st.max_ns:+d}]",
+                )
+        rows = dt_histogram(dt_hist_all, bin_ns=20)
+        if rows:
+            _emit(lines, "    distribution (all, 20 ns bins):")
+            for row in rows:
+                _emit(lines, f"    {row}")
+        _emit(
+            lines,
+            "    Δt < 0 means the probe fired first — the expected sign with "
+            "the probe above the",
+        )
+        _emit(
+            lines,
+            "    telescope — but the true time of flight is only ~3.3 ns/m, far "
+            "inside the floor set",
+        )
+        _emit(
+            lines,
+            "    by the 80 ns acquisition window, the 10 ns clock tick and "
+            "20–50 ns of GPS accEst per",
+        )
+        _emit(
+            lines,
+            "    detector, so the per-event sign is near-random. Read the mean "
+            "as the instrumental",
+        )
+        _emit(
+            lines,
+            "    offset and the std as the combined timing resolution (DESIGN.md §5).",
+        )
 
     _emit(lines)
 

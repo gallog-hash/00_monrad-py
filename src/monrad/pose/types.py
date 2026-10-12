@@ -55,6 +55,21 @@ class Coincidence(NamedTuple):
     # default keeps positional Coincidence(...) construction in tests
     # working unchanged.
     alignment_label: str = ""
+    # Probe-minus-telescope event time (integer ns): prb_ev.t_ns - tel_ev.t_ns,
+    # set by PoseFitter._finish_decode.  Negative means the probe fired first,
+    # which is the expected sign when the probe sits above the telescope.
+    #
+    # Instrumentation only -- nothing in the pipeline gates on it.  The true
+    # time of flight is ~3.3 ns/m at beta~1, far below the measurement floor
+    # (an 80 ns acquisition window per event, DESIGN.md SS3.3; a 10 ns clock
+    # tick, timing.F0_DEFAULT; and 20-50 ns of GPS accEst per detector,
+    # DESIGN.md SS5), so the *per-event* sign is near-random and must not be
+    # cut on.  What is measurable is the distribution: its mean is the constant
+    # inter-detector offset (cable/trigger latency + per-receiver GPS bias) and
+    # its width is the combined timing resolution, which is what DESIGN.md SS5
+    # wants before tightening window_ns.  The default keeps positional
+    # Coincidence(...) construction in tests working unchanged.
+    dt_ns: int = 0
 
 
 class DecodeReport(NamedTuple):
@@ -80,6 +95,14 @@ class DecodeReport(NamedTuple):
     # telescope-classification step (i.e. on the "probe_quality" and "accepted"
     # paths).
     tel_quality: tuple[str, str, str] | None = None
+    # Probe-minus-telescope event time in ns (see Coincidence.dt_ns).  Set on
+    # every path where the cluster held exactly one telescope *and* exactly one
+    # of this probe's events -- i.e. all of "zero_candidate_plane",
+    # "no_anchor_plane", "chi2_track_cut", "probe_quality" and "accepted", so
+    # the timing distribution can be measured over the full one-tel/one-probe
+    # population rather than only over pose-fit survivors.  None only for
+    # "ambiguous_cluster", where no unique pairing exists to difference.
+    dt_ns: int | None = None
 
 
 # The rejection gates _decode_cluster applies, in the order it checks them
@@ -113,7 +136,12 @@ class TelescopeTrackResult(NamedTuple):
     telescope-side entries of GATE_ORDER ("ambiguous_cluster" for >1 or 0
     telescope entries in the cluster, "zero_candidate_plane",
     "no_anchor_plane", "chi2_track_cut"). The line-fit / covariance /
-    tel_quality / t_ns fields are only meaningful when accepted=True.
+    tel_quality fields are only meaningful when accepted=True.
+
+    t_ns is the exception: it is set whenever the cluster held exactly one
+    telescope event, rejection paths included, so DecodeReport.dt_ns can be
+    reported for clusters the telescope side rejected.  It stays 0 only for
+    the "ambiguous_cluster" return, where there is no unique telescope event.
     """
 
     accepted: bool

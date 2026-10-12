@@ -40,6 +40,17 @@ coincidence, rather than growing the same batch and retrying.
 
 Only the open batch is ever buffered in RAM.
 
+Alongside the pose, each window reports the probe-minus-telescope event time
+(``dt_mean_ns`` / ``dt_std_ns``, from
+:attr:`~monrad.pose.Coincidence.dt_ns`) and plots it as a fourth panel.
+This is a timing diagnostic, not a pose observable, and no gate reads it:
+the mean is the constant inter-detector offset, the width the combined
+timing resolution, and tracking both per window shows whether the offset
+drifts over a run -- which DESIGN.md SS5 wants measured before the 200 ns
+stage-2 coincidence window is tightened.  (That is
+``coincidence_stream(window_ns=...)``; this module's own ``window_ns`` is the
+monitoring window from ``--window-s``, an unrelated quantity.)
+
 In-plane uncertainties ``sigma_tx`` / ``sigma_ty`` are reported at the probe
 **centre** (not the fit-parameter corner), consistent with the resolution
 study (``monrad-resolution``).  The propagation uses
@@ -61,6 +72,8 @@ from ..pose import (
     Coincidence,
     PoseFitter,
     PoseResult,
+    dt_counter,
+    dt_stats,
     filter_off_probe,
     filter_rigidity,
     fit_probe_pose,
@@ -144,6 +157,31 @@ def _window_resid_rms(pose: PoseResult) -> float:
     return math.sqrt(sq / len(coincs))
 
 
+def _window_dt_stats(coincs: list[Coincidence]) -> tuple[float, float]:
+    """Mean and standard deviation (ns) of probe-minus-telescope event time.
+
+    Pure instrumentation -- no gate reads it (see
+    :attr:`~monrad.pose.Coincidence.dt_ns`).  The mean is the constant
+    inter-detector timing offset, the width the combined timing resolution;
+    DESIGN.md SS5 wants both measured before the stage-2 *coincidence* window
+    is tightened from its 200 ns default (``coincidence_stream``'s own
+    ``window_ns`` -- not this module's ``window_ns``, which is the monitoring
+    window).  Tracking them *per window* also shows whether that
+    offset drifts over a run, which matters here for a reason beyond
+    calibration: a drifting offset would make any one-sided Delta-t cut have a
+    time-dependent acceptance, and this monitor's whole job is reading out slow
+    drift.  Computed over the same population as :func:`_window_resid_rms`
+    (inliers + Mahalanobis-cut outliers) so the two columns are comparable.
+
+    Returns (nan, nan) for an empty window; sigma is 0.0 for a single
+    coincidence.  Both come from :func:`~monrad.pose.dt_stats`, so the
+    sample-sigma convention matches the whole-run report in
+    ``scripts/run_pipeline.py``.
+    """
+    st = dt_stats(dt_counter(coincs))
+    return st.mean, st.std
+
+
 def _pose_jump(pose: PoseResult, ref: PoseResult) -> tuple[float, float]:
     """How far *pose* has drifted from *ref* -- the post-fit continuity gate's signal.
 
@@ -191,6 +229,11 @@ class WindowResult:
     # window straddled an AlignmentSchedule boundary, so a mixed-alignment
     # window is visible rather than silently attributed to one correction.
     alignment_label: str = ""
+    # Probe-minus-telescope event time over this window's fitted coincidences
+    # (see _window_dt_stats and Coincidence.dt_ns).  Instrumentation only --
+    # no gate reads either field.  nan when the window held no coincidences.
+    dt_mean_ns: float = math.nan
+    dt_std_ns: float = math.nan
 
 
 def _utc(t_ns: float) -> datetime:
@@ -326,6 +369,10 @@ class _WindowAccumulator:
         # back in is what exposes the contamination (see _window_resid_rms).
         rms = _window_resid_rms(pose)
 
+        # Probe-minus-telescope timing over the same population as rms.
+        # Instrumentation; nothing below gates on it (see _window_dt_stats).
+        dt_mean, dt_std = _window_dt_stats(pose.inliers + pose.outliers)
+
         # Distinct alignment labels over the window's coincidences, in
         # encounter (chronological) order — more than one means the window
         # straddled an AlignmentSchedule boundary.
@@ -351,6 +398,8 @@ class _WindowAccumulator:
             sigma_theta=math.sqrt(abs(pose.cov[2, 2])),
             resid_rms=rms,
             alignment_label=",".join(labels),
+            dt_mean_ns=dt_mean,
+            dt_std_ns=dt_std,
         )
         self.results.append(result)
         self.prev_pose = pose
@@ -750,6 +799,8 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                 "sigma_theta",
                 "resid_rms",
                 "alignment_label",
+                "dt_mean_ns",
+                "dt_std_ns",
             ]
         )
         for r in results:
@@ -768,6 +819,8 @@ def _write_csv(results: list[WindowResult], path: Path) -> None:
                     f"{r.sigma_theta:.6g}",
                     f"{r.resid_rms:.6g}",
                     r.alignment_label,
+                    f"{r.dt_mean_ns:.6g}",
+                    f"{r.dt_std_ns:.6g}",
                 ]
             )
 
@@ -790,18 +843,32 @@ def _plot_timeseries(results: list[WindowResult], path: Path) -> None:
         np.array([r.sigma_ty for r in results]),
         np.array([r.sigma_zp for r in results]),
     ]
-    ylabels = ["t_x  [mm]", "t_y  [mm]", "z_p  [mm]"]
+    # Fourth panel: probe-minus-telescope event time.  Not a pose observable
+    # -- a timing diagnostic plotted on the same axis so a timing excursion
+    # can be compared by eye against a pose excursion (Coincidence.dt_ns).
+    # Its band is the per-window spread of dt, not an uncertainty on the mean.
+    vals.append(np.array([r.dt_mean_ns for r in results]))
+    sigs.append(np.array([r.dt_std_ns for r in results]))
+    ylabels = ["t_x  [mm]", "t_y  [mm]", "z_p  [mm]", "Δt  [ns]"]
 
-    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig, axs = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
     for ax, lbl, vs, ss in zip(axs, ylabels, vals, sigs):
         ax.plot(times, vs, "o-", ms=5)
         ax.fill_between(times, vs - ss, vs + ss, alpha=0.3, label="±1σ")
         ax.set_ylabel(lbl)
         ax.grid(True, alpha=0.3)
+    # Zero marks "probe and telescope timestamped in the same ns"; the true
+    # time of flight (probe above => dt < 0) is ~3.3 ns/m, far inside the
+    # scatter, so the offset of this curve from zero is instrumental.
+    axs[-1].axhline(0.0, color="k", lw=0.8, ls=":")
     axs[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
     fig.autofmt_xdate()
     axs[0].set_title("Probe position vs time (centre-referenced ±1σ bands)")
     axs[0].legend(fontsize=8)
+    axs[-1].set_title(
+        "probe − telescope event time (mean ±1σ per window; diagnostic, not gated)",
+        fontsize=9,
+    )
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)

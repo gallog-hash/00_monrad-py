@@ -411,6 +411,56 @@ A generator yielding clusters, each a list of `(detector_id, TimedEvent,
 PosRef)` tuples. `PosRef` is carried transparently so that stage 3 callers
 downstream never need to look anything up.
 
+### 5.3 Measuring Δt (instrumentation, not a cut)
+
+§5's "tighten the window once the empirical Δt distribution is measured" is
+now instrumented. Stage 5 records
+`Coincidence.dt_ns = t_prb − t_tel` for every cluster holding exactly one
+telescope and one probe event, and reports it on `DecodeReport.dt_ns` for the
+rejection paths too (`zero_candidate_plane`, `no_anchor_plane`,
+`chi2_track_cut`, `probe_quality`) — so the timing sample is not restricted
+to the geometrically selected subset that survives to a pose fit.
+`scripts/run_pipeline.py` prints the distribution (mean / std / median /
+range, plus a 20 ns-binned histogram, for both the full one-tel/one-probe
+population and the accepted subset), and `monrad-monitor` carries per-window
+`dt_mean_ns`/`dt_std_ns` into `pose_timeseries.csv` and a fourth plot panel.
+
+**Nothing gates on Δt, and in particular nothing requires the probe to
+precede the telescope.** With the probe mounted above the telescope the true
+ordering *is* probe-first, but the true time of flight is only ≈ 3.3 ns/m at
+β ≈ 1 — one clock tick at 3 m. Three terms swamp it:
+
+| term | scale | source |
+|---|---|---|
+| acquisition window | 80 ns | one timestamp per 16-row block (§3); the two detectors trigger independent windows, so their phases are uncorrelated |
+| clock granularity | 10 ns | `timing.F0_DEFAULT` = 100 MHz |
+| GPS `accEst` | 20–50 ns per detector, 30–70 ns combined | §5 above |
+
+So the *per-event* sign of Δt is near-random and carries essentially no
+information; a one-sided cut would discard roughly half of all genuine
+coincidences. It would also be actively harmful for drift monitoring: the
+observed Δt wanders by ±120 ns over a run (seen on testLab 20210723, benign
+and uncorrelated with `z_p`), and a one-sided cut sitting inside a
+distribution whose mean moves has a *time-dependent* acceptance — injecting a
+spurious slow drift into exactly the observable `monrad-monitor` exists to
+measure.
+
+What the distribution *is* good for: its **mean** is the constant
+inter-detector offset (cable and trigger latency, per-receiver GPS bias), and
+its **width** is the combined timing resolution. Those two numbers are what
+the "tighten to ≈ 100 ns" decision needs, and a mean far from `−ToF` is a
+calibration finding in its own right.
+
+One related bound is worth noting. Because §5.1 clusters by transitive
+closure while stage 5 filters per probe (ignoring *other* probes' events —
+see §8), a chain of probe events can stretch a cluster so that an accepted
+telescope-probe pair sits further apart than `window_ns`: up to ≈ `k ×
+window_ns` with `k` probes. Single-probe runs are unaffected (any third event
+is a duplicate on one of the two detectors, so the cluster is rejected as
+`ambiguous_cluster`). Measuring Δt makes this visible — it would show as tails
+beyond ±`window_ns` in the histogram — which is the honest prerequisite for
+deciding whether a symmetric `|Δt| ≤ window_ns` pair check is worth adding.
+
 
 ## 6. Stage 3 — position decoding
 

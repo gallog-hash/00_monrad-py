@@ -20,7 +20,7 @@ from ..reconstruction import (
     decode_position,
     reconstruct_plane_candidates,
 )
-from ..timing import PosRef
+from ..timing import PosRef, TimedEvent
 from .optimize import _fit_triple, fit_probe_pose, tel_align_arrays
 from .types import Coincidence, DecodeReport, PoseResult, TelescopeTrackResult
 
@@ -143,11 +143,13 @@ class PoseFitter:
         result already computed by :meth:`decode_telescope_track` (by this
         fitter or shared from another — see that method's docstring).
         """
-        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
-        if len(prb_refs) != 1:
+        prb_entries = [
+            (ev, ref) for det_id, ev, ref in cluster if det_id == self.prb_id
+        ]
+        if len(prb_entries) != 1:
             self._fire_report("ambiguous_cluster")
             return None
-        return self._finish_decode(prb_refs[0], tel_result)
+        return self._finish_decode(*prb_entries[0], tel_result)
 
     def _fire_report(
         self,
@@ -156,6 +158,7 @@ class PoseFitter:
         chi2: float | None = None,
         prb_quality: str | None = None,
         tel_quality: tuple[str, str, str] | None = None,
+        dt_ns: int | None = None,
     ) -> None:
         if self.on_decode is not None:
             self.on_decode(
@@ -166,6 +169,7 @@ class PoseFitter:
                     chi2=chi2,
                     prb_quality=prb_quality,
                     tel_quality=tel_quality,
+                    dt_ns=dt_ns,
                 )
             )
 
@@ -191,13 +195,21 @@ class PoseFitter:
         telescope search, mirroring the combined gate this method used to
         have, so a probe-ambiguous cluster never pays for a search whose
         result it can't use.
+
+        The probe's TimedEvent is carried alongside its PosRef purely so the
+        probe-minus-telescope time can be recorded (Coincidence.dt_ns); no
+        gate reads it, and in particular nothing requires the probe to
+        precede the telescope -- see Coincidence.dt_ns for why that sign is
+        not measurable per event.
         """
-        prb_refs = [ref for det_id, _ev, ref in cluster if det_id == self.prb_id]
-        if len(prb_refs) != 1:
+        prb_entries = [
+            (ev, ref) for det_id, ev, ref in cluster if det_id == self.prb_id
+        ]
+        if len(prb_entries) != 1:
             self._fire_report("ambiguous_cluster")
             return None
         tel_result = self._decode_telescope_track(cluster)
-        return self._finish_decode(prb_refs[0], tel_result)
+        return self._finish_decode(*prb_entries[0], tel_result)
 
     def _decode_telescope_track(self, cluster: list) -> TelescopeTrackResult:
         """
@@ -236,7 +248,10 @@ class PoseFitter:
             # A triple needs all 3 planes; single-half dropouts are out of
             # scope for this phase-1 combinatorial search.
             return TelescopeTrackResult(
-                accepted=False, reason="zero_candidate_plane", cand_counts=cand_counts
+                accepted=False,
+                reason="zero_candidate_plane",
+                cand_counts=cand_counts,
+                t_ns=tel_ev.t_ns,
             )
         # Anchor-plane gate (tunable via min_anchor_planes).  An "anchor" is a
         # plane that decoded to a single resolved candidate; zero-candidate
@@ -257,7 +272,10 @@ class PoseFitter:
         n_anchor = sum(1 for c in cands if len(c) == 1)
         if n_anchor < self.min_anchor_planes:
             return TelescopeTrackResult(
-                accepted=False, reason="no_anchor_plane", cand_counts=cand_counts
+                accepted=False,
+                reason="no_anchor_plane",
+                cand_counts=cand_counts,
+                t_ns=tel_ev.t_ns,
             )
 
         # The alignment-corrected plane z and the per-plane delta/tilt arrays
@@ -286,6 +304,7 @@ class PoseFitter:
                 reason="chi2_track_cut",
                 cand_counts=cand_counts,
                 chi2=(best_chi2 if best_fit is not None else None),
+                t_ns=tel_ev.t_ns,
             )
         a_x, b_x, a_y, b_y, cov_x, cov_y, _ = best_fit
         assert best_cands is not None  # set whenever best_fit is
@@ -313,14 +332,25 @@ class PoseFitter:
         )
 
     def _finish_decode(
-        self, prb_ref: PosRef, tel_result: TelescopeTrackResult
+        self,
+        prb_ev: TimedEvent,
+        prb_ref: PosRef,
+        tel_result: TelescopeTrackResult,
     ) -> "Coincidence | None":
         """Probe-side decode given an already-resolved telescope track."""
+        # Probe-minus-telescope event time (see Coincidence.dt_ns).  Reported
+        # on the telescope-side rejections too, so the timing distribution is
+        # measured over every cluster that had a unique one-telescope/
+        # one-probe pairing -- not only over pose-fit survivors, which are a
+        # geometrically selected subsample.  "ambiguous_cluster" is the one
+        # reason that never reaches here, and the one with no dt to report.
+        dt_ns = prb_ev.t_ns - tel_result.t_ns
         if not tel_result.accepted:
             self._fire_report(
                 tel_result.reason,
                 cand_counts=tel_result.cand_counts,
                 chi2=tel_result.chi2,
+                dt_ns=dt_ns,
             )
             return None
         # tel_quality is always set once tel_result.accepted is True (see
@@ -346,6 +376,7 @@ class PoseFitter:
                 chi2=tel_result.chi2,
                 prb_quality=prb_hit.quality,
                 tel_quality=tel_quality,
+                dt_ns=dt_ns,
             )
             return None
 
@@ -355,6 +386,7 @@ class PoseFitter:
             chi2=tel_result.chi2,
             prb_quality=prb_hit.quality,
             tel_quality=tel_quality,
+            dt_ns=dt_ns,
         )
         return Coincidence(
             a_x=tel_result.a_x,
@@ -369,6 +401,7 @@ class PoseFitter:
             sigma_prb_y=prb_hit.sigma_y,
             tel_quality=tel_quality,
             t_ns=tel_result.t_ns,
+            dt_ns=dt_ns,
         )
 
     def _refit(self) -> "PoseResult":
