@@ -770,3 +770,55 @@ def test_pairing_across_gen_wrap(tmp_path):
     assert len(results) == 6
     for (ev, ref), g in zip(results, gens):
         assert _block_gens(ref, pos_paths) == [g] * 16
+
+
+# ── spurious PPS records ─────────────────────────────────────────
+#
+# Real data (Militello 2022-04-03, probe): two extra PPS pulses inside one
+# real second, splitting it into 0.49 + 0.12 + 0.39 s.  Counting each
+# fragment as a whole second made the probe clock jump +2 s for the rest of
+# the run, so every later coincidence fell outside the 200 ns window.
+
+
+def _pps_case(tmp_path, pps_ticks, event_ticks, f0=100_000_000):
+    """One GPS/pos pair with the given PPS and event ticks, in tick order."""
+    recs, gen = [], 1
+    for tick, is_pps in sorted(
+        [(t, True) for t in pps_ticks] + [(t, False) for t in event_ticks]
+    ):
+        recs.append(_gps_rec(tick, gen, is_pps))
+        if not is_pps:
+            gen = (gen + 1) % 2048
+    gps, pos = tmp_path / "s_GPS.bin", tmp_path / "s.bin"
+    _write_gps(gps, recs)
+    _write_pos_rows(pos, _blocks(list(range(1, len(event_ticks) + 1))))
+    utc0 = datetime(2023, 1, 1)
+    return list(reconstruct_stream([gps], [pos], utc0, f0)), _utc_to_ns(utc0)
+
+
+def test_spurious_pps_inside_one_second_is_ignored(tmp_path, caplog):
+    f0 = 100_000_000
+    real = [k * f0 for k in range(6)]
+    spurious = [2 * f0 + 48_878_600, 2 * f0 + 60_763_600]  # 0.489 / 0.119 / 0.392
+    events = [k * f0 + f0 // 2 for k in range(5)] + [2 * f0 + 55_000_000]
+    results, utc0_ns = _pps_case(tmp_path, real + spurious, events, f0)
+    by_tick = sorted(events)
+    assert len(results) == len(events)
+    for (ev, _), tick in zip(results, by_tick):
+        assert ev.t_ns == utc0_ns + tick * 1_000_000_000 // f0  # no +2 s jump
+        assert ev.quality == Quality.GOOD
+    assert "spurious PPS" in caplog.text
+
+
+def test_long_dropped_pps_gap_with_drift_is_not_spurious(tmp_path, caplog):
+    """A 3000 s PPS gap on a +20 ppm oscillator is 0.06 s off the f0 grid,
+    beyond PPS_SPURIOUS_FRAC; predicting with the measured local frequency
+    must still accept it as 3000 whole seconds."""
+    f0 = 100_000_000
+    f_true = f0 + 2_000  # +20 ppm
+    real = [k * f_true for k in (0, 1, 2, 3002, 3003)]
+    events = [f_true // 2, 3002 * f_true + f_true // 2]
+    results, utc0_ns = _pps_case(tmp_path, real, events, f0)
+    assert len(results) == 2
+    assert results[1][0].t_ns == utc0_ns + 3002 * 1_000_000_000 + 500_000_000
+    assert "spurious" not in caplog.text

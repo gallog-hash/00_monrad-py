@@ -29,6 +29,16 @@ _UNIX_EPOCH = datetime(1970, 1, 1)
 PPS_TAU = 1e-4  # residual threshold for PPS acceptance
 F0_DEFAULT = 100_000_000  # Hz — used when header has no freq field
 
+# A PPS record more than this fraction of a second away from the
+# whole-second grid of the last accepted PPS is spurious (real data: two
+# extra pulses splitting one second into 0.49 + 0.12 + 0.39 s).  It is far
+# above oscillator drift, which _pps_is_spurious removes by predicting with
+# the measured local frequency rather than f0.
+PPS_SPURIOUS_FRAC = 0.05
+# Safety valve: after this many consecutive rejected PPS, accept the next
+# one anyway, so a wrong frequency reference cannot starve the chain.
+_MAX_CONSECUTIVE_SPURIOUS = 10
+
 
 # ── public types ─────────────────────────────────────────────────
 
@@ -273,6 +283,23 @@ def _build_next_interval(
     return _Interval(c0, c1, n0, n1, dc, n, trusted)
 
 
+def _pps_is_spurious(dc: int, f_ref: float) -> bool:
+    """
+    True when a PPS ``dc`` ticks after the last accepted PPS is off the
+    whole-second grid: fewer than half a second later, or more than
+    PPS_SPURIOUS_FRAC of a second away from an integer number of seconds.
+
+    Without this check, each sub-second fragment would be counted as a full
+    second and the detector's clock would jump ahead by whole seconds for the
+    rest of the run.  ``dc <= 0`` (a counter reset) is not spurious: it is
+    handled, as untrusted, by _build_next_interval.
+    """
+    if dc <= 0:
+        return False
+    n = round(dc / f_ref)
+    return n == 0 or abs(dc - n * f_ref) > PPS_SPURIOUS_FRAC * f_ref
+
+
 def _linear(utc0_ns: int, iv: _Interval, tick: int) -> int:
     """
     Integer-arithmetic timestamp for tick inside (or extrapolated
@@ -448,11 +475,37 @@ def reconstruct_stream(
     # stream, not per file: see _BlockCursor for why.
     blocks = _BlockCursor(pos_paths)
 
+    n_spurious = 0  # off-grid PPS records ignored (see _pps_is_spurious)
+    consecutive_spurious = 0
+
     for gps_path in gps_paths:
         gps_path = Path(gps_path)
 
         for tick, gen, is_pps in _iter_gps_records(gps_path):
             if is_pps:
+                if prev_pps_tick is not None:
+                    # Predict with the measured local frequency when we have
+                    # a trusted interval, so oscillator drift over a long
+                    # dropped-PPS gap cannot look like an off-grid pulse.
+                    f_ref = (
+                        last_iv.dc / last_iv.dn
+                        if last_iv is not None and last_iv.trusted
+                        else f0
+                    )
+                    if (
+                        _pps_is_spurious(tick - prev_pps_tick, f_ref)
+                        and consecutive_spurious < _MAX_CONSECUTIVE_SPURIOUS
+                    ):
+                        consecutive_spurious += 1
+                        n_spurious += 1
+                        log.warning(
+                            "%s: spurious PPS %.6f s after the last accepted"
+                            " one; ignored",
+                            gps_path.name,
+                            (tick - prev_pps_tick) / f_ref,
+                        )
+                        continue
+                consecutive_spurious = 0
                 pps_count += 1
 
                 if pps_count == 1:
@@ -511,6 +564,9 @@ def reconstruct_stream(
                     _pre_pps1.append((tick, ref))
                 else:
                     _pending.append((tick, ref))
+
+    if n_spurious:
+        log.warning("%d spurious PPS record(s) ignored", n_spurious)
 
     if blocks.n_resyncs or blocks.n_unpaired:
         log.warning(

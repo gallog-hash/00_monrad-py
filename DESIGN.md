@@ -290,6 +290,19 @@ accept the pair as spanning exactly `n` seconds. When `n > 1` this implies
 interval `[C_last, C']` as **untrusted** and propagate that flag to any events
 falling inside it; do not attempt to invent timestamps.
 
+**Spurious PPS records.** Before this check, a PPS latch that is off the
+whole-second grid of the last accepted PPS is **ignored**, as if it were not
+there: `n = round(ΔC / f_ref) = 0`, or `|ΔC − n · f_ref| > 0.05 · f_ref`
+(`PPS_SPURIOUS_FRAC`). Here `f_ref` is the last trusted interval's `f_local`,
+falling back to `f₀`, so oscillator drift across a long dropped-PPS gap is
+not mistaken for an off-grid pulse. Events keep accumulating and are timed by
+the real interval that encloses them. Without this, each sub-second fragment
+counts as a whole second and the clock jumps ahead for the rest of the run.
+Real data has this: on Militello 2022-04-03 two extra probe pulses split one
+second into 0.489 + 0.119 + 0.392 s, the probe clock jumped +2 s, and ~70 % of
+the run's coincidences were lost. After 10 consecutive rejections the next
+PPS is accepted anyway, so a bad `f_ref` cannot starve the chain.
+
 ### 4.2 Event timestamps
 
 Between any two accepted PPS anchors, the locally measured frequency is
