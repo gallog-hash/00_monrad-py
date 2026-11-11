@@ -625,3 +625,148 @@ def test_back_to_back_untrusted(tmp_path):
     assert ev2.quality == Quality.UNTRUSTED, f"expected UNTRUSTED, got {ev2.quality}"
     assert ev3.quality == Quality.UNTRUSTED, f"expected UNTRUSTED, got {ev3.quality}"
     assert ev4.quality == Quality.GOOD, f"expected GOOD,      got {ev4.quality}"
+
+
+# ── GPS event ↔ *.bin block pairing ──────────────────────────────
+#
+# The DAQ rotates *_GPS.bin and *.bin files independently, a few events
+# apart, so the k-th event of a GPS file is not in general the k-th block of
+# the same-index *.bin.  Stage 1 pairs events with blocks by GEN over the
+# whole detector stream.  These tests build GPS/pos file sets whose file
+# boundaries disagree and check that every event lands on its own block.
+
+
+def _write_pos_rows(path, row_gens: list[int], n_cols: int = 1) -> None:
+    """Write a pos file whose rows carry exactly the given GEN values."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", len(row_gens)))
+        f.write(struct.pack("<I", n_cols))
+        for gen in row_gens:
+            word = (1 << 0) | (1 << 10) | (1 << 32) | (1 << 42) | (gen << 52)
+            for _ in range(n_cols):
+                f.write(struct.pack("<Q", word))
+
+
+def _row_gen(path, row: int) -> int:
+    with open(path, "rb") as f:
+        _, n_cols = struct.unpack("<II", f.read(8))
+        f.seek(8 + row * n_cols * 8)
+        return (struct.unpack("<Q", f.read(8))[0] >> 52) & 0x7FF
+
+
+def _block_gens(ref, pos_paths) -> list[int]:
+    """GEN of each of the 16 rows a PosRef points at."""
+    if ref.split_rows == 0:
+        return [
+            _row_gen(pos_paths[ref.file_idx], ref.row_offset + i) for i in range(16)
+        ]
+    head = [
+        _row_gen(pos_paths[ref.file_idx], ref.row_offset + i)
+        for i in range(ref.split_rows)
+    ]
+    tail = [
+        _row_gen(pos_paths[ref.file_idx + 1], i) for i in range(16 - ref.split_rows)
+    ]
+    return head + tail
+
+
+def _pairing_case(tmp_path, gps_gens: list[list[int]], pos_row_gens: list[list[int]]):
+    """
+    Write one GPS file per ``gps_gens`` entry (events 10 µs apart, PPS at the
+    very start and end of the stream) and one pos file per ``pos_row_gens``
+    entry, run stage 1, and return (results, pos_paths, event GENs in order).
+    """
+    f0 = 100_000_000
+    gps_paths, pos_paths = [], []
+    tick = 1
+    all_gens = []
+    for i, gens in enumerate(gps_gens):
+        recs = []
+        if i == 0:
+            recs.append(_gps_rec(0, gens[0], True))
+        for g in gens:
+            recs.append(_gps_rec(tick, g, False))
+            all_gens.append(g)
+            tick += 1000
+        if i == len(gps_gens) - 1:
+            recs.append(_gps_rec(f0, gens[-1], True))
+        p = tmp_path / f"f{i}_GPS.bin"
+        _write_gps(p, recs)
+        gps_paths.append(p)
+    for i, rows in enumerate(pos_row_gens):
+        p = tmp_path / f"f{i}.bin"
+        _write_pos_rows(p, rows)
+        pos_paths.append(p)
+    results = list(reconstruct_stream(gps_paths, pos_paths, datetime(2023, 1, 1), f0))
+    return results, pos_paths, all_gens
+
+
+def _blocks(gens: list[int]) -> list[int]:
+    return [g for g in gens for _ in range(16)]
+
+
+def test_pairing_bin_starts_with_previous_gps_files_last_event(tmp_path):
+    """The real-data pattern: *.bin k+1 begins with GPS file k's last block."""
+    gps = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    pos = [_blocks([1, 2, 3]), _blocks([4, 5, 6, 7, 8])]
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 8
+    for (ev, ref), g in zip(results, gens):
+        assert _block_gens(ref, pos_paths) == [g] * 16
+    # GPS file 0's last event lives at the start of pos file 1.
+    assert results[3][1] == (1, 0, 0)
+
+
+def test_pairing_equal_counts_but_shifted(tmp_path):
+    """Counts match per file, yet blocks are shifted: index pairing mispairs all."""
+    gps = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    pos = [_blocks([1, 2]), _blocks([3, 4, 5]), _blocks([6, 7, 8, 9])]
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 9
+    for (ev, ref), g in zip(results, gens):
+        assert _block_gens(ref, pos_paths) == [g] * 16
+
+
+def test_pairing_block_straddling_two_files_is_split(tmp_path):
+    """A block cut mid-way by a *.bin rotation becomes a split_rows PosRef."""
+    gps = [[1, 2], [3, 4]]
+    rows = _blocks([1, 2, 3, 4])
+    pos = [rows[:40], rows[40:]]  # block GEN 3 = rows 32..47: 8 + 8
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 4
+    assert results[2][1] == (0, 32, 8)
+    for (ev, ref), g in zip(results, gens):
+        assert _block_gens(ref, pos_paths) == [g] * 16
+
+
+def test_pairing_resyncs_past_an_extra_block(tmp_path, caplog):
+    """A *.bin block with no GPS event is skipped; later events stay paired."""
+    gps = [[1, 2, 4, 5]]  # GPS record for GEN 3 missing
+    pos = [_blocks([1, 2, 3, 4, 5])]
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 4
+    for (ev, ref), g in zip(results, gens):
+        assert _block_gens(ref, pos_paths) == [g] * 16
+    assert "skipped" in caplog.text
+
+
+def test_pairing_drops_event_with_no_block(tmp_path, caplog):
+    """A GPS event whose block is missing is dropped, not mispaired."""
+    gps = [[1, 2, 3, 4, 5]]
+    pos = [_blocks([1, 2, 4, 5])]  # block for GEN 3 missing
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 4
+    for (ev, ref), g in zip(results, [1, 2, 4, 5]):
+        assert _block_gens(ref, pos_paths) == [g] * 16
+    assert [ev.evt_seq for ev, _ in results] == [0, 1, 2, 3]
+    assert "dropped" in caplog.text
+
+
+def test_pairing_across_gen_wrap(tmp_path):
+    """GEN wraps 2047 -> 0 inside a shifted rotation."""
+    gps = [[2045, 2046, 2047], [0, 1, 2]]
+    pos = [_blocks([2045, 2046]), _blocks([2047, 0, 1, 2])]
+    results, pos_paths, gens = _pairing_case(tmp_path, gps, pos)
+    assert len(results) == 6
+    for (ev, ref), g in zip(results, gens):
+        assert _block_gens(ref, pos_paths) == [g] * 16

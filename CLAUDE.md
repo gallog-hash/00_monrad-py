@@ -155,8 +155,8 @@ Per-stage tests: `tests/test_stage{1..5}.py`. Full streaming pipeline
 
 - **Integer nanoseconds throughout stage 1.** Use `f_local = (C_{k+1} − C_k) / Δsec` (measured PPS interval, not the nominal `f₀`) to absorb oscillator drift. Never use floats for `t_ns`.
 - **`*.bin` rows come in blocks of 16** (one 80 ns acquisition window). By default each block is bitwise-OR'd across all 16 rows before hit reconstruction (`tot_thresh=1`). `decode_position(tot_thresh=N)` keeps only bits that fired in ≥ N rows — an intentional noise filter, not a bug. Row count must be a multiple of 16.
-- **`*.bin` and `*_GPS.bin` are always decoded as a pair.** Row count / 16 in `*.bin` must equal the number of event records (FLAG=0) in `*_GPS.bin`. GEN fields must agree.
-- **5-minute file boundaries are transparent.** `evt_seq`, the PPS chain, and 16-row blocks all continue across file boundaries. The pipeline stitches split blocks when the DAQ rotates files mid-block.
+- **Events are paired with `*.bin` blocks by GEN, over the whole detector stream — not per file.** The DAQ rotates `*_GPS.bin` and `*.bin` independently, a few events apart (`*.bin` k+1 often starts with GPS file k's last block), so per-file counts need not match and index-within-file pairing is wrong. Concatenated, the event-GEN and block-GEN sequences coincide; `_BlockCursor` in `timing/reconstruct.py` walks the block stream independently and checks every pairing by GEN (resyncs ≤64 blocks ahead; drops an event with no block).
+- **5-minute file boundaries are transparent.** `evt_seq`, the PPS chain, and 16-row blocks all continue across file boundaries. A block that straddles two `*.bin` files comes out as a `split_rows` PosRef.
 - **GEN is 11-bit and wraps every 2048 events.** Always use the unwrapped `evt_seq` (monotonically assigned as events are encountered) for cross-file bookkeeping.
 
 ### Detector geometry
