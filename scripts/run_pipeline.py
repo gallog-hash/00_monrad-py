@@ -506,12 +506,19 @@ def main() -> None:
     tel_utc0, tel_f0, tel_gps, tel_pos = tel
     prb_utc0, prb_f0, prb_gps, prb_pos = prb
 
-    # ── Pass 1a: telescope alignment (stage 4) + telescope event quality ─
-    alignment, tel_q = fit_alignment(
+    # ── Pass 1a: telescope alignment (stage 4) ───────────────────────────
+    # fit_alignment only streams the first DAILY_ALIGNMENT_N_FILES files, so
+    # its quality histogram is not the whole run's; stage 1 is tallied below.
+    alignment, _ = fit_alignment(
         tel, z_tel, tot_thresh=tot_thresh, tot_weights=tot_weights
     )
 
-    # ── Pass 1b: probe event quality (stage 1 only) ──────────────────────
+    # ── Pass 1b: telescope + probe event quality (stage 1 only) ──────────
+    # Both detectors are counted over their full streams, so the two lines
+    # and the tel/probe ratio below compare like with like.
+    tel_q: Counter = Counter()
+    for ev, _ref in reconstruct_stream(tel_gps, tel_pos, tel_utc0, tel_f0):
+        tel_q[ev.quality] += 1
     prb_q: Counter = Counter()
     for ev, _ref in reconstruct_stream(prb_gps, prb_pos, prb_utc0, prb_f0):
         prb_q[ev.quality] += 1
