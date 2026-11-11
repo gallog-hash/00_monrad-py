@@ -186,14 +186,14 @@ same GEN value, and there are no PPS records in `*.bin` — PPS lives only in
 `*_GPS.bin`. The position information for an event is recovered by bitwise-OR
 across the 16 samples (see §6).
 
-In a clean acquisition, `*.bin` row count is a multiple of 16, and
-`*.bin row count / 16` equals the number of non-PPS records in the
-corresponding `*_GPS.bin`. The row-count-multiple-of-16 part holds
-universally; the count-equality part can be violated by ±1–2 blocks at a
-file rotation (the `.bin` and `*_GPS.bin` streams are flushed at slightly
-offset points), so the pipeline treats it as a **warning, not a hard
-assertion**, and proceeds — see §4.4 and §10 ("Cross-file 16-row block
-continuity") for the real-data behaviour.
+`*.bin` row count is a multiple of 16 in every real file seen so far. The
+`*.bin` and `*_GPS.bin` streams are, however, rotated at slightly offset
+points: `*.bin` k+1 often begins with the block of the last event of
+`*_GPS.bin` k, or ends a block early. Per file, therefore, neither the counts
+nor the k-th-event/k-th-block correspondence can be relied on. Concatenated
+over a detector's whole run, the event-GEN and block-GEN sequences coincide
+exactly, so stage 1 pairs events with blocks **by GEN over the whole stream**
+(§4.4).
 
 ### 2.4 Position encoding — fiber and ribbon
 
@@ -290,6 +290,19 @@ accept the pair as spanning exactly `n` seconds. When `n > 1` this implies
 interval `[C_last, C']` as **untrusted** and propagate that flag to any events
 falling inside it; do not attempt to invent timestamps.
 
+**Spurious PPS records.** Before this check, a PPS latch that is off the
+whole-second grid of the last accepted PPS is **ignored**, as if it were not
+there: `n = round(ΔC / f_ref) = 0`, or `|ΔC − n · f_ref| > 0.05 · f_ref`
+(`PPS_SPURIOUS_FRAC`). Here `f_ref` is the last trusted interval's `f_local`,
+falling back to `f₀`, so oscillator drift across a long dropped-PPS gap is
+not mistaken for an off-grid pulse. Events keep accumulating and are timed by
+the real interval that encloses them. Without this, each sub-second fragment
+counts as a whole second and the clock jumps ahead for the rest of the run.
+Real data has this: on Militello 2022-04-03 two extra probe pulses split one
+second into 0.489 + 0.119 + 0.392 s, the probe clock jumped +2 s, and ~70 % of
+the run's coincidences were lost. After 10 consecutive rejections the next
+PPS is accepted anyway, so a bad `f_ref` cannot starve the chain.
+
 ### 4.2 Event timestamps
 
 Between any two accepted PPS anchors, the locally measured frequency is
@@ -338,19 +351,18 @@ without flushing per-detector pipeline state. Concretely:
 - GEN and the unwrapped `evt_seq` continue across the boundary.
 - The PPS anchoring chain continues across the boundary (the next PPS may
   come from the new file).
-- A 16-row block of position data may, in principle, be split across two
-  consecutive `*.bin` files if the DAQ closes a file mid-block. The pipeline
-  detects this by checking that the row count of each `*.bin` is a multiple
-  of 16 *and* that the GEN field of the first row of file `k+1` is the
-  successor (mod 2048) of the GEN field in the last row of file `k`. If a
-  block straddles the boundary, the two halves are stitched before being
-  passed to the position decoder.
-
-Split-block detection must be eager: when opening file `k+1`, check GEN
-continuity before yielding any events from file `k` that might belong to a
-split block. If the last pending event of file `k` has the same GEN as the
-first row of file `k+1`, hold that event and construct a `PosRef` with the
-correct `split_rows` value before yielding.
+- The `*_GPS.bin` and `*.bin` streams rotate at different points, so an
+  event's block need not be in the same-index `*.bin`. A block cursor
+  (`_BlockCursor`) walks the concatenated `*.bin` row stream independently of
+  the GPS file boundaries. Each GPS event takes the block under the cursor if
+  the block's GEN equals the event's GEN; otherwise the cursor scans up to 64
+  blocks ahead (far below the 2048 GEN period, so the match is unambiguous),
+  skips the unmatched blocks and logs a warning. If no block within the window
+  matches, the event is dropped (it has no position data) and the cursor stays.
+- A 16-row block that straddles two consecutive `*.bin` files (the DAQ closed
+  a file mid-block) falls out of the cursor naturally as a `PosRef` with
+  `split_rows` = rows in the first file; the two halves are stitched before
+  being passed to the position decoder.
 
 ### 4.5 Output
 
@@ -1051,11 +1063,14 @@ real data on first inspection:
   GPS event record was written. Because the misalignment is whole blocks (not a
   partial mid-block split), §4.4's `split_rows` stitch never fires here — it is
   a no-op when `rows % 16 == 0`. The pipeline instead detects the count
-  mismatch (`reconstruct.py` logs "N GPS events but M position blocks") and
-  continues; the affected handful of events (~0.001 %) are absorbed by the
-  downstream quality/χ² cuts. The clean "split block with shared GEN, stitched
-  via `split_rows`" case §4.4 describes is therefore **not** what this DAQ
-  produces and remains unexercised.
+  mismatch and used to only log it ("N GPS events but M position blocks"),
+  pairing by index within each file. That estimate of the damage (~0.001 %)
+  was wrong: a shifted file mispairs **every** event in it, and files with
+  equal counts can still be shifted. On Militello 2022-03-31 it mispaired
+  2.9 % of telescope and 11.6 % of probe events. Stage 1 now pairs by GEN
+  over the whole stream (§4.4), and the whole-file GEN sequences match with
+  zero exceptions on both Militello runs (2022-03-29, 2022-03-31). The
+  mid-block split case remains unseen in real data but is covered by tests.
 - **GEN behaviour at acquisition start.** *Confirmed against
   `data/0_testLab_20210723`.* GEN starts at **1** (the first event record has
   GEN = 1) for both telescope and probe — not 0, and not an arbitrary value.

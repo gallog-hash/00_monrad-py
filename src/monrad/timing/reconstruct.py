@@ -11,22 +11,33 @@ reconstruct_stream(gps_paths, pos_paths, utc0, f0)
 
 import bisect
 import logging
-import struct
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
+
 from ..decoders.gps import GPSDecoder, unpack_gps_word
 from ..decoders.header import decode_ubx_tm2, find_header_files, parse_header_group
-from ..decoders.position import unpack_position_word
+from ..decoders.position import POS_GEN_MASK, POS_GEN_SHIFT
 
 log = logging.getLogger(__name__)
 
 _UNIX_EPOCH = datetime(1970, 1, 1)
 PPS_TAU = 1e-4  # residual threshold for PPS acceptance
 F0_DEFAULT = 100_000_000  # Hz — used when header has no freq field
+
+# A PPS record more than this fraction of a second away from the
+# whole-second grid of the last accepted PPS is spurious (real data: two
+# extra pulses splitting one second into 0.49 + 0.12 + 0.39 s).  It is far
+# above oscillator drift, which _pps_is_spurious removes by predicting with
+# the measured local frequency rather than f0.
+PPS_SPURIOUS_FRAC = 0.05
+# Safety valve: after this many consecutive rejected PPS, accept the next
+# one anyway, so a wrong frequency reference cannot starve the chain.
+_MAX_CONSECUTIVE_SPURIOUS = 10
 
 
 # ── public types ─────────────────────────────────────────────────
@@ -120,24 +131,120 @@ def _parse_gps_file(
     return evt_ticks, evt_gens, pps_ticks, pps_gens
 
 
-def _pos_file_meta(
-    path: Path,
-) -> tuple[int, int, int, int]:
+def _read_row_gens(path: Path) -> np.ndarray:
+    """GEN of every row of one *.bin (column 0; all columns share it)."""
+    hdr = np.fromfile(path, dtype="<u4", count=2)
+    if len(hdr) < 2:
+        return np.zeros(0, dtype=np.int16)
+    n_rows, n_cols = int(hdr[0]), int(hdr[1])
+    if n_rows == 0 or n_cols == 0:
+        return np.zeros(0, dtype=np.int16)
+    words = np.fromfile(path, dtype="<u8", offset=8, count=n_rows * n_cols)
+    col0 = words[: (len(words) // n_cols) * n_cols : n_cols]
+    return ((col0 >> np.uint64(POS_GEN_SHIFT)) & np.uint64(POS_GEN_MASK)).astype(
+        np.int16
+    )
+
+
+# A GPS event and its *.bin block are paired by GEN.  On a mismatch the
+# cursor scans this many blocks ahead for the event's GEN.  It is far below
+# the 2048-event GEN period, so a match inside the window is unambiguous.
+_RESYNC_BLOCKS = 64
+
+
+class _BlockCursor:
     """
-    Read (n_rows, n_cols, first_gen, last_gen) from *.bin
-    without loading the full array.
+    Walk the concatenated ``*.bin`` block stream of one detector.
+
+    The DAQ rotates ``*_GPS.bin`` and ``*.bin`` files independently, a few
+    events apart: ``*.bin`` file k+1 often begins with the block of the last
+    event in ``*_GPS.bin`` file k (or ends a block early).  Pairing the k-th
+    GPS event of a file with the k-th block of the same-index ``*.bin``
+    therefore mispairs every event of that file.  Concatenated end to end,
+    though, the event-GEN and block-GEN sequences coincide, so this cursor
+    advances through the block stream independently of GPS file boundaries
+    and checks every pairing by GEN.  A block that straddles two files comes
+    out naturally as a ``split_rows`` PosRef.
+
+    Only the per-row GEN arrays of the file under the cursor (and of files
+    reached by a straddling block or a resync look-ahead) are held in memory.
     """
-    with open(path, "rb") as fh:
-        n_rows = struct.unpack_from("<I", fh.read(4))[0]
-        n_cols = struct.unpack_from("<I", fh.read(4))[0]
-        if n_rows == 0 or n_cols == 0:
-            return n_rows, n_cols, -1, -1
-        first_word = struct.unpack("<Q", fh.read(8))[0]
-        _, _, first_gen = unpack_position_word(first_word)
-        fh.seek(8 + (n_rows - 1) * n_cols * 8)
-        last_word = struct.unpack("<Q", fh.read(8))[0]
-        _, _, last_gen = unpack_position_word(last_word)
-    return n_rows, n_cols, first_gen, last_gen
+
+    def __init__(self, pos_paths: list[Path]) -> None:
+        self._paths = [Path(p) for p in pos_paths]
+        self._gens: dict[int, np.ndarray] = {}
+        self._file = 0
+        self._row = 0
+        self.n_resyncs = 0
+        self.n_skipped_blocks = 0
+        self.n_unpaired = 0
+
+    def _row_gens(self, i: int) -> np.ndarray:
+        g = self._gens.get(i)
+        if g is None:
+            g = _read_row_gens(self._paths[i])
+            self._gens[i] = g
+        return g
+
+    def _block_at(self, f: int, r: int) -> tuple[int, PosRef, tuple[int, int]] | None:
+        """(block GEN, PosRef, cursor after the block), or None at stream end."""
+        n = len(self._paths)
+        while f < n and r >= len(self._row_gens(f)):
+            r -= len(self._row_gens(f))
+            f += 1
+        if f >= n:
+            return None
+        gens = self._row_gens(f)
+        gen = int(gens[r])
+        remaining = len(gens) - r
+        if remaining >= 16:
+            return gen, PosRef(f, r), (f, r + 16)
+        if f + 1 < n and len(self._row_gens(f + 1)) >= 16 - remaining:
+            return gen, PosRef(f, r, split_rows=remaining), (f + 1, 16 - remaining)
+        # Truncated final block: decode_position pads the short read with zeros.
+        return gen, PosRef(f, r), (f, r + 16)
+
+    def take(self, gen: int, label: str) -> PosRef | None:
+        """
+        PosRef of the block carrying ``gen``, advancing the cursor past it.
+
+        Returns None (cursor unchanged) when no block within
+        ``_RESYNC_BLOCKS`` carries ``gen``: the event has no position data.
+        """
+        pos = (self._file, self._row)
+        for skip in range(_RESYNC_BLOCKS + 1):
+            blk = self._block_at(*pos)
+            if blk is None:
+                break
+            blk_gen, ref, nxt = blk
+            if blk_gen == gen:
+                if skip:
+                    self.n_resyncs += 1
+                    self.n_skipped_blocks += skip
+                    log.warning(
+                        "%s: GEN %d found %d block(s) ahead in %s;"
+                        " skipped the unmatched block(s)",
+                        label,
+                        gen,
+                        skip,
+                        self._paths[ref.file_idx].name,
+                    )
+                self._file, self._row = nxt
+                for k in [k for k in self._gens if k < self._file]:
+                    del self._gens[k]
+                return ref
+            pos = nxt
+        self.n_unpaired += 1
+        log.warning(
+            "%s: no *.bin block with GEN %d within %d blocks of %s row %d;"
+            " event dropped (no position data)",
+            label,
+            gen,
+            _RESYNC_BLOCKS,
+            self._paths[min(self._file, len(self._paths) - 1)].name,
+            self._row,
+        )
+        return None
 
 
 def _build_next_interval(
@@ -174,6 +281,23 @@ def _build_next_interval(
             n1,
         )
     return _Interval(c0, c1, n0, n1, dc, n, trusted)
+
+
+def _pps_is_spurious(dc: int, f_ref: float) -> bool:
+    """
+    True when a PPS ``dc`` ticks after the last accepted PPS is off the
+    whole-second grid: fewer than half a second later, or more than
+    PPS_SPURIOUS_FRAC of a second away from an integer number of seconds.
+
+    Without this check, each sub-second fragment would be counted as a full
+    second and the detector's clock would jump ahead by whole seconds for the
+    rest of the run.  ``dc <= 0`` (a counter reset) is not spurious: it is
+    handled, as untrusted, by _build_next_interval.
+    """
+    if dc <= 0:
+        return False
+    n = round(dc / f_ref)
+    return n == 0 or abs(dc - n * f_ref) > PPS_SPURIOUS_FRAC * f_ref
 
 
 def _linear(utc0_ns: int, iv: _Interval, tick: int) -> int:
@@ -347,58 +471,41 @@ def reconstruct_stream(
     last_iv: _Interval | None = None  # last built, for fwd extrap
     evt_seq = 0
 
-    # split-block detection
-    prev_pos_last_gen: int | None = None
-    prev_pos_nr: int | None = None
+    # Events are paired with *.bin blocks by GEN over the whole detector
+    # stream, not per file: see _BlockCursor for why.
+    blocks = _BlockCursor(pos_paths)
 
-    for file_idx, (gps_path, pos_path) in enumerate(zip(gps_paths, pos_paths)):
+    n_spurious = 0  # off-grid PPS records ignored (see _pps_is_spurious)
+    consecutive_spurious = 0
+
+    for gps_path in gps_paths:
         gps_path = Path(gps_path)
-        pos_path = Path(pos_path)
-
-        nr, nc, first_gen, last_gen = _pos_file_meta(pos_path)
-
-        if nr % 16 != 0:
-            log.warning(
-                "%s: row count %d not multiple of 16"
-                " (possible split block at file end)",
-                pos_path.name,
-                nr,
-            )
-
-        # GEN continuity check and split-block detection
-        if prev_pos_last_gen is not None and nr > 0:
-            expected = (prev_pos_last_gen + 1) % 2048
-            if first_gen == prev_pos_last_gen:
-                # Last block of previous file straddled the boundary
-                tail = (prev_pos_nr or 0) % 16
-                if tail and _pending:
-                    old_tick, old_ref = _pending[-1]
-                    _pending[-1] = (
-                        old_tick,
-                        PosRef(
-                            old_ref.file_idx,
-                            old_ref.row_offset,
-                            split_rows=tail,
-                        ),
-                    )
-                log.warning(
-                    "%s: split block detected — %d rows in prev file",
-                    pos_path.name,
-                    tail if tail else 0,
-                )
-            elif first_gen != expected:
-                log.warning(
-                    "%s: GEN discontinuity at boundary — expected %d, got %d",
-                    pos_path.name,
-                    expected,
-                    first_gen,
-                )
-
-        n_pos_events = nr // 16
-        local_event_idx = 0
 
         for tick, gen, is_pps in _iter_gps_records(gps_path):
             if is_pps:
+                if prev_pps_tick is not None:
+                    # Predict with the measured local frequency when we have
+                    # a trusted interval, so oscillator drift over a long
+                    # dropped-PPS gap cannot look like an off-grid pulse.
+                    f_ref = (
+                        last_iv.dc / last_iv.dn
+                        if last_iv is not None and last_iv.trusted
+                        else f0
+                    )
+                    if (
+                        _pps_is_spurious(tick - prev_pps_tick, f_ref)
+                        and consecutive_spurious < _MAX_CONSECUTIVE_SPURIOUS
+                    ):
+                        consecutive_spurious += 1
+                        n_spurious += 1
+                        log.warning(
+                            "%s: spurious PPS %.6f s after the last accepted"
+                            " one; ignored",
+                            gps_path.name,
+                            (tick - prev_pps_tick) / f_ref,
+                        )
+                        continue
+                consecutive_spurious = 0
                 pps_count += 1
 
                 if pps_count == 1:
@@ -448,24 +555,27 @@ def reconstruct_stream(
                     prev_pps_tick = tick
 
             else:
-                # Event record: assign PosRef and buffer it.
-                ref = PosRef(file_idx, local_event_idx * 16)
+                # Event record: pair it with its *.bin block by GEN and
+                # buffer it.  An event with no block is dropped.
+                ref = blocks.take(gen, gps_path.name)
+                if ref is None:
+                    continue
                 if pps_count == 0:
                     _pre_pps1.append((tick, ref))
                 else:
                     _pending.append((tick, ref))
-                local_event_idx += 1
 
-        if local_event_idx != n_pos_events:
-            log.warning(
-                "%s: %d GPS events but %d position blocks",
-                pos_path.name,
-                local_event_idx,
-                n_pos_events,
-            )
+    if n_spurious:
+        log.warning("%d spurious PPS record(s) ignored", n_spurious)
 
-        prev_pos_last_gen = last_gen if nr > 0 else prev_pos_last_gen
-        prev_pos_nr = nr
+    if blocks.n_resyncs or blocks.n_unpaired:
+        log.warning(
+            "GPS/*.bin pairing: %d resync(s) skipped %d unmatched block(s);"
+            " %d event(s) dropped with no block",
+            blocks.n_resyncs,
+            blocks.n_skipped_blocks,
+            blocks.n_unpaired,
+        )
 
     if not pps_count:
         raise ValueError("No PPS records found — cannot anchor timestamps")
